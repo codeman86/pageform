@@ -220,7 +220,10 @@ impl PageFormApp {
         let (text_w, text_h) = default_size(FieldKind::Text, self.grid_size);
         let (check, _) = default_size(FieldKind::Checkbox, self.grid_size);
         ui.label(format!(
-            "Click places text {text_w:.0}×{text_h:.0} pt or a {check:.0} pt checkbox."
+            "Click places text {}×{} pt or a {} pt checkbox.",
+            fmt_pt(text_w),
+            fmt_pt(text_h),
+            fmt_pt(check)
         ));
         ui.separator();
         ui.heading("Field");
