@@ -1,4 +1,5 @@
 mod preview;
+mod theme;
 mod ui;
 
 use pageform_core::{export_pdf, Document, GridSize};
@@ -93,6 +94,7 @@ Usage:
       Write the sample form without opening a window.
 
 Scroll to zoom. Middle-drag or Space-drag to pan.
+The window opens in the dark theme. Dark / Light in the side panel switches it.
 Grid sizes: Small (1/16 in), Medium (1/8 in, default), Large (1/4 in).
 Dots cover the page. Guide lines and the print-safe margin are canvas only.
 Snap follows the active size so columns and rows stay even."

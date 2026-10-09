@@ -1,7 +1,7 @@
 //! egui canvas. Geometry and PDF export live in `pageform-core`.
 
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2,
+    self, Align2, CursorIcon, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2,
 };
 use pageform_core::{
     default_size, export_pdf, hit_handle, move_rect, place_default, print_safe_rect,
@@ -21,8 +21,9 @@ pub fn run_gui(demo: bool) -> eframe::Result<()> {
         "PageForm",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::light());
-            Ok(Box::new(PageFormApp::new(demo)))
+            let app = PageFormApp::new(demo, cc.storage);
+            crate::theme::apply(&cc.egui_ctx, app.dark);
+            Ok(Box::new(app))
         }),
     )
 }
@@ -71,16 +72,19 @@ struct PageFormApp {
     name_error: Option<String>,
     export_path: String,
     status: String,
+    dark: bool,
+    persist_theme: bool,
 }
 
 impl PageFormApp {
-    fn new(demo: bool) -> Self {
+    fn new(demo: bool, storage: Option<&dyn eframe::Storage>) -> Self {
         let doc = if demo {
             Document::sample()
         } else {
             Document::letter()
         };
         let page = doc.page();
+        let stored = storage.and_then(|storage| storage.get_string(crate::theme::STORAGE_KEY));
         Self {
             view: ViewTransform::new(page.height),
             doc,
@@ -103,6 +107,8 @@ impl PageFormApp {
             } else {
                 "Blank US Letter page".to_string()
             },
+            dark: crate::theme::is_dark(stored.as_deref()),
+            persist_theme: false,
         }
     }
 
@@ -196,6 +202,16 @@ impl PageFormApp {
     }
 
     fn properties(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Theme");
+        if ui
+            .button(crate::theme::toggle_label(self.dark))
+            .on_hover_text(crate::theme::toggle_tip(self.dark))
+            .clicked()
+        {
+            self.dark = !self.dark;
+            self.persist_theme = true;
+        }
+        ui.add_space(8.0);
         ui.heading("Page");
         let page = self.doc.page();
         ui.label(format!(
@@ -259,7 +275,7 @@ impl PageFormApp {
                 .map(|err| err.to_string());
         }
         if let Some(error) = &self.name_error {
-            ui.colored_label(Color32::from_rgb(160, 40, 40), error);
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
         ui.add_space(6.0);
         ui.label(format!("X  {} pt", fmt_pt(rect.x)));
@@ -451,7 +467,8 @@ impl PageFormApp {
     }
 
     fn paint(&self, painter: &egui::Painter, canvas: Rect) {
-        painter.rect_filled(canvas, 0.0, Color32::from_rgb(232, 234, 238));
+        let colors = crate::theme::canvas_colors(self.dark);
+        painter.rect_filled(canvas, 0.0, colors.desk);
         let page = self.doc.page();
         let page_rect = to_egui(self.view.pdf_rect_to_screen(RectPt {
             x: 0.0,
@@ -460,26 +477,26 @@ impl PageFormApp {
             h: page.height,
         }));
         let shadow = page_rect.translate(Vec2::new(3.0, 4.0));
-        painter.rect_filled(shadow, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 28));
-        painter.rect_filled(page_rect, 0.0, Color32::WHITE);
+        painter.rect_filled(shadow, 0.0, colors.shadow);
+        painter.rect_filled(page_rect, 0.0, colors.page);
 
         if self.guides_visible {
-            self.paint_guides(painter, page, page_rect);
+            self.paint_guides(painter, page, page_rect, &colors);
         }
         if self.dots_visible {
-            self.paint_dots(painter, page);
+            self.paint_dots(painter, page, &colors);
         }
 
         for field in self.doc.fields() {
             let screen = to_egui(self.view.pdf_rect_to_screen(field.rect()));
             let selected = self.selection == Some(field.id());
-            painter.rect_filled(screen, 0.0, Color32::WHITE);
+            painter.rect_filled(screen, 0.0, colors.field_fill);
             let color = if selected {
-                Color32::from_rgb(25, 102, 204)
+                colors.selection
             } else if field.kind() == FieldKind::Text {
-                Color32::from_rgb(36, 48, 72)
+                colors.text_stroke
             } else {
-                Color32::from_rgb(32, 32, 36)
+                colors.check_stroke
             };
             let width = if selected { 2.0_f32 } else { 1.0 };
             stroke_rect(painter, screen, Stroke::new(width, color));
@@ -489,7 +506,7 @@ impl PageFormApp {
                     Align2::LEFT_CENTER,
                     field.name(),
                     FontId::proportional((12.0 * self.view.zoom).clamp(8.0, 22.0)),
-                    Color32::from_rgb(50, 58, 72),
+                    colors.field_text,
                 );
             }
         }
@@ -498,11 +515,7 @@ impl PageFormApp {
             if let Some(current) = self.pointer_pdf_from_painter(painter) {
                 let rect = self.place_rect(start, current, kind);
                 let screen = to_egui(self.view.pdf_rect_to_screen(rect));
-                stroke_rect(
-                    painter,
-                    screen,
-                    Stroke::new(1.5_f32, Color32::from_rgb(25, 102, 204)),
-                );
+                stroke_rect(painter, screen, Stroke::new(1.5_f32, colors.selection));
             }
         }
 
@@ -512,30 +525,18 @@ impl PageFormApp {
                     let at = handle.point(field.rect());
                     let (x, y) = self.view.pdf_to_screen(at);
                     let handle_rect = Rect::from_center_size(Pos2::new(x, y), Vec2::splat(8.0));
-                    painter.rect_filled(handle_rect, 0.0, Color32::WHITE);
-                    stroke_rect(
-                        painter,
-                        handle_rect,
-                        Stroke::new(1.5_f32, Color32::from_rgb(25, 102, 204)),
-                    );
+                    painter.rect_filled(handle_rect, 0.0, colors.handle_fill);
+                    stroke_rect(painter, handle_rect, Stroke::new(1.5_f32, colors.selection));
                 }
             }
         }
 
         if self.margins_visible {
             let safe = to_egui(self.view.pdf_rect_to_screen(print_safe_rect(&page)));
-            dash_rect(
-                painter,
-                safe,
-                Stroke::new(1.0_f32, Color32::from_rgb(186, 112, 112)),
-            );
+            dash_rect(painter, safe, Stroke::new(1.0_f32, colors.margin));
         }
 
-        stroke_rect(
-            painter,
-            page_rect,
-            Stroke::new(1.0_f32, Color32::from_rgb(60, 64, 72)),
-        );
+        stroke_rect(painter, page_rect, Stroke::new(1.0_f32, colors.page_edge));
     }
 
     fn pointer_pdf_from_painter(&self, painter: &egui::Painter) -> Option<PdfPoint> {
@@ -543,7 +544,7 @@ impl PageFormApp {
         Some(self.view.screen_to_pdf(pos.x, pos.y))
     }
 
-    fn paint_dots(&self, painter: &egui::Painter, page: Page) {
+    fn paint_dots(&self, painter: &egui::Painter, page: Page, colors: &crate::theme::CanvasColors) {
         let minor = self.grid_size.minor_pt();
         let major = self.grid_size.major_pt();
         let draw_minor = minor * self.view.zoom >= 6.0;
@@ -554,16 +555,22 @@ impl PageFormApp {
                 let (sx, sy) = self.view.pdf_to_screen(PdfPoint { x, y });
                 let radius = if major_dot { 2.2 } else { 1.35 };
                 let color = if major_dot {
-                    Color32::from_rgb(142, 150, 164)
+                    colors.major_dot
                 } else {
-                    Color32::from_rgb(186, 192, 202)
+                    colors.minor_dot
                 };
                 painter.circle_filled(Pos2::new(sx, sy), radius, color);
             }
         }
     }
 
-    fn paint_guides(&self, painter: &egui::Painter, page: Page, page_rect: Rect) {
+    fn paint_guides(
+        &self,
+        painter: &egui::Painter,
+        page: Page,
+        page_rect: Rect,
+        colors: &crate::theme::CanvasColors,
+    ) {
         let minor = self.grid_size.minor_pt();
         let major = self.grid_size.major_pt();
         let draw_minor = minor * self.view.zoom >= 6.0;
@@ -574,9 +581,9 @@ impl PageFormApp {
             }
             let (sx, _) = self.view.pdf_to_screen(PdfPoint { x, y: 0.0 });
             let color = if major_line {
-                Color32::from_rgb(168, 196, 216)
+                colors.major_guide
             } else {
-                Color32::from_rgb(214, 228, 236)
+                colors.minor_guide
             };
             painter.line_segment(
                 [
@@ -593,9 +600,9 @@ impl PageFormApp {
             }
             let (_, sy) = self.view.pdf_to_screen(PdfPoint { x: 0.0, y });
             let color = if major_line {
-                Color32::from_rgb(168, 196, 216)
+                colors.major_guide
             } else {
-                Color32::from_rgb(214, 228, 236)
+                colors.minor_guide
             };
             painter.line_segment(
                 [
@@ -649,7 +656,25 @@ impl PageFormApp {
 }
 
 impl eframe::App for PageFormApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(
+            crate::theme::STORAGE_KEY,
+            crate::theme::storage_value(self.dark).to_owned(),
+        );
+    }
+
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::theme::apply(ctx, self.dark);
+        if self.persist_theme {
+            if let Some(storage) = frame.storage_mut() {
+                storage.set_string(
+                    crate::theme::STORAGE_KEY,
+                    crate::theme::storage_value(self.dark).to_owned(),
+                );
+                storage.flush();
+            }
+            self.persist_theme = false;
+        }
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
             self.toolbar(ui);
