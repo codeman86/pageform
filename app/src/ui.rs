@@ -28,7 +28,7 @@ pub fn run_gui(demo: bool) -> eframe::Result<()> {
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
     Select,
     Text,
@@ -165,17 +165,193 @@ impl PageFormApp {
         }
     }
 
+    fn set_dark(&mut self, dark: bool) {
+        if self.dark != dark {
+            self.dark = dark;
+            self.persist_theme = true;
+        }
+    }
+
+    fn delete_selection(&mut self) {
+        let Some(id) = self.selection else {
+            return;
+        };
+        if self.doc.remove(id) {
+            self.status = "Deleted field".to_string();
+        }
+        self.selection = None;
+        self.drag = None;
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| self.file_menu(ui));
+            ui.menu_button("Edit", |ui| self.edit_menu(ui));
+            ui.menu_button("Insert", |ui| self.insert_menu(ui));
+            ui.menu_button("View", |ui| self.view_menu(ui));
+        });
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        let export = ui.button("Export PDF").on_hover_text(
+            "Write a fillable PDF to the path in the toolbar. Guides and margins stay on the canvas.",
+        );
+        if export.clicked() {
+            self.export_current();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button(quit_label()).clicked() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        if menu_command(ui, "Select", Some("Esc"), self.tool == Tool::Select) {
+            self.tool = Tool::Select;
+        }
+        ui.separator();
+        let delete = ui.add_enabled(
+            self.selection.is_some(),
+            egui::Button::new("Delete").shortcut_text("Del"),
+        );
+        if delete.clicked() {
+            self.delete_selection();
+            ui.close();
+        }
+    }
+
+    fn insert_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(220.0);
+        let text = ui
+            .button("Text")
+            .on_hover_text("Place a default-sized text field at the center of the visible page.");
+        if text.clicked() {
+            self.insert_at_view(FieldKind::Text);
+            ui.close();
+        }
+        let checkbox = ui
+            .button("Checkbox")
+            .on_hover_text("Place a default-sized checkbox at the center of the visible page.");
+        if checkbox.clicked() {
+            self.insert_at_view(FieldKind::Checkbox);
+            ui.close();
+        }
+    }
+
+    /// Insert menu drops a field. The toolbar tools stay armed for drawing.
+    fn insert_at_view(&mut self, kind: FieldKind) {
+        let rect = self.default_insert_rect(kind);
+        let id = self.doc.add_field(kind, rect);
+        self.selection = Some(id);
+        self.drag = None;
+        self.status = format!("Placed {}", kind.label().to_lowercase());
+    }
+
+    /// Default size, centered on the visible page, snapped when snap is on.
+    /// A later insert steps down, then right, so it does not cover the last one.
+    fn default_insert_rect(&self, kind: FieldKind) -> RectPt {
+        let (w, h) = default_size(kind, self.grid_size);
+        let page = self.doc.page();
+        let grid = self.snap_grid();
+        let first = anchor_for_center(self.visible_page_center(), w, h);
+        let mut anchor = first;
+        let mut placed = place_default(first, w, h, grid, &page);
+        for _ in 0..48 {
+            placed = place_default(anchor, w, h, grid, &page);
+            if !self
+                .doc
+                .fields()
+                .iter()
+                .any(|field| rects_overlap(field.rect(), placed))
+            {
+                return placed;
+            }
+            let below = PdfPoint {
+                x: placed.x,
+                y: placed.y,
+            };
+            let stepped = place_default(below, w, h, grid, &page);
+            if same_rect(stepped, placed) {
+                let right = PdfPoint {
+                    x: placed.right(),
+                    y: first.y,
+                };
+                let stepped_right = place_default(right, w, h, grid, &page);
+                if same_rect(stepped_right, placed) {
+                    return placed;
+                }
+                anchor = right;
+            } else {
+                anchor = below;
+            }
+        }
+        placed
+    }
+
+    /// Center of the page area currently inside the canvas. The page center if
+    /// the canvas is not ready yet or the page is panned fully out of view.
+    fn visible_page_center(&self) -> PdfPoint {
+        let page = self.doc.page();
+        let page_center = PdfPoint {
+            x: page.width * 0.5,
+            y: page.height * 0.5,
+        };
+        let Some(canvas) = self.canvas_rect else {
+            return page_center;
+        };
+        let screen = self.view.pdf_rect_to_screen(RectPt {
+            x: 0.0,
+            y: 0.0,
+            w: page.width,
+            h: page.height,
+        });
+        let left = canvas.left().max(screen.x);
+        let right = canvas.right().min(screen.x + screen.w);
+        let top = canvas.top().max(screen.y);
+        let bottom = canvas.bottom().min(screen.y + screen.h);
+        if right - left < 1.0 || bottom - top < 1.0 {
+            return page_center;
+        }
+        self.view
+            .screen_to_pdf((left + right) * 0.5, (top + bottom) * 0.5)
+    }
+
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        ui.checkbox(&mut self.dots_visible, "Grid dots");
+        ui.checkbox(&mut self.guides_visible, "Guide lines");
+        ui.checkbox(&mut self.margins_visible, "Print-safe margin");
+        ui.checkbox(&mut self.snap, "Snap");
+        ui.separator();
+        ui.label("Grid size");
+        for size in GridSize::ALL {
+            ui.radio_value(&mut self.grid_size, size, size.label());
+        }
+        ui.separator();
+        ui.label("Theme");
+        let before = self.dark;
+        ui.radio_value(&mut self.dark, true, "Dark");
+        ui.radio_value(&mut self.dark, false, "Light");
+        if self.dark != before {
+            self.persist_theme = true;
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.heading("PageForm");
-            ui.separator();
             ui.selectable_value(&mut self.tool, Tool::Select, "Select");
             ui.selectable_value(&mut self.tool, Tool::Text, "Text field");
             ui.selectable_value(&mut self.tool, Tool::Checkbox, "Checkbox");
             ui.separator();
-            ui.toggle_value(&mut self.dots_visible, "Dots");
-            ui.toggle_value(&mut self.guides_visible, "Guides");
-            ui.toggle_value(&mut self.margins_visible, "Margins");
+            ui.toggle_value(&mut self.dots_visible, "Dots")
+                .on_hover_text("Grid dots");
+            ui.toggle_value(&mut self.guides_visible, "Guides")
+                .on_hover_text("Guide lines. Canvas only.");
+            ui.toggle_value(&mut self.margins_visible, "Margins")
+                .on_hover_text("Print-safe margin. Canvas only.");
             for size in GridSize::ALL {
                 ui.selectable_value(&mut self.grid_size, size, size.label());
             }
@@ -192,26 +368,24 @@ impl PageFormApp {
             ui.label("Export");
             ui.add(
                 egui::TextEdit::singleline(&mut self.export_path)
-                    .desired_width(180.0)
+                    .desired_width(160.0)
                     .hint_text("sample-form.pdf"),
             );
             if ui.button("Export PDF").clicked() {
                 self.export_current();
             }
+            ui.separator();
+            if ui
+                .button(crate::theme::toggle_label(self.dark))
+                .on_hover_text(crate::theme::toggle_tip(self.dark))
+                .clicked()
+            {
+                self.set_dark(!self.dark);
+            }
         });
     }
 
     fn properties(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Theme");
-        if ui
-            .button(crate::theme::toggle_label(self.dark))
-            .on_hover_text(crate::theme::toggle_tip(self.dark))
-            .clicked()
-        {
-            self.dark = !self.dark;
-            self.persist_theme = true;
-        }
-        ui.add_space(8.0);
         ui.heading("Page");
         let page = self.doc.page();
         ui.label(format!(
@@ -255,7 +429,7 @@ impl PageFormApp {
 
         let Some(id) = self.selection else {
             ui.label("No field selected.");
-            ui.label("Use Text field or Checkbox, then drag on the page. A click places a default-size field.");
+            ui.label("Toolbar Text field or Checkbox draws on the page. Insert drops a default field in the view.");
             return;
         };
         let Some(field) = self.doc.field(id) else {
@@ -334,11 +508,7 @@ impl PageFormApp {
             if ctx
                 .input(|input| input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace))
             {
-                if let Some(id) = self.selection {
-                    self.doc.remove(id);
-                    self.selection = None;
-                    self.drag = None;
-                }
+                self.delete_selection();
             }
         }
 
@@ -675,10 +845,13 @@ impl eframe::App for PageFormApp {
             }
             self.persist_theme = false;
         }
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            self.menu_bar(ui);
+        });
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             self.toolbar(ui);
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -766,10 +939,161 @@ fn on_step(value: f32, step: f32) -> bool {
     ((value / step).round() * step - value).abs() < 0.05
 }
 
+/// File → Quit on Linux. File → Exit on Windows.
+fn quit_label() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Exit"
+    } else {
+        "Quit"
+    }
+}
+
+fn anchor_for_center(center: PdfPoint, w: f32, h: f32) -> PdfPoint {
+    PdfPoint {
+        x: center.x - w * 0.5,
+        y: center.y + h * 0.5,
+    }
+}
+
+fn same_rect(a: RectPt, b: RectPt) -> bool {
+    (a.x - b.x).abs() < 0.5
+        && (a.y - b.y).abs() < 0.5
+        && (a.w - b.w).abs() < 0.5
+        && (a.h - b.h).abs() < 0.5
+}
+
+fn rects_overlap(a: RectPt, b: RectPt) -> bool {
+    a.x < b.right() - 0.5 && b.x < a.right() - 0.5 && a.y < b.top() - 0.5 && b.y < a.top() - 0.5
+}
+
+fn menu_command(ui: &mut egui::Ui, label: &str, shortcut: Option<&str>, selected: bool) -> bool {
+    let mut button = egui::Button::new(label).selected(selected);
+    if let Some(shortcut) = shortcut {
+        button = button.shortcut_text(shortcut);
+    }
+    let clicked = ui.add(button).clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+
 fn fmt_pt(value: f32) -> String {
     if (value - value.round()).abs() < 0.05 {
         format!("{}", value.round() as i32)
     } else {
         format!("{value:.1}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_label_matches_the_desktop() {
+        let label = quit_label();
+        if cfg!(target_os = "windows") {
+            assert_eq!(label, "Exit");
+        } else {
+            assert_eq!(label, "Quit");
+        }
+    }
+
+    #[test]
+    fn delete_removes_the_selected_field() {
+        let mut app = PageFormApp::new(true, None);
+        let id = app.doc.fields()[0].id();
+        app.selection = Some(id);
+        app.delete_selection();
+        assert!(app.doc.field(id).is_none());
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert_eq!(app.status, "Deleted field");
+        assert_eq!(app.doc.fields().len(), 1);
+    }
+
+    #[test]
+    fn delete_with_nothing_selected_leaves_the_page() {
+        let mut app = PageFormApp::new(false, None);
+        app.delete_selection();
+        assert!(app.doc.fields().is_empty());
+        assert_eq!(app.status, "Blank US Letter page");
+    }
+
+    #[test]
+    fn insert_menu_drops_a_default_field_at_the_page_center() {
+        let mut app = PageFormApp::new(false, None);
+        app.tool = Tool::Checkbox;
+        app.insert_at_view(FieldKind::Text);
+        assert_eq!(app.tool, Tool::Checkbox);
+        assert_eq!(app.doc.fields().len(), 1);
+        let field = &app.doc.fields()[0];
+        assert_eq!(field.kind(), FieldKind::Text);
+        assert_eq!(app.selection, Some(field.id()));
+        let rect = field.rect();
+        let (w, h) = default_size(FieldKind::Text, GridSize::Medium);
+        assert!((rect.w - w).abs() < 0.1);
+        assert!((rect.h - h).abs() < 0.1);
+        assert!((rect.x + rect.w * 0.5 - 306.0).abs() < 0.1);
+        assert!((rect.y + rect.h * 0.5 - 396.0).abs() < 0.1);
+        assert!(on_step(rect.x, GridSize::Medium.minor_pt()));
+        assert!(on_step(rect.y, GridSize::Medium.minor_pt()));
+    }
+
+    #[test]
+    fn insert_menu_steps_past_a_field_already_in_the_view() {
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        app.insert_at_view(FieldKind::Checkbox);
+        app.insert_at_view(FieldKind::Text);
+        let fields = app.doc.fields();
+        assert_eq!(fields.len(), 3);
+        assert!(!rects_overlap(fields[0].rect(), fields[1].rect()));
+        assert!(!rects_overlap(fields[0].rect(), fields[2].rect()));
+        assert!(!rects_overlap(fields[1].rect(), fields[2].rect()));
+        assert!(fields[1].rect().top() <= fields[0].rect().y + 0.5);
+    }
+
+    #[test]
+    fn insert_menu_uses_the_visible_page_not_the_page_center() {
+        let mut app = PageFormApp::new(false, None);
+        app.view.zoom = 2.0;
+        app.view.origin_x = 0.0;
+        app.view.origin_y = 0.0;
+        app.view.page_height = app.doc.page().height;
+        app.canvas_rect = Some(Rect::from_min_max(
+            Pos2::new(0.0, 0.0),
+            Pos2::new(200.0, 200.0),
+        ));
+        let center = app.visible_page_center();
+        assert!((center.x - 50.0).abs() < 0.1);
+        assert!((center.y - 742.0).abs() < 0.1);
+        app.insert_at_view(FieldKind::Checkbox);
+        let rect = app.doc.fields()[0].rect();
+        let (w, h) = default_size(FieldKind::Checkbox, GridSize::Medium);
+        assert!((rect.w - w).abs() < 0.1);
+        assert!((rect.h - h).abs() < 0.1);
+        assert!((rect.x + rect.w * 0.5 - center.x).abs() < app.grid_size.minor_pt());
+        assert!((rect.y + rect.h * 0.5 - center.y).abs() < app.grid_size.minor_pt());
+        assert!(rect.x >= 0.0 && rect.y >= 0.0);
+        assert!(rect.right() <= app.doc.page().width + 0.1);
+        assert!(rect.top() <= app.doc.page().height + 0.1);
+    }
+
+    #[test]
+    fn theme_switch_is_marked_for_save_and_dark_stays_default() {
+        let mut app = PageFormApp::new(false, None);
+        assert!(app.dark);
+        assert!(!app.persist_theme);
+        app.set_dark(false);
+        assert!(!app.dark);
+        assert!(app.persist_theme);
+        app.persist_theme = false;
+        app.set_dark(false);
+        assert!(!app.persist_theme);
+        app.set_dark(true);
+        assert!(app.dark);
+        assert!(app.persist_theme);
     }
 }
