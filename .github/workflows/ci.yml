@@ -51,3 +51,34 @@ jobs:
             target/sample-form.pdf
             target/sample-canvas.png
           if-no-files-found: error
+
+      - name: Build Windows release executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Statically link the CRT so the download does not depend on a
+          # separate Visual C++ redistributable. Windows system libraries
+          # (user32, d3d12, and so on) stay on the machine.
+          $env:RUSTFLAGS = "-C target-feature=+crt-static"
+          cargo build --release -p pageform
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Force target\release\pageform.exe dist\PageForm.exe
+          Get-ChildItem target\release -Filter *.dll -File | ForEach-Object {
+            Copy-Item -Force $_.FullName (Join-Path dist $_.Name)
+          }
+          $exe = Get-Item dist\PageForm.exe
+          Write-Host "dist\PageForm.exe size: $($exe.Length) bytes"
+          if ($exe.Length -lt 1MB) {
+            throw "PageForm.exe is only $($exe.Length) bytes; expected the release egui app."
+          }
+          Get-ChildItem dist | Format-Table Name, Length -AutoSize
+
+      - name: Upload Windows executable
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pageform-windows-exe
+          path: dist/
+          if-no-files-found: error
