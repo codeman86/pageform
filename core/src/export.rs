@@ -89,7 +89,9 @@ pub fn export_pdf(doc: &Document) -> Result<Vec<u8>, ExportError> {
 
     pdf.pages(pages_id).count(1).kids([page_id]);
 
-    pdf.type1_font(font_id).base_font(Name(b"Helvetica"));
+    pdf.type1_font(font_id)
+        .base_font(Name(b"Helvetica"))
+        .encoding_predefined(Name(b"WinAnsiEncoding"));
 
     let mut catalog = pdf.catalog(catalog_id);
     catalog.pages(pages_id);

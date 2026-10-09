@@ -47,6 +47,22 @@ fn sample_pdf_has_two_acroform_fields_at_canvas_rects() {
     let acro = deref(&doc, catalog.get(b"AcroForm").expect("AcroForm"));
     let acro = acro.as_dict().expect("AcroForm dict");
     assert!(acro.get(b"NeedAppearances").is_err());
+    let dr = deref(&doc, acro.get(b"DR").expect("DR"));
+    let fonts = deref(&doc, dr.as_dict().expect("DR").get(b"Font").expect("Font"));
+    let helv = deref(
+        &doc,
+        fonts.as_dict().expect("Font").get(b"Helv").expect("Helv"),
+    );
+    let helv = helv.as_dict().expect("Helv font");
+    assert_name(
+        deref(&doc, helv.get(b"BaseFont").expect("BaseFont")),
+        b"Helvetica",
+    );
+    assert_name(
+        deref(&doc, helv.get(b"Encoding").expect("Encoding")),
+        b"WinAnsiEncoding",
+    );
+
     let da = string_bytes(deref(&doc, acro.get(b"DA").expect("AcroForm DA")));
     assert!(
         contains(da, b"/Helv") && contains(da, b"Tf"),
