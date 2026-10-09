@@ -96,11 +96,16 @@ Usage:
 Scroll to zoom. Middle-drag or Space-drag to pan.
 The window opens in the dark theme. View → Dark / Light, or the toolbar
 button, switches it and the choice is restored next launch.
-File exports the toolbar path. Edit selects or deletes. Insert → Text
-and Insert → Checkbox drop a default field in the view. The toolbar
-Text field and Checkbox tools still arm drawing on the page.
+File exports the toolbar path. Edit selects, deletes, or opens Preferences.
+Insert drops a default item in the view: Text Field, Text (static label),
+Checkbox, Radio, Table, Signature, Date, Drop-down, Line, Square/Rectangle,
+Text Box, and Image. The matching toolbar tool arms drawing on the page.
+A selected radio makes the next radio join that group. Preferences can hide
+the label beside each radio. There is no list box.
+View toggles grid dots, guide lines, the print-safe margin, header, footer,
+page numbers, and snap, and chooses the grid size and Dark or Light.
+Header, footer, and page numbers are canvas only.
 Grid sizes: Small (1/16 in), Medium (1/8 in, default), Large (1/4 in).
-Dots cover the page. Guide lines and the print-safe margin are canvas only.
 Snap follows the active size so columns and rows stay even."
     );
 }

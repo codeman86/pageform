@@ -44,24 +44,65 @@ pub fn render_preview(
         let rect = field.rect();
         let (x, y, w, h) = pdf_rect_px(rect, page.height);
         let border = match field.kind() {
-            FieldKind::Text => [36, 64, 112],
-            FieldKind::Checkbox => [32, 32, 36],
+            FieldKind::Checkbox | FieldKind::Radio => [32, 32, 36],
+            FieldKind::Table => [90, 96, 110],
+            FieldKind::Line | FieldKind::Rectangle => [36, 48, 72],
+            _ => [36, 64, 112],
         };
-        image.fill_rect(x, y, w, h, [255, 255, 255]);
-        image.stroke_rect(x, y, w, h, 2.0, border);
-        match field.kind() {
-            FieldKind::Text => {
-                image.text(x + 8.0, y + 8.0, field.name(), [40, 48, 64], 2);
+        if let Some((start, end)) = field.line_ends() {
+            let (x0, y0, _, _) = pdf_rect_px(
+                RectPt {
+                    x: start.x,
+                    y: start.y,
+                    w: 0.0,
+                    h: 0.0,
+                },
+                page.height,
+            );
+            let (x1, y1, _, _) = pdf_rect_px(
+                RectPt {
+                    x: end.x,
+                    y: end.y,
+                    w: 0.0,
+                    h: 0.0,
+                },
+                page.height,
+            );
+            image.hline(
+                x0.min(x1),
+                (y0 + y1) * 0.5,
+                (x1 - x0).abs().max(2.0),
+                2.0,
+                border,
+            );
+            continue;
+        }
+        let fill = !matches!(field.kind(), FieldKind::StaticText | FieldKind::Rectangle);
+        if fill {
+            image.fill_rect(x, y, w, h, [255, 255, 255]);
+        }
+        if field.kind() != FieldKind::StaticText {
+            image.stroke_rect(x, y, w, h, 2.0, border);
+        }
+        let label = match field.kind() {
+            FieldKind::Text
+            | FieldKind::Checkbox
+            | FieldKind::Signature
+            | FieldKind::Date
+            | FieldKind::Dropdown => field.name(),
+            FieldKind::StaticText | FieldKind::Radio | FieldKind::TextBox | FieldKind::Image => {
+                field.caption()
             }
-            FieldKind::Checkbox => {
-                image.text(
-                    x + w + 8.0,
-                    y + (h - 16.0).max(0.0) * 0.5,
-                    field.name(),
-                    [40, 48, 64],
-                    2,
-                );
-            }
+            FieldKind::Table => "placeholder",
+            FieldKind::Line | FieldKind::Rectangle => "",
+        };
+        if !label.is_empty() {
+            let text_x = if matches!(field.kind(), FieldKind::Checkbox | FieldKind::Radio) {
+                x + w + 8.0
+            } else {
+                x + 8.0
+            };
+            image.text(text_x, y + 8.0, label, [40, 48, 64], 2);
         }
     }
 
