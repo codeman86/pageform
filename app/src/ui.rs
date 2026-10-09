@@ -165,17 +165,107 @@ impl PageFormApp {
         }
     }
 
+    fn set_dark(&mut self, dark: bool) {
+        if self.dark != dark {
+            self.dark = dark;
+            self.persist_theme = true;
+        }
+    }
+
+    fn delete_selection(&mut self) {
+        let Some(id) = self.selection else {
+            return;
+        };
+        if self.doc.remove(id) {
+            self.status = "Deleted field".to_string();
+        }
+        self.selection = None;
+        self.drag = None;
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("File", |ui| self.file_menu(ui));
+            ui.menu_button("Edit", |ui| self.edit_menu(ui));
+            ui.menu_button("Insert", |ui| self.insert_menu(ui));
+            ui.menu_button("View", |ui| self.view_menu(ui));
+        });
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        let export = ui.button("Export PDF").on_hover_text(
+            "Write a fillable PDF to the path in the toolbar. Guides and margins stay on the canvas.",
+        );
+        if export.clicked() {
+            self.export_current();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button(quit_label()).clicked() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        if menu_command(ui, "Select", Some("Esc"), self.tool == Tool::Select) {
+            self.tool = Tool::Select;
+        }
+        ui.separator();
+        let delete = ui.add_enabled(
+            self.selection.is_some(),
+            egui::Button::new("Delete").shortcut_text("Del"),
+        );
+        if delete.clicked() {
+            self.delete_selection();
+            ui.close();
+        }
+    }
+
+    fn insert_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        if menu_command(ui, "Text field", None, self.tool == Tool::Text) {
+            self.tool = Tool::Text;
+        }
+        if menu_command(ui, "Checkbox", None, self.tool == Tool::Checkbox) {
+            self.tool = Tool::Checkbox;
+        }
+    }
+
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        ui.checkbox(&mut self.dots_visible, "Grid dots");
+        ui.checkbox(&mut self.guides_visible, "Guide lines");
+        ui.checkbox(&mut self.margins_visible, "Print-safe margin");
+        ui.checkbox(&mut self.snap, "Snap");
+        ui.separator();
+        ui.label("Grid size");
+        for size in GridSize::ALL {
+            ui.radio_value(&mut self.grid_size, size, size.label());
+        }
+        ui.separator();
+        ui.label("Theme");
+        let before = self.dark;
+        ui.radio_value(&mut self.dark, true, "Dark");
+        ui.radio_value(&mut self.dark, false, "Light");
+        if self.dark != before {
+            self.persist_theme = true;
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.heading("PageForm");
-            ui.separator();
             ui.selectable_value(&mut self.tool, Tool::Select, "Select");
             ui.selectable_value(&mut self.tool, Tool::Text, "Text field");
             ui.selectable_value(&mut self.tool, Tool::Checkbox, "Checkbox");
             ui.separator();
-            ui.toggle_value(&mut self.dots_visible, "Dots");
-            ui.toggle_value(&mut self.guides_visible, "Guides");
-            ui.toggle_value(&mut self.margins_visible, "Margins");
+            ui.toggle_value(&mut self.dots_visible, "Dots")
+                .on_hover_text("Grid dots");
+            ui.toggle_value(&mut self.guides_visible, "Guides")
+                .on_hover_text("Guide lines. Canvas only.");
+            ui.toggle_value(&mut self.margins_visible, "Margins")
+                .on_hover_text("Print-safe margin. Canvas only.");
             for size in GridSize::ALL {
                 ui.selectable_value(&mut self.grid_size, size, size.label());
             }
@@ -192,26 +282,24 @@ impl PageFormApp {
             ui.label("Export");
             ui.add(
                 egui::TextEdit::singleline(&mut self.export_path)
-                    .desired_width(180.0)
+                    .desired_width(160.0)
                     .hint_text("sample-form.pdf"),
             );
             if ui.button("Export PDF").clicked() {
                 self.export_current();
             }
+            ui.separator();
+            if ui
+                .button(crate::theme::toggle_label(self.dark))
+                .on_hover_text(crate::theme::toggle_tip(self.dark))
+                .clicked()
+            {
+                self.set_dark(!self.dark);
+            }
         });
     }
 
     fn properties(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Theme");
-        if ui
-            .button(crate::theme::toggle_label(self.dark))
-            .on_hover_text(crate::theme::toggle_tip(self.dark))
-            .clicked()
-        {
-            self.dark = !self.dark;
-            self.persist_theme = true;
-        }
-        ui.add_space(8.0);
         ui.heading("Page");
         let page = self.doc.page();
         ui.label(format!(
@@ -334,11 +422,7 @@ impl PageFormApp {
             if ctx
                 .input(|input| input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace))
             {
-                if let Some(id) = self.selection {
-                    self.doc.remove(id);
-                    self.selection = None;
-                    self.drag = None;
-                }
+                self.delete_selection();
             }
         }
 
@@ -675,10 +759,13 @@ impl eframe::App for PageFormApp {
             }
             self.persist_theme = false;
         }
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            self.menu_bar(ui);
+        });
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             self.toolbar(ui);
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -766,10 +853,83 @@ fn on_step(value: f32, step: f32) -> bool {
     ((value / step).round() * step - value).abs() < 0.05
 }
 
+/// File → Quit on Linux. File → Exit on Windows.
+fn quit_label() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Exit"
+    } else {
+        "Quit"
+    }
+}
+
+fn menu_command(ui: &mut egui::Ui, label: &str, shortcut: Option<&str>, selected: bool) -> bool {
+    let mut button = egui::Button::new(label).selected(selected);
+    if let Some(shortcut) = shortcut {
+        button = button.shortcut_text(shortcut);
+    }
+    let clicked = ui.add(button).clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+
 fn fmt_pt(value: f32) -> String {
     if (value - value.round()).abs() < 0.05 {
         format!("{}", value.round() as i32)
     } else {
         format!("{value:.1}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_label_matches_the_desktop() {
+        let label = quit_label();
+        if cfg!(target_os = "windows") {
+            assert_eq!(label, "Exit");
+        } else {
+            assert_eq!(label, "Quit");
+        }
+    }
+
+    #[test]
+    fn delete_removes_the_selected_field() {
+        let mut app = PageFormApp::new(true, None);
+        let id = app.doc.fields()[0].id();
+        app.selection = Some(id);
+        app.delete_selection();
+        assert!(app.doc.field(id).is_none());
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert_eq!(app.status, "Deleted field");
+        assert_eq!(app.doc.fields().len(), 1);
+    }
+
+    #[test]
+    fn delete_with_nothing_selected_leaves_the_page() {
+        let mut app = PageFormApp::new(false, None);
+        app.delete_selection();
+        assert!(app.doc.fields().is_empty());
+        assert_eq!(app.status, "Blank US Letter page");
+    }
+
+    #[test]
+    fn theme_switch_is_marked_for_save_and_dark_stays_default() {
+        let mut app = PageFormApp::new(false, None);
+        assert!(app.dark);
+        assert!(!app.persist_theme);
+        app.set_dark(false);
+        assert!(!app.dark);
+        assert!(app.persist_theme);
+        app.persist_theme = false;
+        app.set_dark(false);
+        assert!(!app.persist_theme);
+        app.set_dark(true);
+        assert!(app.dark);
+        assert!(app.persist_theme);
     }
 }
