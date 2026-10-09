@@ -96,8 +96,9 @@ Usage:
 Scroll to zoom. Middle-drag or Space-drag to pan.
 The window opens in the dark theme. View → Dark / Light, or the toolbar
 button, switches it and the choice is restored next launch.
-File exports the toolbar path. Edit selects or deletes. Insert arms the
-text field or checkbox tool.
+File exports the toolbar path. Edit selects or deletes. Insert → Text
+and Insert → Checkbox drop a default field in the view. The toolbar
+Text field and Checkbox tools still arm drawing on the page.
 Grid sizes: Small (1/16 in), Medium (1/8 in, default), Large (1/4 in).
 Dots cover the page. Guide lines and the print-safe margin are canvas only.
 Snap follows the active size so columns and rows stay even."
