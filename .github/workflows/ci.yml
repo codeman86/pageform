@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS is out of scope for Milestone 0.
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux build packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libvulkan-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libssl-dev
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Export sample PDF and canvas preview
+        run: cargo run -p pageform -- --export target/sample-form.pdf --preview target/sample-canvas.png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pageform-m0-${{ matrix.os }}
+          path: |
+            target/sample-form.pdf
+            target/sample-canvas.png
+          if-no-files-found: error
