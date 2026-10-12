@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PageForm
+Comment=Open-source native form and document editor
+Exec=pageform
+Icon=pageform
+Categories=Graphics;Office;
+Terminal=false
+StartupWMClass=pageform

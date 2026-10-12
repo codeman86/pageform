@@ -1,12 +1,16 @@
 //! egui canvas. Geometry and PDF export live in `pageform-core`.
 
+#[path = "icons.rs"]
+mod icons;
+
 use eframe::egui::{
     self, Align2, CursorIcon, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2,
 };
 use pageform_core::{
     default_size, export_pdf, hit_handle, move_rect, place_default, print_safe_rect,
-    rect_from_drag, resize_rect, Document, FieldKind, GridSize, Handle, Page, PdfPoint, RectPt,
-    ScreenRect, ViewTransform,
+    rect_from_drag, resize_rect, snap_point, Document, FieldId, FieldKind, GridSize, Handle, Page,
+    PdfPoint, RectPt, ScreenRect, ViewTransform, DATE_HINT, PRINT_SAFE_MARGIN_PT, TABLE_COLUMNS,
+    TABLE_ROWS,
 };
 
 pub fn run_gui(demo: bool) -> eframe::Result<()> {
@@ -28,11 +32,59 @@ pub fn run_gui(demo: bool) -> eframe::Result<()> {
     )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
     Select,
     Text,
+    StaticText,
     Checkbox,
+    Radio,
+    Table,
+    Signature,
+    Date,
+    Dropdown,
+    Line,
+    Square,
+    Rectangle,
+    TextBox,
+    Image,
+}
+
+impl Tool {
+    fn place_kind(self) -> Option<FieldKind> {
+        match self {
+            Tool::Select => None,
+            Tool::Text => Some(FieldKind::Text),
+            Tool::StaticText => Some(FieldKind::StaticText),
+            Tool::Checkbox => Some(FieldKind::Checkbox),
+            Tool::Radio => Some(FieldKind::Radio),
+            Tool::Table => Some(FieldKind::Table),
+            Tool::Signature => Some(FieldKind::Signature),
+            Tool::Date => Some(FieldKind::Date),
+            Tool::Dropdown => Some(FieldKind::Dropdown),
+            Tool::Line => Some(FieldKind::Line),
+            Tool::Square | Tool::Rectangle => Some(FieldKind::Rectangle),
+            Tool::TextBox => Some(FieldKind::TextBox),
+            Tool::Image => Some(FieldKind::Image),
+        }
+    }
+
+    fn for_kind(kind: FieldKind) -> Self {
+        match kind {
+            FieldKind::Text => Tool::Text,
+            FieldKind::StaticText => Tool::StaticText,
+            FieldKind::Checkbox => Tool::Checkbox,
+            FieldKind::Radio => Tool::Radio,
+            FieldKind::Table => Tool::Table,
+            FieldKind::Signature => Tool::Signature,
+            FieldKind::Date => Tool::Date,
+            FieldKind::Dropdown => Tool::Dropdown,
+            FieldKind::Line => Tool::Line,
+            FieldKind::Rectangle => Tool::Rectangle,
+            FieldKind::TextBox => Tool::TextBox,
+            FieldKind::Image => Tool::Image,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -43,24 +95,31 @@ enum Drag {
         kind: FieldKind,
     },
     Move {
-        id: pageform_core::FieldId,
+        id: FieldId,
         grab_x: f32,
         grab_y: f32,
     },
     Resize {
-        id: pageform_core::FieldId,
+        id: FieldId,
         handle: Handle,
         origin: RectPt,
+    },
+    LineEnd {
+        id: FieldId,
+        index: usize,
     },
 }
 
 struct PageFormApp {
     doc: Document,
     tool: Tool,
-    selection: Option<pageform_core::FieldId>,
+    selection: Option<FieldId>,
     dots_visible: bool,
     guides_visible: bool,
     margins_visible: bool,
+    header_visible: bool,
+    footer_visible: bool,
+    page_numbers_visible: bool,
     grid_size: GridSize,
     snap: bool,
     view: ViewTransform,
@@ -68,12 +127,17 @@ struct PageFormApp {
     canvas_rect: Option<Rect>,
     drag: Option<Drag>,
     name_buf: String,
-    name_for: Option<pageform_core::FieldId>,
+    caption_buf: String,
+    options_buf: String,
+    name_for: Option<FieldId>,
     name_error: Option<String>,
     export_path: String,
     status: String,
     dark: bool,
     persist_theme: bool,
+    show_preferences: bool,
+    show_about: bool,
+    show_help: bool,
 }
 
 impl PageFormApp {
@@ -93,12 +157,17 @@ impl PageFormApp {
             dots_visible: true,
             guides_visible: true,
             margins_visible: true,
+            header_visible: false,
+            footer_visible: false,
+            page_numbers_visible: false,
             grid_size: GridSize::Medium,
             snap: true,
             fitted: false,
             canvas_rect: None,
             drag: None,
             name_buf: String::new(),
+            caption_buf: String::new(),
+            options_buf: String::new(),
             name_for: None,
             name_error: None,
             export_path: "sample-form.pdf".to_string(),
@@ -109,6 +178,9 @@ impl PageFormApp {
             },
             dark: crate::theme::is_dark(stored.as_deref()),
             persist_theme: false,
+            show_preferences: false,
+            show_about: false,
+            show_help: false,
         }
     }
 
@@ -141,9 +213,17 @@ impl PageFormApp {
         let dx = x0 - x1;
         let dy = y0 - y1;
         let page = self.doc.page();
+        let square = self.tool == Tool::Square && kind == FieldKind::Rectangle;
         if dx * dx + dy * dy < 16.0 {
-            let (w, h) = default_size(kind, self.grid_size);
+            let (mut w, mut h) = default_size(kind, self.grid_size);
+            if square {
+                let side = w.min(h);
+                w = side;
+                h = side;
+            }
             place_default(start, w, h, self.snap_grid(), &page)
+        } else if square {
+            square_from_drag(start, current, self.snap_grid(), self.min_size(), &page)
         } else {
             rect_from_drag(start, current, self.snap_grid(), self.min_size(), &page)
         }
@@ -165,53 +245,585 @@ impl PageFormApp {
         }
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("PageForm");
-            ui.separator();
-            ui.selectable_value(&mut self.tool, Tool::Select, "Select");
-            ui.selectable_value(&mut self.tool, Tool::Text, "Text field");
-            ui.selectable_value(&mut self.tool, Tool::Checkbox, "Checkbox");
-            ui.separator();
-            ui.toggle_value(&mut self.dots_visible, "Dots");
-            ui.toggle_value(&mut self.guides_visible, "Guides");
-            ui.toggle_value(&mut self.margins_visible, "Margins");
-            for size in GridSize::ALL {
-                ui.selectable_value(&mut self.grid_size, size, size.label());
-            }
-            ui.toggle_value(&mut self.snap, "Snap");
-            ui.label(self.grid_size.minor_label());
-            ui.separator();
-            if ui.button("Fit").clicked() {
-                if let Some(rect) = self.canvas_rect {
-                    self.fit(rect);
+    fn set_dark(&mut self, dark: bool) {
+        if self.dark != dark {
+            self.dark = dark;
+            self.persist_theme = true;
+        }
+    }
+
+    fn delete_selection(&mut self) {
+        let Some(id) = self.selection else {
+            return;
+        };
+        if self.doc.remove(id) {
+            self.status = "Deleted field".to_string();
+        }
+        self.selection = None;
+        self.drag = None;
+    }
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::MenuBar::new().ui(ui, |ui| {
+            for label in MENU_BAR {
+                match *label {
+                    "File" => {
+                        ui.menu_button(*label, |ui| self.file_menu(ui));
+                    }
+                    "Edit" => {
+                        ui.menu_button(*label, |ui| self.edit_menu(ui));
+                    }
+                    "Insert" => {
+                        ui.menu_button(*label, |ui| self.insert_menu(ui));
+                    }
+                    "View" => {
+                        ui.menu_button(*label, |ui| self.view_menu(ui));
+                    }
+                    "Help" => {
+                        ui.menu_button(*label, |ui| self.help_menu(ui));
+                    }
+                    _ => unreachable!("unknown menu {label}"),
                 }
             }
-            ui.label(format!("{}%", (self.view.zoom * 100.0).round() as i32));
-            ui.separator();
-            ui.label("Export");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.export_path)
-                    .desired_width(180.0)
-                    .hint_text("sample-form.pdf"),
+        });
+    }
+
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        for label in FILE_MENU {
+            if label.is_empty() {
+                ui.separator();
+                continue;
+            }
+            match *label {
+                "Export PDF" => {
+                    let tip = format!(
+                        "Write a fillable PDF to {}. Guides and margins stay on the canvas.",
+                        self.export_path
+                    );
+                    let export = ui.button(*label).on_hover_text(tip);
+                    if export.clicked() {
+                        self.export_current();
+                        ui.close();
+                    }
+                }
+                "Exit" => {
+                    if ui.button(*label).clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                "New" => {
+                    ui.menu_button("New", |ui| {
+                        ui.set_min_width(180.0);
+                        for item in NEW_MENU {
+                            if ui.button(*item).clicked() {
+                                self.mark_not_implemented(item);
+                                ui.close_kind(egui::UiKind::Menu);
+                            }
+                        }
+                    });
+                }
+                other => self.stub_item(ui, other),
+            }
+        }
+    }
+
+    fn edit_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        for label in EDIT_MENU {
+            if label.is_empty() {
+                ui.separator();
+                continue;
+            }
+            match *label {
+                "Select" => {
+                    if menu_command(ui, label, Some("Esc"), self.tool == Tool::Select) {
+                        self.tool = Tool::Select;
+                    }
+                }
+                "Delete" => {
+                    let delete = ui.add_enabled(
+                        self.selection.is_some(),
+                        egui::Button::new(*label).shortcut_text("Del"),
+                    );
+                    if delete.clicked() {
+                        self.delete_selection();
+                        ui.close();
+                    }
+                }
+                "Preferences" => {
+                    if ui.button(*label).clicked() {
+                        self.show_preferences = true;
+                        ui.close();
+                    }
+                }
+                other => self.stub_item(ui, other),
+            }
+        }
+    }
+
+    fn help_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(160.0);
+        for label in HELP_MENU {
+            match *label {
+                "Help" => {
+                    if ui.button(*label).clicked() {
+                        self.show_help = true;
+                        ui.close();
+                    }
+                }
+                "About" => {
+                    if ui.button(*label).clicked() {
+                        self.show_about = true;
+                        ui.close();
+                    }
+                }
+                other => self.stub_item(ui, other),
+            }
+        }
+    }
+
+    fn stub_item(&mut self, ui: &mut egui::Ui, label: &str) {
+        let button = ui.button(label).on_hover_text("Not implemented yet");
+        if button.clicked() {
+            self.mark_not_implemented(label);
+            ui.close();
+        }
+    }
+
+    fn mark_not_implemented(&mut self, command: &str) {
+        self.status = format!("{command} is not implemented yet");
+    }
+
+    fn insert_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(240.0);
+        for kind in sorted_insert_kinds() {
+            let button = ui.button(kind.label()).on_hover_text(insert_tip(kind));
+            if button.clicked() {
+                self.insert_at_view(kind);
+                ui.close();
+            }
+        }
+    }
+
+    /// Insert menu drops a field. The toolbar tools stay armed for drawing.
+    fn insert_at_view(&mut self, kind: FieldKind) {
+        let rect = self.default_insert_rect(kind);
+        let id = self.place_kind(kind, rect);
+        self.selection = Some(id);
+        self.drag = None;
+        self.status = format!("Placed {}", kind.label());
+    }
+
+    /// Menu and toolbar share this. A selected radio makes the next radio join its group.
+    fn place_kind(&mut self, kind: FieldKind, rect: RectPt) -> FieldId {
+        if kind == FieldKind::Radio {
+            let group = self.selected_radio_group();
+            self.doc.add_radio(rect, group.as_deref())
+        } else {
+            self.doc.add_field(kind, rect)
+        }
+    }
+
+    fn selected_radio_group(&self) -> Option<String> {
+        self.selection.and_then(|id| {
+            self.doc.field(id).and_then(|field| {
+                (field.kind() == FieldKind::Radio).then(|| field.name().to_string())
+            })
+        })
+    }
+
+    /// Default size, centered on the visible page, snapped when snap is on.
+    /// A later insert steps down, then right, so it does not cover the last one.
+    fn default_insert_rect(&self, kind: FieldKind) -> RectPt {
+        let (w, h) = default_size(kind, self.grid_size);
+        let page = self.doc.page();
+        let grid = self.snap_grid();
+        let first = anchor_for_center(self.visible_page_center(), w, h);
+        let mut anchor = first;
+        let mut placed = place_default(first, w, h, grid, &page);
+        for _ in 0..48 {
+            placed = place_default(anchor, w, h, grid, &page);
+            if !self
+                .doc
+                .fields()
+                .iter()
+                .any(|field| rects_overlap(field.rect(), placed))
+            {
+                return placed;
+            }
+            let below = PdfPoint {
+                x: placed.x,
+                y: placed.y,
+            };
+            let stepped = place_default(below, w, h, grid, &page);
+            if same_rect(stepped, placed) {
+                let right = PdfPoint {
+                    x: placed.right(),
+                    y: first.y,
+                };
+                let stepped_right = place_default(right, w, h, grid, &page);
+                if same_rect(stepped_right, placed) {
+                    return placed;
+                }
+                anchor = right;
+            } else {
+                anchor = below;
+            }
+        }
+        placed
+    }
+
+    /// Center of the page area currently inside the canvas. The page center if
+    /// the canvas is not ready yet or the page is panned fully out of view.
+    fn visible_page_center(&self) -> PdfPoint {
+        let page = self.doc.page();
+        let page_center = PdfPoint {
+            x: page.width * 0.5,
+            y: page.height * 0.5,
+        };
+        let Some(canvas) = self.canvas_rect else {
+            return page_center;
+        };
+        let screen = self.view.pdf_rect_to_screen(RectPt {
+            x: 0.0,
+            y: 0.0,
+            w: page.width,
+            h: page.height,
+        });
+        let left = canvas.left().max(screen.x);
+        let right = canvas.right().min(screen.x + screen.w);
+        let top = canvas.top().max(screen.y);
+        let bottom = canvas.bottom().min(screen.y + screen.h);
+        if right - left < 1.0 || bottom - top < 1.0 {
+            return page_center;
+        }
+        self.view
+            .screen_to_pdf((left + right) * 0.5, (top + bottom) * 0.5)
+    }
+
+    fn view_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(200.0);
+        ui.checkbox(&mut self.dots_visible, "Grid dots");
+        ui.checkbox(&mut self.guides_visible, "Guide lines");
+        ui.checkbox(&mut self.margins_visible, "Print-safe margin");
+        ui.checkbox(&mut self.header_visible, "Header")
+            .on_hover_text("Header band on the canvas. Not written into the PDF.");
+        ui.checkbox(&mut self.footer_visible, "Footer")
+            .on_hover_text("Footer band on the canvas. Not written into the PDF.");
+        ui.checkbox(&mut self.page_numbers_visible, "Page numbers")
+            .on_hover_text(
+                "Page number on the canvas. This page reads 1. Not written into the PDF.",
             );
-            if ui.button("Export PDF").clicked() {
-                self.export_current();
+        ui.checkbox(&mut self.snap, "Snap");
+        ui.separator();
+        ui.label("Grid size");
+        for size in GridSize::ALL {
+            ui.radio_value(&mut self.grid_size, size, size.label());
+        }
+        ui.separator();
+        ui.label("Theme");
+        let before = self.dark;
+        ui.radio_value(&mut self.dark, true, "Dark");
+        ui.radio_value(&mut self.dark, false, "Light");
+        if self.dark != before {
+            self.persist_theme = true;
+        }
+    }
+
+    fn preferences_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_preferences {
+            return;
+        }
+        let mut close = false;
+        let response = egui::Modal::new(egui::Id::new("pageform_preferences")).show(ctx, |ui| {
+            ui.set_min_width(560.0);
+            ui.set_min_height(280.0);
+            ui.heading(egui::RichText::new("Preferences").size(28.0));
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Theme").size(18.0));
+            ui.add_space(6.0);
+            let before = self.dark;
+            ui.radio_value(&mut self.dark, true, "Dark");
+            ui.radio_value(&mut self.dark, false, "Light");
+            if self.dark != before {
+                self.persist_theme = true;
+            }
+            ui.add_space(8.0);
+            ui.label("Saved on this computer. Dark is the default.");
+            ui.add_space(18.0);
+            let mut show_labels = self.doc.radio_labels();
+            if ui
+                .checkbox(&mut show_labels, "Radio labels")
+                .on_hover_text(
+                    "Text beside each radio button. Off hides those labels on the canvas and in the export.",
+                )
+                .changed()
+            {
+                self.doc.set_radio_labels(show_labels);
+                self.status = if show_labels {
+                    "Radio labels on".to_string()
+                } else {
+                    "Radio labels off".to_string()
+                };
+            }
+            ui.add_space(22.0);
+            if ui.button("Close").clicked() {
+                close = true;
+            }
+        });
+        if close || response.should_close() {
+            self.show_preferences = false;
+        }
+    }
+
+    fn about_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut close = false;
+        let response = egui::Modal::new(egui::Id::new("pageform_about")).show(ctx, |ui| {
+            ui.set_min_width(460.0);
+            ui.vertical_centered(|ui| {
+                placeholder_icon(ui);
+                ui.add_space(8.0);
+                ui.heading("PageForm");
+                ui.add_space(4.0);
+                ui.label(ABOUT_TAGLINE);
+                ui.add_space(6.0);
+                ui.label(format!("Version {}", app_version()));
+                ui.add_space(12.0);
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || response.should_close() {
+            self.show_about = false;
+        }
+    }
+
+    /// Separate OS window when the backend supports viewports, so the FAQ can
+    /// sit on another screen. A titled egui window is the fallback.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let dark = self.dark;
+        let host = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("pageform-help"),
+            egui::ViewportBuilder::default()
+                .with_title("PageForm Help")
+                .with_inner_size([520.0, 640.0])
+                .with_min_inner_size([380.0, 320.0])
+                .with_close_button(true)
+                .with_decorations(true),
+            |ctx, class| {
+                if class == egui::ViewportClass::Embedded {
+                    return HelpHost::Embedded;
+                }
+                crate::theme::apply(ctx, dark);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    help_faq(ui);
+                });
+                let close = ctx.input(|input| input.viewport().close_requested());
+                HelpHost::Native { close }
+            },
+        );
+        match host {
+            HelpHost::Embedded => {
+                egui::Window::new("PageForm Help")
+                    .collapsible(true)
+                    .resizable(true)
+                    .default_size([520.0, 640.0])
+                    .open(&mut self.show_help)
+                    .show(ctx, |ui| {
+                        help_faq(ui);
+                    });
+            }
+            HelpHost::Native { close } => {
+                if close {
+                    self.show_help = false;
+                }
+            }
+        }
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            self.toolbar_documents(ui);
+            ui.separator();
+            self.toolbar_tools(ui);
+            ui.separator();
+            self.toolbar_view(ui);
+        });
+    }
+
+    fn toolbar_documents(&mut self, ui: &mut egui::Ui) {
+        for label in icons::DOC_COMMANDS {
+            match *label {
+                "New" => self.icon_choices(ui, icons::Icon::New, false, "New", NEW_MENU),
+                "Open" => self.stub_icon(ui, icons::Icon::Open, "Open"),
+                "Save" => {
+                    self.icon_choices(ui, icons::Icon::Save, false, "Save", &["Save", "Save As"])
+                }
+                "Print" => self.stub_icon(ui, icons::Icon::Print, "Print"),
+                _ => {}
+            }
+        }
+    }
+
+    fn toolbar_tools(&mut self, ui: &mut egui::Ui) {
+        let select =
+            icons::icon_button(ui, icons::Icon::Select, self.tool == Tool::Select, "Select");
+        if select.clicked() {
+            self.tool = Tool::Select;
+        }
+        if icons::icon_button(ui, icons::Icon::InsertPage, false, "Insert Page").clicked() {
+            self.mark_not_implemented("Insert Page");
+        }
+        for label in icons::INSERT_TOOLS {
+            if *label == "Shapes" {
+                self.shapes_menu(ui);
+            } else if let Some(kind) = kind_for_toolbar_label(label) {
+                let tool = Tool::for_kind(kind);
+                let response =
+                    icons::icon_button(ui, icon_for_kind(kind), self.tool == tool, kind.label())
+                        .on_hover_text(toolbar_tip(kind));
+                if response.clicked() {
+                    self.tool = tool;
+                }
+            }
+        }
+    }
+
+    fn shapes_menu(&mut self, ui: &mut egui::Ui) {
+        let response = icons::icon_menu(
+            ui,
+            icons::Icon::Shapes,
+            self.tool == Tool::Square || self.tool == Tool::Rectangle,
+            "Shapes",
+        );
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(160.0);
+            if ui
+                .selectable_label(self.tool == Tool::Square, "Square")
+                .on_hover_text("Draw a square. The sides stay equal.")
+                .clicked()
+            {
+                self.tool = Tool::Square;
+                ui.close();
+            }
+            if ui
+                .selectable_label(self.tool == Tool::Rectangle, "Rectangle")
+                .on_hover_text("Draw a rectangle. Width and height are independent.")
+                .clicked()
+            {
+                self.tool = Tool::Rectangle;
+                ui.close();
+            }
+        });
+    }
+
+    fn toolbar_view(&mut self, ui: &mut egui::Ui) {
+        let response = icons::icon_menu(ui, icons::Icon::Grid, false, "Grid size");
+        let current = self.grid_size;
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(140.0);
+            for size in GridSize::ALL {
+                if ui
+                    .selectable_label(current == size, size.label())
+                    .on_hover_text(size.minor_label())
+                    .clicked()
+                {
+                    self.grid_size = size;
+                    ui.close();
+                }
+            }
+        });
+        for ((label, icon), detail) in icons::VIEW_TOGGLES
+            .iter()
+            .copied()
+            .zip(icons::VIEW_ICONS)
+            .zip([
+                "Grid dots",
+                "Guide lines. Canvas only.",
+                "Print-safe margin. Canvas only.",
+                "Page number. Canvas only.",
+                "Snap to the minor grid spacing.",
+            ])
+        {
+            self.toggle_view(ui, icon, label, detail);
+        }
+        let theme_icon = if self.dark {
+            icons::Icon::Moon
+        } else {
+            icons::Icon::Sun
+        };
+        let theme_tip = format!(
+            "{} — {}",
+            crate::theme::toggle_label(self.dark),
+            crate::theme::toggle_tip(self.dark)
+        );
+        if icons::icon_button(ui, theme_icon, false, &theme_tip).clicked() {
+            self.set_dark(!self.dark);
+        }
+    }
+
+    fn toggle_view(&mut self, ui: &mut egui::Ui, icon: icons::Icon, tip: &str, detail: &str) {
+        let on = match tip {
+            "Dots" => self.dots_visible,
+            "Guides" => self.guides_visible,
+            "Margins" => self.margins_visible,
+            "Page numbers" => self.page_numbers_visible,
+            "Snap" => self.snap,
+            _ => return,
+        };
+        if icons::icon_button(ui, icon, on, tip)
+            .on_hover_text(detail)
+            .clicked()
+        {
+            match tip {
+                "Dots" => self.dots_visible = !self.dots_visible,
+                "Guides" => self.guides_visible = !self.guides_visible,
+                "Margins" => self.margins_visible = !self.margins_visible,
+                "Page numbers" => self.page_numbers_visible = !self.page_numbers_visible,
+                "Snap" => self.snap = !self.snap,
+                _ => {}
+            }
+        }
+    }
+
+    fn stub_icon(&mut self, ui: &mut egui::Ui, icon: icons::Icon, label: &str) {
+        if icons::icon_button(ui, icon, false, label).clicked() {
+            self.mark_not_implemented(label);
+        }
+    }
+
+    fn icon_choices(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: icons::Icon,
+        selected: bool,
+        tip: &str,
+        items: &[&str],
+    ) {
+        let response = icons::icon_menu(ui, icon, selected, tip);
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(180.0);
+            for label in items {
+                if ui.button(*label).clicked() {
+                    self.mark_not_implemented(label);
+                    ui.close();
+                }
             }
         });
     }
 
     fn properties(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Theme");
-        if ui
-            .button(crate::theme::toggle_label(self.dark))
-            .on_hover_text(crate::theme::toggle_tip(self.dark))
-            .clicked()
-        {
-            self.dark = !self.dark;
-            self.persist_theme = true;
-        }
-        ui.add_space(8.0);
         ui.heading("Page");
         let page = self.doc.page();
         ui.label(format!(
@@ -227,20 +839,14 @@ impl PageFormApp {
             self.grid_size.minor_label(),
             self.grid_size.major_pt()
         ));
-        ui.label("Dots cover the whole page. Guide lines and the print-safe outline are canvas only and are not exported.");
+        ui.label("Dots cover the whole page. Guide lines, the print-safe outline, header, footer, and page number are canvas only and are not exported.");
         ui.label(format!(
             "Print safe area is inset {:.0} pt (0.5 in).",
-            pageform_core::PRINT_SAFE_MARGIN_PT
+            PRINT_SAFE_MARGIN_PT
         ));
         ui.label("Snap uses the minor spacing, even if dots or guides are hidden, so columns and rows stay even.");
-        let (text_w, text_h) = default_size(FieldKind::Text, self.grid_size);
-        let (check, _) = default_size(FieldKind::Checkbox, self.grid_size);
-        ui.label(format!(
-            "Click places text {}×{} pt or a {} pt checkbox.",
-            fmt_pt(text_w),
-            fmt_pt(text_h),
-            fmt_pt(check)
-        ));
+        ui.label("Insert drops a default-sized item in the view. A toolbar icon draws on the page. Square/Rectangle is under Shapes.");
+        ui.label("Edit → Preferences sets Dark or Light and radio labels.");
         ui.separator();
         ui.heading("Field");
 
@@ -250,29 +856,103 @@ impl PageFormApp {
                 .selection
                 .and_then(|id| self.doc.field(id).map(|field| field.name().to_string()))
                 .unwrap_or_default();
+            self.caption_buf = self
+                .selection
+                .and_then(|id| self.doc.field(id).map(|field| field.caption().to_string()))
+                .unwrap_or_default();
+            self.options_buf = self
+                .selection
+                .and_then(|id| self.doc.field(id).map(|field| field.options().join(", ")))
+                .unwrap_or_default();
             self.name_error = None;
         }
 
         let Some(id) = self.selection else {
-            ui.label("No field selected.");
-            ui.label("Use Text field or Checkbox, then drag on the page. A click places a default-size field.");
+            ui.label("Nothing selected.");
+            ui.label("Insert drops a default item. A toolbar icon draws on the page.");
             return;
         };
-        let Some(field) = self.doc.field(id) else {
-            self.selection = None;
-            return;
+        let (kind, rect, group_name) = {
+            let Some(field) = self.doc.field(id) else {
+                self.selection = None;
+                return;
+            };
+            (field.kind(), field.rect(), field.name().to_string())
         };
-        let kind = field.kind();
-        let rect = field.rect();
         ui.label(format!("Type  {}", kind.label()));
-        ui.label("Name");
-        let edit = ui.add(egui::TextEdit::singleline(&mut self.name_buf).desired_width(200.0));
-        if edit.changed() {
-            self.name_error = self
+        ui.label(kind_note(kind));
+        if kind.is_form_field() {
+            let name_label = if kind == FieldKind::Radio {
+                "Group"
+            } else {
+                "Name"
+            };
+            ui.label(name_label);
+            let edit = ui.add(egui::TextEdit::singleline(&mut self.name_buf).desired_width(200.0));
+            if edit.changed() {
+                self.name_error = self
+                    .doc
+                    .set_name(id, &self.name_buf)
+                    .err()
+                    .map(|err| err.to_string());
+            }
+        }
+        if matches!(
+            kind,
+            FieldKind::StaticText | FieldKind::TextBox | FieldKind::Radio
+        ) {
+            ui.label(if kind == FieldKind::Radio {
+                "Label"
+            } else {
+                "Text"
+            });
+            let edit =
+                ui.add(egui::TextEdit::singleline(&mut self.caption_buf).desired_width(200.0));
+            if edit.changed() {
+                self.name_error = self
+                    .doc
+                    .set_caption(id, &self.caption_buf)
+                    .err()
+                    .map(|err| err.to_string());
+            }
+            if kind == FieldKind::Radio && !self.doc.radio_labels() {
+                ui.label("Hidden until Radio labels is on in Edit → Preferences.");
+            }
+        }
+        if kind == FieldKind::Dropdown {
+            ui.label("Options");
+            let edit =
+                ui.add(egui::TextEdit::singleline(&mut self.options_buf).desired_width(200.0));
+            if edit.changed() {
+                let options = self
+                    .options_buf
+                    .split(',')
+                    .map(|option| option.trim().to_string())
+                    .filter(|option| !option.is_empty())
+                    .collect();
+                self.name_error = self
+                    .doc
+                    .set_options(id, options)
+                    .err()
+                    .map(|err| err.to_string());
+            }
+        }
+        if kind == FieldKind::Radio {
+            let members: Vec<(String, String)> = self
                 .doc
-                .set_name(id, &self.name_buf)
-                .err()
-                .map(|err| err.to_string());
+                .fields()
+                .iter()
+                .filter(|member| member.kind() == FieldKind::Radio && member.name() == group_name)
+                .map(|member| (member.on_state().to_string(), member.caption().to_string()))
+                .collect();
+            ui.add_space(4.0);
+            ui.label("Options in this group");
+            for (state, caption) in &members {
+                ui.label(format!("{state}  {caption}"));
+            }
+            if ui.button("Add option to group").clicked() {
+                self.insert_at_view(FieldKind::Radio);
+            }
         }
         if let Some(error) = &self.name_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
@@ -283,7 +963,7 @@ impl PageFormApp {
         ui.label(format!("W  {} pt", fmt_pt(rect.w)));
         ui.label(format!("H  {} pt", fmt_pt(rect.h)));
         ui.add_space(8.0);
-        ui.label("Delete removes the selected field.");
+        ui.label("Delete removes the selected item.");
     }
 
     fn fit(&mut self, rect: Rect) {
@@ -334,11 +1014,7 @@ impl PageFormApp {
             if ctx
                 .input(|input| input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace))
             {
-                if let Some(id) = self.selection {
-                    self.doc.remove(id);
-                    self.selection = None;
-                    self.drag = None;
-                }
+                self.delete_selection();
             }
         }
 
@@ -379,11 +1055,10 @@ impl PageFormApp {
         if primary_released {
             if let Some(Drag::Place { start, kind }) = self.drag {
                 if let Some(current) = self.pointer_pdf(ctx) {
-                    let rect = self.place_rect(start, current, kind);
-                    let id = self.doc.add_field(kind, rect);
+                    let id = self.finish_place(start, current, kind);
                     self.selection = Some(id);
                     self.tool = Tool::Select;
-                    self.status = format!("Placed {}", kind.label().to_lowercase());
+                    self.status = format!("Placed {}", kind.label());
                 }
             }
             if !ctx.input(|input| input.pointer.button_down(PointerButton::Middle)) {
@@ -397,28 +1072,23 @@ impl PageFormApp {
             return;
         };
         match self.tool {
-            Tool::Text | Tool::Checkbox => {
-                if !self.on_page(pdf) {
-                    return;
-                }
-                let kind = if self.tool == Tool::Text {
-                    FieldKind::Text
-                } else {
-                    FieldKind::Checkbox
-                };
-                self.drag = Some(Drag::Place { start: pdf, kind });
-            }
             Tool::Select => {
                 let radius = 8.0 / self.view.zoom;
                 if let Some(id) = self.selection {
                     if let Some(field) = self.doc.field(id) {
-                        if let Some(handle) = hit_handle(field.rect(), pdf, radius) {
-                            self.drag = Some(Drag::Resize {
-                                id,
-                                handle,
-                                origin: field.rect(),
-                            });
+                        if let Some(index) = field.hit_line_end(pdf, radius) {
+                            self.drag = Some(Drag::LineEnd { id, index });
                             return;
+                        }
+                        if field.line_ends().is_none() {
+                            if let Some(handle) = hit_handle(field.rect(), pdf, radius) {
+                                self.drag = Some(Drag::Resize {
+                                    id,
+                                    handle,
+                                    origin: field.rect(),
+                                });
+                                return;
+                            }
                         }
                     }
                 }
@@ -427,7 +1097,7 @@ impl PageFormApp {
                     .fields()
                     .iter()
                     .rev()
-                    .find(|field| field.rect().contains(pdf))
+                    .find(|field| field.contains_point(pdf, radius))
                 {
                     let id = field.id();
                     let rect = field.rect();
@@ -442,7 +1112,32 @@ impl PageFormApp {
                     self.drag = None;
                 }
             }
+            _ => {
+                if !self.on_page(pdf) {
+                    return;
+                }
+                if let Some(kind) = self.tool.place_kind() {
+                    self.drag = Some(Drag::Place { start: pdf, kind });
+                }
+            }
         }
+    }
+
+    fn finish_place(&mut self, start: PdfPoint, current: PdfPoint, kind: FieldKind) -> FieldId {
+        if kind == FieldKind::Line {
+            let (x0, y0) = self.view.pdf_to_screen(start);
+            let (x1, y1) = self.view.pdf_to_screen(current);
+            let dx = x0 - x1;
+            let dy = y0 - y1;
+            if dx * dx + dy * dy >= 16.0 {
+                let grid = self.snap_grid();
+                return self
+                    .doc
+                    .add_line(snap_point(start, grid), snap_point(current, grid));
+            }
+        }
+        let rect = self.place_rect(start, current, kind);
+        self.place_kind(kind, rect)
     }
 
     fn update_drag(&mut self, ctx: &egui::Context) {
@@ -461,6 +1156,9 @@ impl PageFormApp {
             Some(Drag::Resize { id, handle, origin }) => {
                 let rect = resize_rect(origin, handle, pdf, grid, self.min_size(), &page);
                 self.doc.update_rect(id, rect);
+            }
+            Some(Drag::LineEnd { id, index }) => {
+                self.doc.set_line_end(id, index, snap_point(pdf, grid));
             }
             _ => {}
         }
@@ -488,45 +1186,43 @@ impl PageFormApp {
         }
 
         for field in self.doc.fields() {
-            let screen = to_egui(self.view.pdf_rect_to_screen(field.rect()));
-            let selected = self.selection == Some(field.id());
-            painter.rect_filled(screen, 0.0, colors.field_fill);
-            let color = if selected {
-                colors.selection
-            } else if field.kind() == FieldKind::Text {
-                colors.text_stroke
-            } else {
-                colors.check_stroke
-            };
-            let width = if selected { 2.0_f32 } else { 1.0 };
-            stroke_rect(painter, screen, Stroke::new(width, color));
-            if field.kind() == FieldKind::Text && screen.height() > 14.0 {
-                painter.text(
-                    screen.left_center() + Vec2::new(6.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    field.name(),
-                    FontId::proportional((12.0 * self.view.zoom).clamp(8.0, 22.0)),
-                    colors.field_text,
-                );
-            }
+            self.paint_field(painter, field, &colors);
         }
 
         if let Some(Drag::Place { start, kind }) = self.drag {
             if let Some(current) = self.pointer_pdf_from_painter(painter) {
-                let rect = self.place_rect(start, current, kind);
-                let screen = to_egui(self.view.pdf_rect_to_screen(rect));
-                stroke_rect(painter, screen, Stroke::new(1.5_f32, colors.selection));
+                if kind == FieldKind::Line {
+                    let (x0, y0) = self.view.pdf_to_screen(start);
+                    let (x1, y1) = self.view.pdf_to_screen(current);
+                    painter.line_segment(
+                        [Pos2::new(x0, y0), Pos2::new(x1, y1)],
+                        Stroke::new(1.5_f32, colors.selection),
+                    );
+                } else {
+                    let rect = self.place_rect(start, current, kind);
+                    let screen = to_egui(self.view.pdf_rect_to_screen(rect));
+                    stroke_rect(painter, screen, Stroke::new(1.5_f32, colors.selection));
+                }
             }
         }
 
         if let Some(id) = self.selection {
             if let Some(field) = self.doc.field(id) {
-                for handle in Handle::ALL {
-                    let at = handle.point(field.rect());
-                    let (x, y) = self.view.pdf_to_screen(at);
-                    let handle_rect = Rect::from_center_size(Pos2::new(x, y), Vec2::splat(8.0));
-                    painter.rect_filled(handle_rect, 0.0, colors.handle_fill);
-                    stroke_rect(painter, handle_rect, Stroke::new(1.5_f32, colors.selection));
+                if let Some((start, end)) = field.line_ends() {
+                    for point in [start, end] {
+                        let (x, y) = self.view.pdf_to_screen(point);
+                        let handle_rect = Rect::from_center_size(Pos2::new(x, y), Vec2::splat(8.0));
+                        painter.rect_filled(handle_rect, 0.0, colors.handle_fill);
+                        stroke_rect(painter, handle_rect, Stroke::new(1.5_f32, colors.selection));
+                    }
+                } else {
+                    for handle in Handle::ALL {
+                        let at = handle.point(field.rect());
+                        let (x, y) = self.view.pdf_to_screen(at);
+                        let handle_rect = Rect::from_center_size(Pos2::new(x, y), Vec2::splat(8.0));
+                        painter.rect_filled(handle_rect, 0.0, colors.handle_fill);
+                        stroke_rect(painter, handle_rect, Stroke::new(1.5_f32, colors.selection));
+                    }
                 }
             }
         }
@@ -535,8 +1231,235 @@ impl PageFormApp {
             let safe = to_egui(self.view.pdf_rect_to_screen(print_safe_rect(&page)));
             dash_rect(painter, safe, Stroke::new(1.0_f32, colors.margin));
         }
+        self.paint_page_chrome(painter, page, &colors);
 
         stroke_rect(painter, page_rect, Stroke::new(1.0_f32, colors.page_edge));
+    }
+
+    fn paint_field(
+        &self,
+        painter: &egui::Painter,
+        field: &pageform_core::Field,
+        colors: &crate::theme::CanvasColors,
+    ) {
+        let selected = self.selection == Some(field.id());
+        let width = if selected { 2.0_f32 } else { 1.0 };
+        let stroke_color = if selected {
+            colors.selection
+        } else if matches!(
+            field.kind(),
+            FieldKind::Line | FieldKind::Rectangle | FieldKind::StaticText
+        ) {
+            colors.shape_stroke
+        } else if matches!(field.kind(), FieldKind::Checkbox | FieldKind::Radio) {
+            colors.check_stroke
+        } else {
+            colors.text_stroke
+        };
+        let font = FontId::proportional((12.0 * self.view.zoom).clamp(8.0, 22.0));
+        if let Some((start, end)) = field.line_ends() {
+            let (x0, y0) = self.view.pdf_to_screen(start);
+            let (x1, y1) = self.view.pdf_to_screen(end);
+            painter.line_segment(
+                [Pos2::new(x0, y0), Pos2::new(x1, y1)],
+                Stroke::new(width.max(1.25), stroke_color),
+            );
+            return;
+        }
+
+        let screen = to_egui(self.view.pdf_rect_to_screen(field.rect()));
+        let filled = !matches!(
+            field.kind(),
+            FieldKind::StaticText | FieldKind::Rectangle | FieldKind::Line | FieldKind::Radio
+        );
+        if filled {
+            painter.rect_filled(screen, 0.0, colors.field_fill);
+        }
+        if field.kind() != FieldKind::Radio && (field.kind() != FieldKind::StaticText || selected) {
+            stroke_rect(painter, screen, Stroke::new(width, stroke_color));
+        }
+        match field.kind() {
+            FieldKind::Text | FieldKind::Signature | FieldKind::Date | FieldKind::Dropdown
+                if screen.height() > 12.0 =>
+            {
+                let label = match field.kind() {
+                    FieldKind::Text => field.name(),
+                    FieldKind::Signature => field.caption(),
+                    FieldKind::Date => DATE_HINT,
+                    FieldKind::Dropdown => {
+                        field.options().first().map(String::as_str).unwrap_or("")
+                    }
+                    _ => "",
+                };
+                painter.text(
+                    screen.left_center() + Vec2::new(6.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    label,
+                    font.clone(),
+                    colors.field_text,
+                );
+                if field.kind() == FieldKind::Dropdown {
+                    painter.text(
+                        screen.right_center() - Vec2::new(8.0, 0.0),
+                        Align2::RIGHT_CENTER,
+                        "v",
+                        font,
+                        colors.field_text,
+                    );
+                }
+            }
+            FieldKind::StaticText => {
+                painter.text(
+                    screen.left_center() + Vec2::new(2.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    field.caption(),
+                    font,
+                    colors.label_text,
+                );
+            }
+            FieldKind::Radio => {
+                let center = screen.center();
+                let radius = (screen.width().min(screen.height()) * 0.5 - 1.5).max(2.0);
+                painter.circle_filled(center, radius, colors.field_fill);
+                painter.circle_stroke(center, radius, Stroke::new(width, stroke_color));
+                if self.doc.radio_labels() && !field.caption().is_empty() {
+                    painter.text(
+                        screen.right_center() + Vec2::new(6.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        field.caption(),
+                        font,
+                        colors.label_text,
+                    );
+                }
+            }
+            FieldKind::Table => {
+                let stroke = Stroke::new(1.0_f32, colors.text_stroke);
+                for column in 1..TABLE_COLUMNS {
+                    let x =
+                        screen.left() + screen.width() * (column as f32) / (TABLE_COLUMNS as f32);
+                    painter.line_segment(
+                        [Pos2::new(x, screen.top()), Pos2::new(x, screen.bottom())],
+                        stroke,
+                    );
+                }
+                for row in 1..TABLE_ROWS {
+                    let y = screen.top() + screen.height() * (row as f32) / (TABLE_ROWS as f32);
+                    painter.line_segment(
+                        [Pos2::new(screen.left(), y), Pos2::new(screen.right(), y)],
+                        stroke,
+                    );
+                }
+                painter.text(
+                    screen.left_top() + Vec2::new(4.0, 4.0),
+                    Align2::LEFT_TOP,
+                    "placeholder",
+                    font,
+                    colors.field_text,
+                );
+            }
+            FieldKind::TextBox => {
+                if screen.width() > 8.0 {
+                    let galley = painter.layout(
+                        field.caption().to_string(),
+                        font,
+                        colors.field_text,
+                        (screen.width() - 8.0).max(8.0),
+                    );
+                    painter.galley(
+                        screen.left_top() + Vec2::new(4.0, 4.0),
+                        galley,
+                        colors.field_text,
+                    );
+                }
+            }
+            FieldKind::Image => {
+                painter.line_segment(
+                    [screen.left_top(), screen.right_bottom()],
+                    Stroke::new(1.0_f32, colors.text_stroke),
+                );
+                painter.line_segment(
+                    [screen.right_top(), screen.left_bottom()],
+                    Stroke::new(1.0_f32, colors.text_stroke),
+                );
+                painter.text(
+                    screen.center(),
+                    Align2::CENTER_CENTER,
+                    "Image",
+                    font,
+                    colors.field_text,
+                );
+            }
+            FieldKind::Checkbox | FieldKind::Rectangle | FieldKind::Line => {}
+            _ => {}
+        }
+    }
+
+    fn paint_page_chrome(
+        &self,
+        painter: &egui::Painter,
+        page: Page,
+        colors: &crate::theme::CanvasColors,
+    ) {
+        let band = PRINT_SAFE_MARGIN_PT;
+        let stroke = Stroke::new(1.0_f32, colors.margin);
+        let font = FontId::proportional(13.0);
+        if self.header_visible {
+            let y = page.height - band;
+            let (x0, sy) = self.view.pdf_to_screen(PdfPoint { x: band, y });
+            let (x1, _) = self.view.pdf_to_screen(PdfPoint {
+                x: page.width - band,
+                y,
+            });
+            dash_line(painter, Pos2::new(x0, sy), Pos2::new(x1, sy), stroke);
+            let (_, label_y) = self.view.pdf_to_screen(PdfPoint {
+                x: page.width * 0.5,
+                y: page.height - band * 0.45,
+            });
+            let (label_x, _) = self.view.pdf_to_screen(PdfPoint {
+                x: page.width * 0.5,
+                y: page.height,
+            });
+            painter.text(
+                Pos2::new(label_x, label_y),
+                Align2::CENTER_CENTER,
+                "Header",
+                font.clone(),
+                colors.margin,
+            );
+        }
+        if self.footer_visible {
+            let y = band;
+            let (x0, sy) = self.view.pdf_to_screen(PdfPoint { x: band, y });
+            let (x1, _) = self.view.pdf_to_screen(PdfPoint {
+                x: page.width - band,
+                y,
+            });
+            dash_line(painter, Pos2::new(x0, sy), Pos2::new(x1, sy), stroke);
+            let (label_x, label_y) = self.view.pdf_to_screen(PdfPoint {
+                x: band + 8.0,
+                y: band * 0.45,
+            });
+            painter.text(
+                Pos2::new(label_x, label_y),
+                Align2::LEFT_CENTER,
+                "Footer",
+                font.clone(),
+                colors.margin,
+            );
+        }
+        if self.page_numbers_visible {
+            let (x, y) = self.view.pdf_to_screen(PdfPoint {
+                x: page.width * 0.5,
+                y: band * 0.45,
+            });
+            painter.text(
+                Pos2::new(x, y),
+                Align2::CENTER_CENTER,
+                "1",
+                font,
+                colors.margin,
+            );
+        }
     }
 
     fn pointer_pdf_from_painter(&self, painter: &egui::Painter) -> Option<PdfPoint> {
@@ -620,14 +1543,23 @@ impl PageFormApp {
         }
         let cursor = if ctx.input(|input| input.key_down(Key::Space)) {
             CursorIcon::Grab
-        } else if matches!(self.tool, Tool::Text | Tool::Checkbox) {
+        } else if self.tool.place_kind().is_some() {
             CursorIcon::Crosshair
         } else if let Some(pos) = response.hover_pos() {
             let pdf = self.view.screen_to_pdf(pos.x, pos.y);
+            let radius = 8.0 / self.view.zoom;
             if let Some(id) = self.selection {
                 if let Some(field) = self.doc.field(id) {
-                    if let Some(handle) = hit_handle(field.rect(), pdf, 8.0 / self.view.zoom) {
-                        handle_cursor(handle)
+                    if field.hit_line_end(pdf, radius).is_some() {
+                        CursorIcon::Grab
+                    } else if field.line_ends().is_none() {
+                        if let Some(handle) = hit_handle(field.rect(), pdf, radius) {
+                            handle_cursor(handle)
+                        } else if self.field_at(pdf) {
+                            CursorIcon::Grab
+                        } else {
+                            return;
+                        }
                     } else if self.field_at(pdf) {
                         CursorIcon::Grab
                     } else {
@@ -648,10 +1580,11 @@ impl PageFormApp {
     }
 
     fn field_at(&self, pdf: PdfPoint) -> bool {
+        let radius = 8.0 / self.view.zoom;
         self.doc
             .fields()
             .iter()
-            .any(|field| field.rect().contains(pdf))
+            .any(|field| field.contains_point(pdf, radius))
     }
 }
 
@@ -675,10 +1608,13 @@ impl eframe::App for PageFormApp {
             }
             self.persist_theme = false;
         }
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            self.menu_bar(ui);
+        });
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             self.toolbar(ui);
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -697,6 +1633,9 @@ impl eframe::App for PageFormApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.canvas(ui);
         });
+        self.preferences_dialog(ctx);
+        self.about_dialog(ctx);
+        self.help_window(ctx);
     }
 }
 
@@ -766,10 +1705,787 @@ fn on_step(value: f32, step: f32) -> bool {
     ((value / step).round() * step - value).abs() < 0.05
 }
 
+const MENU_BAR: &[&str] = &["File", "Edit", "Insert", "View", "Help"];
+
+const FILE_MENU: &[&str] = &[
+    "New",
+    "Open",
+    "",
+    "Save",
+    "Save As",
+    "",
+    "Print",
+    "Export PDF",
+    "",
+    "Exit",
+];
+
+const NEW_MENU: &[&str] = &["New Blank Document", "New from Template"];
+
+const EDIT_MENU: &[&str] = &[
+    "Select",
+    "Select All",
+    "",
+    "Copy",
+    "Cut",
+    "Paste",
+    "Delete",
+    "",
+    "Preferences",
+];
+
+const HELP_MENU: &[&str] = &["Help", "About"];
+
+const ABOUT_TAGLINE: &str = "Open-Source Native Form and Document Editor Written in Rust";
+
+const HELP_FAQ: &[(&str, &str)] = &[
+    (
+        "What is PageForm?",
+        "PageForm is an open-source native form and document editor written in Rust. This version edits one US Letter page.",
+    ),
+    (
+        "How do I place something?",
+        "The Insert menu drops a default-sized item at the center of the visible page. A toolbar icon arms that tool so you can drag on the page. Square/Rectangle is the Shapes icon.",
+    ),
+    (
+        "How do I select, move, and delete?",
+        "Edit → Select, or the Select tool. Drag a selected item to move it, and drag a handle to resize it. Edit → Delete, or the Delete key, removes the selection.",
+    ),
+    (
+        "Where are theme and radio labels?",
+        "Edit → Preferences. Dark is the default, and the choice is saved. Radio labels shows or hides the text beside each radio button. The toolbar theme button switches Dark and Light as well.",
+    ),
+    (
+        "What do New, Open, Save, Save As, and Print do?",
+        "File → New lists New Blank Document and New from Template. Those, plus Open, Save, Save As, and Print, are not implemented yet. File → Export PDF writes sample-form.pdf. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
+    ),
+    (
+        "Is there a list box?",
+        "No. Drop-down is a combo box.",
+    ),
+    (
+        "What is still a placeholder?",
+        "Table is a 3 by 2 grid and the cells are not editable. Image is a crossed box until a file can be chosen. Signature is a real unsigned field; the app does not capture ink.",
+    ),
+];
+
+enum HelpHost {
+    Embedded,
+    Native { close: bool },
+}
+
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+fn menu_entries<'a>(labels: &'a [&'a str]) -> Vec<&'a str> {
+    labels
+        .iter()
+        .copied()
+        .filter(|label| !label.is_empty())
+        .collect()
+}
+
+fn sorted_insert_kinds() -> [FieldKind; 12] {
+    let mut kinds = FieldKind::INSERT;
+    kinds.sort_by(|left, right| left.label().cmp(right.label()));
+    kinds
+}
+
+fn placeholder_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(72.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 10.0, egui::Color32::from_rgb(32, 36, 44));
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "E",
+        FontId::proportional(40.0),
+        egui::Color32::WHITE,
+    );
+}
+
+fn help_faq(ui: &mut egui::Ui) {
+    ui.heading("PageForm Help");
+    ui.label("Frequently asked questions");
+    ui.separator();
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for (question, answer) in HELP_FAQ {
+            ui.strong(*question);
+            ui.label(*answer);
+            ui.add_space(10.0);
+        }
+    });
+}
+
+fn anchor_for_center(center: PdfPoint, w: f32, h: f32) -> PdfPoint {
+    PdfPoint {
+        x: center.x - w * 0.5,
+        y: center.y + h * 0.5,
+    }
+}
+
+fn same_rect(a: RectPt, b: RectPt) -> bool {
+    (a.x - b.x).abs() < 0.5
+        && (a.y - b.y).abs() < 0.5
+        && (a.w - b.w).abs() < 0.5
+        && (a.h - b.h).abs() < 0.5
+}
+
+fn square_from_drag(
+    start: PdfPoint,
+    end: PdfPoint,
+    grid: Option<f32>,
+    min: f32,
+    page: &pageform_core::Page,
+) -> pageform_core::RectPt {
+    let start = snap_point(start, grid);
+    let end = snap_point(end, grid);
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let side = dx.abs().max(dy.abs()).max(min.max(1.0));
+    let ex = start.x + if dx < 0.0 { -side } else { side };
+    let ey = start.y + if dy < 0.0 { -side } else { side };
+    rect_from_drag(start, PdfPoint { x: ex, y: ey }, None, min, page)
+}
+
+fn rects_overlap(a: RectPt, b: RectPt) -> bool {
+    a.x < b.right() - 0.5 && b.x < a.right() - 0.5 && a.y < b.top() - 0.5 && b.y < a.top() - 0.5
+}
+
+fn menu_command(ui: &mut egui::Ui, label: &str, shortcut: Option<&str>, selected: bool) -> bool {
+    let mut button = egui::Button::new(label).selected(selected);
+    if let Some(shortcut) = shortcut {
+        button = button.shortcut_text(shortcut);
+    }
+    let clicked = ui.add(button).clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+
+fn insert_tip(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::Text => "Drop a one-line fillable text field at the center of the visible page.",
+        FieldKind::StaticText => "Drop a static label. It is not a fillable field.",
+        FieldKind::Checkbox => "Drop a default-sized checkbox at the center of the visible page.",
+        FieldKind::Radio => {
+            "Drop a radio button. If a radio is selected, it joins that group. Labels sit beside each button."
+        }
+        FieldKind::Table => "Drop a table placeholder (a small grid). Cells are not editable yet.",
+        FieldKind::Signature => {
+            "Drop an AcroForm signature field. Capturing a signature in the app is not available yet."
+        }
+        FieldKind::Date => "Drop a date field (YYYY-MM-DD text).",
+        FieldKind::Dropdown => "Drop a combo drop-down. This is not a list box.",
+        FieldKind::Line => "Drop a horizontal line. Drag with the toolbar tool to set the angle.",
+        FieldKind::Rectangle => "Drop a rectangle. Drag with the toolbar tool to size it.",
+        FieldKind::TextBox => "Drop a static text box. It is not a fillable field.",
+        FieldKind::Image => "Drop an image placeholder. Choosing a file is not available yet.",
+    }
+}
+
+fn icon_for_kind(kind: FieldKind) -> icons::Icon {
+    match kind {
+        FieldKind::Text => icons::Icon::TextField,
+        FieldKind::StaticText => icons::Icon::Text,
+        FieldKind::Checkbox => icons::Icon::Checkbox,
+        FieldKind::Radio => icons::Icon::Radio,
+        FieldKind::Table => icons::Icon::Table,
+        FieldKind::Signature => icons::Icon::Signature,
+        FieldKind::Date => icons::Icon::Date,
+        FieldKind::Dropdown => icons::Icon::Dropdown,
+        FieldKind::Line => icons::Icon::Line,
+        FieldKind::Rectangle => icons::Icon::Shapes,
+        FieldKind::TextBox => icons::Icon::TextBox,
+        FieldKind::Image => icons::Icon::Image,
+    }
+}
+
+fn kind_for_toolbar_label(label: &str) -> Option<FieldKind> {
+    FieldKind::INSERT
+        .into_iter()
+        .find(|kind| kind.label() == label)
+}
+
+fn toolbar_tip(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::Text => "Arm the text field tool, then drag on the page.",
+        FieldKind::StaticText => {
+            "Arm the static text tool, then drag on the page. Not a fillable field."
+        }
+        FieldKind::Checkbox => "Arm the checkbox tool, then drag on the page.",
+        FieldKind::Radio => {
+            "Arm the radio tool, then drag on the page. A selected radio joins that group."
+        }
+        FieldKind::Table => "Arm the table tool. Placeholder grid; cells are not editable yet.",
+        FieldKind::Signature => "Arm the signature tool. No ink capture in the app yet.",
+        FieldKind::Date => "Arm the date tool, then drag on the page.",
+        FieldKind::Dropdown => "Arm the drop-down tool. Combo box, not a list box.",
+        FieldKind::Line => "Arm the line tool, then drag from one point to another.",
+        FieldKind::Rectangle => "Arm the rectangle tool, then drag on the page.",
+        FieldKind::TextBox => "Arm the text box tool. Static text, not a fillable field.",
+        FieldKind::Image => "Arm the image tool. Placeholder box until a file can be chosen.",
+    }
+}
+
+fn kind_note(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::Text => "One-line fillable text field.",
+        FieldKind::StaticText => "Static label. Not a fillable field.",
+        FieldKind::Checkbox => "Fillable checkbox.",
+        FieldKind::Radio => "One button in a radio group. The first two labels are Yes and No.",
+        FieldKind::Table => "Table placeholder. A 3×2 grid. Cells are not editable yet.",
+        FieldKind::Signature => {
+            "Unsigned signature field. Drawing a signature is not available yet."
+        }
+        FieldKind::Date => "Fillable text, 10 characters, format YYYY-MM-DD. Not a calendar.",
+        FieldKind::Dropdown => "Combo drop-down. Not a list box. Options are comma-separated.",
+        FieldKind::Line => "Line on the page. Not a fillable field.",
+        FieldKind::Rectangle => "Rectangle on the page. Not a fillable field.",
+        FieldKind::TextBox => "Static text box. Not a fillable field.",
+        FieldKind::Image => "Image placeholder. Choosing a file is not available yet.",
+    }
+}
+
 fn fmt_pt(value: f32) -> String {
     if (value - value.round()).abs() < 0.05 {
         format!("{}", value.round() as i32)
     } else {
         format!("{value:.1}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_bar_order_is_file_edit_insert_view_help() {
+        assert_eq!(
+            MENU_BAR,
+            ["File", "Edit", "Insert", "View", "Help"].as_slice()
+        );
+        assert_eq!(
+            menu_entries(FILE_MENU),
+            [
+                "New",
+                "Open",
+                "Save",
+                "Save As",
+                "Print",
+                "Export PDF",
+                "Exit"
+            ]
+        );
+        assert_eq!(
+            menu_entries(EDIT_MENU),
+            [
+                "Select",
+                "Select All",
+                "Copy",
+                "Cut",
+                "Paste",
+                "Delete",
+                "Preferences"
+            ]
+        );
+        assert_eq!(menu_entries(HELP_MENU), ["Help", "About"]);
+        assert_eq!(NEW_MENU, ["New Blank Document", "New from Template"]);
+        assert_eq!(
+            ABOUT_TAGLINE,
+            "Open-Source Native Form and Document Editor Written in Rust"
+        );
+        assert!(!app_version().is_empty());
+        assert!(HELP_FAQ.len() >= 5);
+    }
+
+    #[test]
+    fn insert_menu_is_alphabetical_and_the_toolbar_order_stays() {
+        let menu: Vec<_> = sorted_insert_kinds()
+            .into_iter()
+            .map(FieldKind::label)
+            .collect();
+        let mut expected = menu.clone();
+        expected.sort();
+        assert_eq!(menu, expected);
+        assert_eq!(
+            menu,
+            [
+                "Checkbox",
+                "Date",
+                "Drop-down",
+                "Image",
+                "Line",
+                "Radio",
+                "Signature",
+                "Square/Rectangle",
+                "Table",
+                "Text",
+                "Text Box",
+                "Text Field",
+            ]
+        );
+        assert_eq!(icons::INSERT_TOOLS.len(), 12);
+        assert!(icons::INSERT_TOOLS.contains(&"Shapes"));
+        assert!(!icons::INSERT_TOOLS.contains(&"Square/Rectangle"));
+        assert!(!icons::VIEW_TOGGLES.contains(&"Header"));
+        assert!(!icons::VIEW_TOGGLES.contains(&"Footer"));
+        assert_ne!(menu, icons::INSERT_TOOLS);
+        assert_eq!(
+            kind_for_toolbar_label("Checkbox"),
+            Some(FieldKind::Checkbox)
+        );
+        assert_eq!(kind_for_toolbar_label("Shapes"), None);
+        assert!(matches!(
+            icon_for_kind(FieldKind::Rectangle),
+            icons::Icon::Shapes
+        ));
+        assert!(matches!(
+            icon_for_kind(FieldKind::Text),
+            icons::Icon::TextField
+        ));
+        assert!(matches!(
+            icon_for_kind(FieldKind::StaticText),
+            icons::Icon::Text
+        ));
+    }
+
+    #[test]
+    fn toolbar_does_not_paint_removed_commands() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let output = panel(&ctx, &mut app, |app, ui| app.toolbar(ui));
+        let joined = galley_texts(&output).join("\n");
+        for banned in ["Export PDF", "Header", "Footer", "Fit", "Square/Rectangle"] {
+            assert!(
+                !joined.contains(banned),
+                "{banned} showed up on the toolbar: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn square_drag_keeps_equal_sides_and_rectangle_drag_does_not() {
+        let page = Page::letter();
+        let start = PdfPoint { x: 72.0, y: 200.0 };
+        let end = PdfPoint { x: 180.0, y: 140.0 };
+        let square = square_from_drag(start, end, None, 9.0, &page);
+        assert!((square.w - square.h).abs() < 0.1);
+        assert!((square.w - 108.0).abs() < 0.1);
+        let rect = rect_from_drag(start, end, None, 9.0, &page);
+        assert!((rect.w - 108.0).abs() < 0.1);
+        assert!((rect.h - 60.0).abs() < 0.1);
+        assert!((rect.w - rect.h).abs() > 1.0);
+    }
+
+    #[test]
+    fn file_and_edit_stubs_report_in_the_status_bar() {
+        let mut app = PageFormApp::new(false, None);
+        assert!(!app.show_preferences);
+        assert!(!app.show_about);
+        assert!(!app.show_help);
+        for command in [
+            "New",
+            "Open",
+            "Save",
+            "Save As",
+            "Print",
+            "Select All",
+            "Copy",
+            "Cut",
+            "Paste",
+            "New Blank Document",
+            "New from Template",
+            "Insert Page",
+        ] {
+            app.mark_not_implemented(command);
+            assert_eq!(app.status, format!("{command} is not implemented yet"));
+        }
+    }
+
+    #[test]
+    fn delete_removes_the_selected_field() {
+        let mut app = PageFormApp::new(true, None);
+        let id = app.doc.fields()[0].id();
+        app.selection = Some(id);
+        app.delete_selection();
+        assert!(app.doc.field(id).is_none());
+        assert!(app.selection.is_none());
+        assert!(app.drag.is_none());
+        assert_eq!(app.status, "Deleted field");
+        assert_eq!(app.doc.fields().len(), 1);
+    }
+
+    #[test]
+    fn delete_with_nothing_selected_leaves_the_page() {
+        let mut app = PageFormApp::new(false, None);
+        app.delete_selection();
+        assert!(app.doc.fields().is_empty());
+        assert_eq!(app.status, "Blank US Letter page");
+    }
+
+    #[test]
+    fn insert_menu_drops_a_default_field_at_the_page_center() {
+        let mut app = PageFormApp::new(false, None);
+        app.tool = Tool::Checkbox;
+        app.insert_at_view(FieldKind::Text);
+        assert_eq!(app.tool, Tool::Checkbox);
+        assert_eq!(app.doc.fields().len(), 1);
+        let field = &app.doc.fields()[0];
+        assert_eq!(field.kind(), FieldKind::Text);
+        assert_eq!(app.selection, Some(field.id()));
+        let rect = field.rect();
+        let (w, h) = default_size(FieldKind::Text, GridSize::Medium);
+        assert!((rect.w - w).abs() < 0.1);
+        assert!((rect.h - h).abs() < 0.1);
+        assert!((rect.x + rect.w * 0.5 - 306.0).abs() < 0.1);
+        assert!((rect.y + rect.h * 0.5 - 396.0).abs() < 0.1);
+        assert!(on_step(rect.x, GridSize::Medium.minor_pt()));
+        assert!(on_step(rect.y, GridSize::Medium.minor_pt()));
+    }
+
+    #[test]
+    fn insert_menu_steps_past_a_field_already_in_the_view() {
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        app.insert_at_view(FieldKind::Checkbox);
+        app.insert_at_view(FieldKind::Text);
+        let fields = app.doc.fields();
+        assert_eq!(fields.len(), 3);
+        assert!(!rects_overlap(fields[0].rect(), fields[1].rect()));
+        assert!(!rects_overlap(fields[0].rect(), fields[2].rect()));
+        assert!(!rects_overlap(fields[1].rect(), fields[2].rect()));
+        assert!(fields[1].rect().top() <= fields[0].rect().y + 0.5);
+    }
+
+    #[test]
+    fn insert_menu_uses_the_visible_page_not_the_page_center() {
+        let mut app = PageFormApp::new(false, None);
+        app.view.zoom = 2.0;
+        app.view.origin_x = 0.0;
+        app.view.origin_y = 0.0;
+        app.view.page_height = app.doc.page().height;
+        app.canvas_rect = Some(Rect::from_min_max(
+            Pos2::new(0.0, 0.0),
+            Pos2::new(200.0, 200.0),
+        ));
+        let center = app.visible_page_center();
+        assert!((center.x - 50.0).abs() < 0.1);
+        assert!((center.y - 742.0).abs() < 0.1);
+        app.insert_at_view(FieldKind::Checkbox);
+        let rect = app.doc.fields()[0].rect();
+        let (w, h) = default_size(FieldKind::Checkbox, GridSize::Medium);
+        assert!((rect.w - w).abs() < 0.1);
+        assert!((rect.h - h).abs() < 0.1);
+        assert!((rect.x + rect.w * 0.5 - center.x).abs() < app.grid_size.minor_pt());
+        assert!((rect.y + rect.h * 0.5 - center.y).abs() < app.grid_size.minor_pt());
+        assert!(rect.x >= 0.0 && rect.y >= 0.0);
+        assert!(rect.right() <= app.doc.page().width + 0.1);
+        assert!(rect.top() <= app.doc.page().height + 0.1);
+    }
+
+    #[test]
+    fn insert_radio_joins_the_selected_group_and_labels_can_hide() {
+        let mut app = PageFormApp::new(false, None);
+        assert!(app.doc.radio_labels());
+        app.insert_at_view(FieldKind::Radio);
+        app.insert_at_view(FieldKind::Radio);
+        assert_eq!(app.doc.fields().len(), 2);
+        assert_eq!(app.doc.fields()[0].name(), app.doc.fields()[1].name());
+        assert_eq!(app.doc.fields()[0].caption(), "Yes");
+        assert_eq!(app.doc.fields()[1].caption(), "No");
+        assert!(app.doc.fields()[0].is_form_field());
+        app.doc.set_radio_labels(false);
+        assert!(!app.doc.radio_labels());
+        assert_eq!(app.tool, Tool::Select);
+    }
+
+    #[test]
+    fn static_text_and_image_are_not_form_fields() {
+        let mut app = PageFormApp::new(false, None);
+        app.tool = Tool::Text;
+        app.insert_at_view(FieldKind::StaticText);
+        app.insert_at_view(FieldKind::Image);
+        app.insert_at_view(FieldKind::Line);
+        app.insert_at_view(FieldKind::Rectangle);
+        app.insert_at_view(FieldKind::TextBox);
+        assert_eq!(app.tool, Tool::Text);
+        assert!(app.doc.fields().iter().all(|field| !field.is_form_field()));
+        assert_eq!(app.doc.fields()[0].kind(), FieldKind::StaticText);
+        assert_eq!(app.doc.fields()[0].caption(), "Label");
+        assert_eq!(app.doc.fields()[1].kind(), FieldKind::Image);
+    }
+
+    #[test]
+    fn header_footer_and_page_numbers_start_off() {
+        let app = PageFormApp::new(false, None);
+        assert!(!app.header_visible);
+        assert!(!app.footer_visible);
+        assert!(!app.page_numbers_visible);
+        assert!(app.dark);
+        assert_eq!(
+            FieldKind::INSERT.map(|kind| kind.label()),
+            [
+                "Text Field",
+                "Text",
+                "Checkbox",
+                "Radio",
+                "Table",
+                "Signature",
+                "Date",
+                "Drop-down",
+                "Line",
+                "Square/Rectangle",
+                "Text Box",
+                "Image",
+            ]
+        );
+    }
+
+    #[test]
+    fn theme_switch_is_marked_for_save_and_dark_stays_default() {
+        let mut app = PageFormApp::new(false, None);
+        assert!(app.dark);
+        assert!(!app.persist_theme);
+        app.set_dark(false);
+        assert!(!app.dark);
+        assert!(app.persist_theme);
+        app.persist_theme = false;
+        app.set_dark(false);
+        assert!(!app.persist_theme);
+        app.set_dark(true);
+        assert!(app.dark);
+        assert!(app.persist_theme);
+    }
+
+    #[test]
+    fn menus_and_dialogs_paint_their_items() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+
+        let bar = panel(&ctx, &mut app, |app, ui| app.menu_bar(ui));
+        assert_eq!(ordered_hits(&galley_texts(&bar), MENU_BAR), MENU_BAR);
+
+        let file = panel(&ctx, &mut app, |app, ui| app.file_menu(ui));
+        assert_eq!(
+            ordered_hits(&galley_texts(&file), &menu_entries(FILE_MENU)),
+            menu_entries(FILE_MENU)
+        );
+        let edit = panel(&ctx, &mut app, |app, ui| app.edit_menu(ui));
+        assert_eq!(
+            ordered_hits(&galley_texts(&edit), &menu_entries(EDIT_MENU)),
+            menu_entries(EDIT_MENU)
+        );
+        let insert = panel(&ctx, &mut app, |app, ui| app.insert_menu(ui));
+        let insert_labels = sorted_insert_kinds().map(FieldKind::label);
+        assert_eq!(
+            ordered_hits(&galley_texts(&insert), &insert_labels),
+            insert_labels.to_vec()
+        );
+        let help = panel(&ctx, &mut app, |app, ui| app.help_menu(ui));
+        assert_eq!(
+            ordered_hits(&galley_texts(&help), HELP_MENU),
+            HELP_MENU.to_vec()
+        );
+
+        app.show_preferences = true;
+        app.show_about = true;
+        app.show_help = true;
+        let dialogs = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.preferences_dialog(ctx);
+            app.about_dialog(ctx);
+            app.help_window(ctx);
+        });
+        let texts = galley_texts(&dialogs);
+        assert!(texts.iter().any(|text| text == "Preferences"));
+        assert!(texts.iter().any(|text| text == "Dark"));
+        assert!(texts.iter().any(|text| text == "Light"));
+        assert!(texts.iter().any(|text| text == "Radio labels"));
+        assert!(texts.iter().any(|text| text == "PageForm"));
+        assert!(texts.iter().any(|text| text == ABOUT_TAGLINE));
+        assert!(texts
+            .iter()
+            .any(|text| text == &format!("Version {}", app_version())));
+        assert!(texts.iter().any(|text| text == "OK"));
+        assert!(texts.iter().any(|text| text == "E"));
+        assert!(texts.iter().any(|text| text == "PageForm Help"));
+        assert!(texts.iter().any(|text| text == "What is PageForm?"));
+        assert!(app.show_help, "headless help uses the embedded window");
+    }
+
+    #[test]
+    fn clicking_a_stub_and_preferences_updates_state() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+
+        click_menu(&ctx, &mut app, "Open", |app, ui| app.file_menu(ui));
+        assert_eq!(app.status, "Open is not implemented yet");
+        click_menu(&ctx, &mut app, "Save As", |app, ui| app.file_menu(ui));
+        assert_eq!(app.status, "Save As is not implemented yet");
+        click_menu(&ctx, &mut app, "Print", |app, ui| app.file_menu(ui));
+        assert_eq!(app.status, "Print is not implemented yet");
+        click_menu(&ctx, &mut app, "Select All", |app, ui| app.edit_menu(ui));
+        assert_eq!(app.status, "Select All is not implemented yet");
+        click_menu(&ctx, &mut app, "Paste", |app, ui| app.edit_menu(ui));
+        assert_eq!(app.status, "Paste is not implemented yet");
+
+        click_menu(&ctx, &mut app, "Preferences", |app, ui| app.edit_menu(ui));
+        assert!(app.show_preferences);
+        click_menu(&ctx, &mut app, "Help", |app, ui| app.help_menu(ui));
+        assert!(app.show_help);
+        click_menu(&ctx, &mut app, "About", |app, ui| app.help_menu(ui));
+        assert!(app.show_about);
+
+        let prefs = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.preferences_dialog(ctx);
+        });
+        let light_at = text_center(&prefs, "Light").expect("Light");
+        click_at(&ctx, &mut app, light_at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.preferences_dialog(ctx);
+        });
+        assert!(!app.dark);
+        assert!(app.persist_theme);
+    }
+
+    fn screen_input() -> egui::RawInput {
+        use std::cell::Cell;
+        thread_local! {
+            static TIME: Cell<f64> = const { Cell::new(0.0) };
+        }
+        let time = TIME.with(|time| {
+            let next = time.get() + 1.0;
+            time.set(next);
+            next
+        });
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0))),
+            time: Some(time),
+            ..Default::default()
+        }
+    }
+
+    fn run_ui(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        input: egui::RawInput,
+        mut show: impl FnMut(&mut PageFormApp, &egui::Context),
+    ) -> egui::FullOutput {
+        ctx.run(input, |ctx| show(app, ctx))
+    }
+
+    /// Areas and windows measure themselves on the first frame and paint on the next.
+    fn show_settled(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        mut show: impl FnMut(&mut PageFormApp, &egui::Context),
+    ) -> egui::FullOutput {
+        let _ = run_ui(ctx, app, screen_input(), &mut show);
+        run_ui(ctx, app, screen_input(), show)
+    }
+
+    fn panel(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        mut show: impl FnMut(&mut PageFormApp, &mut egui::Ui),
+    ) -> egui::FullOutput {
+        run_ui(ctx, app, screen_input(), |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(app, ui));
+        })
+    }
+
+    fn click_menu(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        label: &str,
+        mut show: impl FnMut(&mut PageFormApp, &mut egui::Ui) + Clone,
+    ) {
+        let output = panel(ctx, app, show.clone());
+        let at = text_center(&output, label).unwrap_or_else(|| panic!("missing {label}"));
+        click_at(ctx, app, at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(app, ui));
+        });
+    }
+
+    fn click_at(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        pos: Pos2,
+        mut show: impl FnMut(&mut PageFormApp, &egui::Context),
+    ) {
+        let mut raw = screen_input();
+        raw.events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let _ = run_ui(ctx, app, raw, &mut show);
+    }
+
+    fn ordered_hits(texts: &[String], wanted: &[&str]) -> Vec<String> {
+        let wanted: std::collections::HashSet<&str> = wanted.iter().copied().collect();
+        texts
+            .iter()
+            .filter(|text| wanted.contains(text.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    fn galley_texts(output: &egui::FullOutput) -> Vec<String> {
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn collect_text(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                let value = text.galley.text().trim();
+                if !value.is_empty() {
+                    texts.push(value.to_string());
+                }
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, texts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn text_center(output: &egui::FullOutput, label: &str) -> Option<Pos2> {
+        fn walk(shape: &egui::epaint::Shape, label: &str) -> Option<Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text().trim() == label => {
+                    Some(text.pos + Vec2::new(4.0, text.galley.size().y * 0.5))
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| walk(shape, label))
+                }
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| walk(&clipped.shape, label))
     }
 }

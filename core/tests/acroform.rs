@@ -248,6 +248,230 @@ fn assert_close(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 0.02, "{actual} != {expected}");
 }
 
+#[test]
+fn new_insert_items_export_as_fields_or_page_content() {
+    let mut doc = Form::letter();
+    let text = RectPt {
+        x: 72.0,
+        y: 700.0,
+        w: 144.0,
+        h: 18.0,
+    };
+    doc.add_field(FieldKind::Text, text);
+    doc.add_field(
+        FieldKind::StaticText,
+        RectPt {
+            x: 72.0,
+            y: 670.0,
+            w: 144.0,
+            h: 18.0,
+        },
+    );
+    doc.set_caption(doc.fields()[1].id(), "Full name").unwrap();
+    doc.add_field(
+        FieldKind::Checkbox,
+        RectPt {
+            x: 72.0,
+            y: 640.0,
+            w: 18.0,
+            h: 18.0,
+        },
+    );
+    let radio = doc.add_field(
+        FieldKind::Radio,
+        RectPt {
+            x: 72.0,
+            y: 610.0,
+            w: 18.0,
+            h: 18.0,
+        },
+    );
+    let group = doc.field(radio).unwrap().name().to_string();
+    doc.add_radio(
+        RectPt {
+            x: 72.0,
+            y: 580.0,
+            w: 18.0,
+            h: 18.0,
+        },
+        Some(&group),
+    );
+    doc.add_field(
+        FieldKind::Table,
+        RectPt {
+            x: 200.0,
+            y: 500.0,
+            w: 216.0,
+            h: 108.0,
+        },
+    );
+    doc.add_field(
+        FieldKind::Signature,
+        RectPt {
+            x: 72.0,
+            y: 450.0,
+            w: 144.0,
+            h: 36.0,
+        },
+    );
+    doc.add_field(
+        FieldKind::Date,
+        RectPt {
+            x: 72.0,
+            y: 420.0,
+            w: 108.0,
+            h: 18.0,
+        },
+    );
+    doc.add_field(
+        FieldKind::Dropdown,
+        RectPt {
+            x: 72.0,
+            y: 390.0,
+            w: 144.0,
+            h: 18.0,
+        },
+    );
+    doc.add_field(
+        FieldKind::Line,
+        RectPt {
+            x: 72.0,
+            y: 360.0,
+            w: 144.0,
+            h: 9.0,
+        },
+    );
+    doc.add_field(
+        FieldKind::Rectangle,
+        RectPt {
+            x: 300.0,
+            y: 300.0,
+            w: 72.0,
+            h: 54.0,
+        },
+    );
+    doc.add_field(
+        FieldKind::TextBox,
+        RectPt {
+            x: 72.0,
+            y: 240.0,
+            w: 180.0,
+            h: 54.0,
+        },
+    );
+    doc.add_field(
+        FieldKind::Image,
+        RectPt {
+            x: 300.0,
+            y: 200.0,
+            w: 90.0,
+            h: 72.0,
+        },
+    );
+
+    let bytes = export_pdf(&doc).unwrap();
+    assert!(!bytes
+        .windows(b"NeedAppearances".len())
+        .any(|window| window == b"NeedAppearances"));
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let root = catalog(&pdf);
+    let page_dict = page(&pdf, root);
+    let acro = deref(&pdf, root.get(b"AcroForm").unwrap())
+        .as_dict()
+        .unwrap();
+    let fields = deref(&pdf, acro.get(b"Fields").unwrap());
+    let fields = fields.as_array().unwrap();
+    // Text, checkbox, one radio parent, signature, date, drop-down.
+    assert_eq!(fields.len(), 6);
+    let annots = deref(&pdf, page_dict.get(b"Annots").unwrap());
+    // The radio parent is not a widget. Two radio widgets plus five other fields.
+    assert_eq!(annots.as_array().unwrap().len(), 7);
+
+    let names = field_names(&pdf, fields);
+    assert!(names.iter().any(|name| name == "Text1"));
+    assert!(names.iter().any(|name| name == "Check1"));
+    assert!(names.iter().any(|name| name == "Radio1"));
+    assert!(names.iter().any(|name| name == "Sign1"));
+    assert!(names.iter().any(|name| name == "Date1"));
+    assert!(names.iter().any(|name| name == "Choice1"));
+    assert!(!names.iter().any(|name| name.contains("Label")));
+    assert!(!names.iter().any(|name| name.contains("Table")));
+    assert!(!names.iter().any(|name| name.contains("Line")));
+    assert!(!names.iter().any(|name| name.contains("Shape")));
+    assert!(!names.iter().any(|name| name.contains("TextBox")));
+    assert!(!names.iter().any(|name| name.contains("Image")));
+
+    let radio_field = find_field(&pdf, fields, "Radio1");
+    assert_name(deref(&pdf, radio_field.get(b"FT").unwrap()), b"Btn");
+    let flags = flag_bits(&pdf, radio_field);
+    assert_ne!(flags & (1 << 15), 0, "radio flag");
+    assert_eq!(flags & (1 << 16), 0, "not a pushbutton");
+    let kids = deref(&pdf, radio_field.get(b"Kids").unwrap());
+    assert_eq!(kids.as_array().unwrap().len(), 2);
+
+    let date = find_field(&pdf, fields, "Date1");
+    assert_name(deref(&pdf, date.get(b"FT").unwrap()), b"Tx");
+    match deref(&pdf, date.get(b"MaxLen").unwrap()) {
+        Object::Integer(len) => assert_eq!(*len, 10),
+        other => panic!("MaxLen {other:?}"),
+    }
+    let tu = string_bytes(deref(&pdf, date.get(b"TU").unwrap()));
+    assert_eq!(tu, b"YYYY-MM-DD");
+
+    let choice = find_field(&pdf, fields, "Choice1");
+    assert_name(deref(&pdf, choice.get(b"FT").unwrap()), b"Ch");
+    let choice_flags = flag_bits(&pdf, choice);
+    assert_ne!(choice_flags & (1 << 17), 0, "combo, not a list box");
+    assert_eq!(choice_flags & (1 << 18), 0, "not an editable combo");
+    assert_eq!(choice_flags & (1 << 21), 0, "not multi-select");
+    let options = deref(&pdf, choice.get(b"Opt").unwrap());
+    assert_eq!(options.as_array().unwrap().len(), 3);
+
+    let sign = find_field(&pdf, fields, "Sign1");
+    assert_name(deref(&pdf, sign.get(b"FT").unwrap()), b"Sig");
+
+    let contents = stream_plain(&pdf, deref(&pdf, page_dict.get(b"Contents").unwrap()));
+    let text = String::from_utf8_lossy(&contents);
+    assert!(text.contains("Full name"), "static text is page content");
+    assert!(text.contains("Text"), "text box caption is page content");
+    assert!(text.contains("Image"), "image placeholder is page content");
+    assert!(
+        !text.contains("Header") && !text.contains("Footer"),
+        "view chrome is not in the PDF"
+    );
+
+    doc.set_radio_labels(false);
+    let hidden = export_pdf(&doc).unwrap();
+    let hidden_pdf = Document::load_mem(&hidden).unwrap();
+    let hidden_catalog = catalog(&hidden_pdf);
+    let hidden_page = page(&hidden_pdf, hidden_catalog);
+    let hidden_contents = stream_plain(
+        &hidden_pdf,
+        deref(&hidden_pdf, hidden_page.get(b"Contents").unwrap()),
+    );
+    let hidden_text = String::from_utf8_lossy(&hidden_contents);
+    assert!(!hidden_text.contains("(Yes)"));
+    assert!(!hidden_text.contains("(No)"));
+}
+
+fn field_names(doc: &Document, fields: &[Object]) -> Vec<String> {
+    fields
+        .iter()
+        .map(|field| {
+            let dict = deref(doc, field).as_dict().unwrap();
+            let bytes = string_bytes(deref(doc, dict.get(b"T").unwrap()));
+            String::from_utf8_lossy(bytes).into_owned()
+        })
+        .collect()
+}
+
+fn flag_bits(doc: &Document, field: &lopdf::Dictionary) -> i64 {
+    match deref(doc, field.get(b"Ff").unwrap()) {
+        Object::Integer(value) => *value,
+        other => panic!("unexpected /Ff {other:?}"),
+    }
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())

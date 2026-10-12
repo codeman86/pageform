@@ -94,9 +94,25 @@ Usage:
       Write the sample form without opening a window.
 
 Scroll to zoom. Middle-drag or Space-drag to pan.
-The window opens in the dark theme. Dark / Light in the side panel switches it.
+The window opens in the dark theme. Edit → Preferences, View → Dark / Light,
+or the toolbar moon/sun icon switches it, and the choice is restored next launch.
+File: New opens New Blank Document and New from Template. Those, plus Open, Save,
+Save As, and Print, are not implemented yet.
+Export PDF writes sample-form.pdf. Exit closes the window.
+Edit: Select and Delete work. Select All, Copy, Cut, and Paste are not
+implemented yet. Preferences is a dialog for the theme and radio labels.
+Insert drops a default item in the view, listed alphabetically: Checkbox,
+Date, Drop-down, Image, Line, Radio, Signature, Square/Rectangle, Table,
+Text (static label), Text Box, and Text Field. Toolbar icons use that same
+order, with Square and Rectangle as separate tools under one Shapes icon. Insert Page is not
+implemented yet. Header and footer are in the View menu only.
+A selected radio makes the next radio join that group. Preferences can hide
+the label beside each radio. There is no list box.
+View toggles grid dots, guide lines, the print-safe margin, header, footer,
+page numbers, and snap, and chooses the grid size and Dark or Light.
+Header, footer, and page numbers are canvas only.
+Help opens a separate FAQ window. About opens a centered dialog.
 Grid sizes: Small (1/16 in), Medium (1/8 in, default), Large (1/4 in).
-Dots cover the page. Guide lines and the print-safe margin are canvas only.
 Snap follows the active size so columns and rows stay even."
     );
 }

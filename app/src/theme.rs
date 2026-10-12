@@ -66,6 +66,8 @@ pub struct CanvasColors {
     pub check_stroke: Color32,
     pub field_fill: Color32,
     pub field_text: Color32,
+    pub label_text: Color32,
+    pub shape_stroke: Color32,
     pub handle_fill: Color32,
     pub margin: Color32,
 }
@@ -86,6 +88,8 @@ pub fn canvas_colors(dark: bool) -> CanvasColors {
             check_stroke: Color32::from_rgb(32, 32, 36),
             field_fill: Color32::WHITE,
             field_text: Color32::from_rgb(50, 58, 72),
+            label_text: Color32::from_rgb(232, 236, 242),
+            shape_stroke: Color32::from_rgb(214, 220, 228),
             handle_fill: Color32::WHITE,
             margin: Color32::from_rgb(220, 146, 146),
         }
@@ -105,6 +109,8 @@ pub fn canvas_colors(dark: bool) -> CanvasColors {
             check_stroke: Color32::from_rgb(32, 32, 36),
             field_fill: Color32::WHITE,
             field_text: Color32::from_rgb(50, 58, 72),
+            label_text: Color32::from_rgb(50, 58, 72),
+            shape_stroke: Color32::from_rgb(36, 48, 72),
             handle_fill: Color32::WHITE,
             margin: Color32::from_rgb(186, 112, 112),
         }
@@ -163,6 +169,8 @@ mod tests {
         assert!(rel_luma(colors.major_guide) > rel_luma(colors.minor_guide));
         assert!(rel_luma(colors.page_edge) > page);
         assert!(rel_luma(colors.margin) > page);
+        assert!(rel_luma(colors.shape_stroke) > page + 0.15);
+        assert!(rel_luma(colors.label_text) > page + 0.2);
         assert!(rel_luma(colors.desk) < page);
     }
 
@@ -176,5 +184,7 @@ mod tests {
         assert!(rel_luma(colors.major_guide) < rel_luma(colors.minor_guide));
         assert!(rel_luma(colors.page_edge) < page);
         assert!(rel_luma(colors.margin) < page);
+        assert!(rel_luma(colors.shape_stroke) < page - 0.15);
+        assert!(rel_luma(colors.label_text) < page - 0.2);
     }
 }

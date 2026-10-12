@@ -82,3 +82,18 @@ jobs:
           name: pageform-windows-exe
           path: dist/
           if-no-files-found: error
+
+      - name: Build Linux AppImage
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y file curl ca-certificates \
+            libxkbcommon0 libwayland-client0 libwayland-cursor0 libwayland-egl1
+          packaging/make-appimage.sh
+
+      - name: Upload Linux AppImage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pageform-linux-appimage
+          path: dist/PageForm-x86_64.AppImage
+          if-no-files-found: error
