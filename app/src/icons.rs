@@ -149,9 +149,9 @@ fn icon_widget(
             .rect_stroke(rect, 4.0, visuals.bg_stroke, StrokeKind::Inside);
     }
     let glyph = if caret {
-        Rect::from_min_size(rect.min + Vec2::new(3.0, 4.0), Vec2::splat(20.0))
+        Rect::from_min_size(rect.min + Vec2::new(4.0, 5.0), Vec2::splat(18.0))
     } else {
-        Rect::from_center_size(rect.center(), Vec2::splat(20.0))
+        Rect::from_center_size(rect.center(), Vec2::splat(18.0))
     };
     paint_icon(ui.painter(), glyph, visuals.fg_stroke.color, icon);
     if caret {
@@ -374,32 +374,32 @@ mod tests {
         assert_eq!(
             names,
             [
-                "note-add",
-                "folder-open",
-                "save",
-                "print",
-                "arrow-selector-tool",
-                "note-stack-add",
+                "note-add-outline",
+                "folder-open-outline",
+                "save-outline",
+                "print-outline",
+                "arrow-selector-tool-outline",
+                "note-stack-add-outline",
                 "check-box-outline",
-                "calendar-today",
-                "dropdown",
-                "image",
+                "calendar-today-outline",
+                "dropdown-outline",
+                "image-outline",
                 "horizontal-rule",
-                "radio-button-checked",
-                "shapes",
-                "signature",
-                "table",
+                "radio-button-unchecked",
+                "shapes-outline",
+                "signature-outline-rounded",
+                "table-outline",
                 "title",
-                "text-snippet",
+                "text-snippet-outline",
                 "text-fields",
-                "grid-on",
-                "looks-one",
+                "grid-on-outline",
+                "looks-one-outline",
                 "grain",
                 "grid-guides",
-                "margin",
-                "my-location",
-                "dark-mode",
-                "light-mode",
+                "margin-outline",
+                "my-location-outline",
+                "dark-mode-outline",
+                "light-mode-outline",
             ]
         );
         for icon in Icon::ALL {
@@ -409,7 +409,27 @@ mod tests {
                 "{} did not tessellate",
                 icon.iconify_name()
             );
+            let area = mesh_area(&tess);
+            assert!(
+                area < 280.0,
+                "{} fills {:.0} px² of the 24² box (solid square)",
+                icon.iconify_name(),
+                area
+            );
         }
+    }
+
+    fn mesh_area(tess: &Tess) -> f32 {
+        let mut area = 0.0;
+        let mut index = 0;
+        while index + 2 < tess.indices.len() {
+            let a = tess.vertices[tess.indices[index] as usize];
+            let b = tess.vertices[tess.indices[index + 1] as usize];
+            let c = tess.vertices[tess.indices[index + 2] as usize];
+            area += ((b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y)).abs() * 0.5;
+            index += 3;
+        }
+        area
     }
 
     fn assert_sorted(labels: &[&str]) {
