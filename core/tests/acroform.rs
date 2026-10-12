@@ -697,6 +697,72 @@ fn styled_properties_round_trip_into_the_acroform() {
     assert!(!page_text.contains("CANVAS-FOOTER"));
 }
 
+#[test]
+fn inline_text_edits_export_as_page_content_or_field_value() {
+    let mut doc = Form::letter();
+    let label = doc.add_field(
+        FieldKind::StaticText,
+        RectPt {
+            x: 72.0,
+            y: 700.0,
+            w: 180.0,
+            h: 18.0,
+        },
+    );
+    doc.set_caption(label, "Full name").unwrap();
+    let text_box = doc.add_field(
+        FieldKind::TextBox,
+        RectPt {
+            x: 72.0,
+            y: 640.0,
+            w: 180.0,
+            h: 48.0,
+        },
+    );
+    doc.set_caption(text_box, "Line one\nLine two").unwrap();
+    let check = doc.add_field(
+        FieldKind::Checkbox,
+        RectPt {
+            x: 72.0,
+            y: 600.0,
+            w: 18.0,
+            h: 18.0,
+        },
+    );
+    doc.set_caption(check, "Agree").unwrap();
+    let text = doc.add_field(
+        FieldKind::Text,
+        RectPt {
+            x: 72.0,
+            y: 560.0,
+            w: 144.0,
+            h: 18.0,
+        },
+    );
+    doc.set_name(text, "person").unwrap();
+    doc.set_default_value(text, "Ada");
+
+    let bytes = export_pdf(&doc).unwrap();
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let root = catalog(&pdf);
+    let page_dict = page(&pdf, root);
+    let contents = stream_plain(&pdf, deref(&pdf, page_dict.get(b"Contents").unwrap()));
+    let page_text = String::from_utf8_lossy(&contents);
+    assert!(page_text.contains("Full name"), "{page_text}");
+    assert!(page_text.contains("Line one"), "{page_text}");
+    assert!(page_text.contains("Line two"), "{page_text}");
+    assert!(page_text.contains("Agree"), "{page_text}");
+
+    let acro = deref(&pdf, root.get(b"AcroForm").unwrap())
+        .as_dict()
+        .unwrap();
+    let fields = deref(&pdf, acro.get(b"Fields").unwrap());
+    let person = find_field(&pdf, fields.as_array().unwrap(), "person");
+    assert_eq!(string_bytes(deref(&pdf, person.get(b"V").unwrap())), b"Ada");
+    let appearance = stream_plain(&pdf, appearance_n(&pdf, person));
+    assert!(String::from_utf8_lossy(&appearance).contains("Ada"));
+}
+
 fn field_names(doc: &Document, fields: &[Object]) -> Vec<String> {
     fields
         .iter()

@@ -1022,8 +1022,12 @@ fn page_content(doc: &Document) -> (Vec<u8>, Vec<FontFamily>) {
                     let leading = style.font_size.max(8.0) * 1.15;
                     let mut y = rect.top() - style.font_size.max(8.0);
                     for line in words {
-                        if y < rect.y || line.is_empty() {
+                        if y < rect.y {
                             break;
+                        }
+                        if line.is_empty() {
+                            y -= leading;
+                            continue;
                         }
                         let x = aligned_x(rect.x, rect.w, &line, style, 4.0);
                         show_text(
@@ -1038,6 +1042,21 @@ fn page_content(doc: &Document) -> (Vec<u8>, Vec<FontFamily>) {
                         y -= leading;
                     }
                 }
+            }
+            FieldKind::Checkbox if !field.caption().is_empty() => {
+                let rect = field.rect();
+                remember_font(&mut fonts, style.font);
+                let x = rect.right() + 4.0;
+                let y = rect.y + ((rect.h - style.font_size) * 0.5).max(1.0);
+                show_text(
+                    &mut content,
+                    x,
+                    y,
+                    field.caption(),
+                    style.font,
+                    style.font_size,
+                    style.text_color,
+                );
             }
             FieldKind::Radio if doc.radio_labels() && !field.caption().is_empty() => {
                 let rect = field.rect();
@@ -1188,6 +1207,21 @@ fn stroke_table(content: &mut Content, rect: crate::geom::RectPt, style: &FieldS
 }
 
 fn wrap_text(text: &str, width: f32, font: FontFamily, size: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+        } else {
+            lines.extend(wrap_paragraph(paragraph, width, font, size));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn wrap_paragraph(text: &str, width: f32, font: FontFamily, size: f32) -> Vec<String> {
     let char_width = match font {
         FontFamily::Courier => size * 0.6,
         FontFamily::Times => size * 0.45,

@@ -89,6 +89,24 @@ impl Tool {
     }
 }
 
+/// Which string a canvas text editor writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineTarget {
+    /// Static text, text box, radio or checkbox label, signature word.
+    Caption,
+    /// Fillable field's default value.
+    DefaultValue,
+}
+
+struct InlineEdit {
+    id: FieldId,
+    target: InlineTarget,
+    buffer: String,
+    original: String,
+    multiline: bool,
+    request_focus: bool,
+}
+
 #[derive(Clone)]
 enum Drag {
     Pan,
@@ -145,6 +163,7 @@ struct PageFormApp {
     properties_pinned: bool,
     persist_panel: bool,
     context_field: Option<FieldId>,
+    inline: Option<InlineEdit>,
     show_preferences: bool,
     show_about: bool,
     show_help: bool,
@@ -196,6 +215,7 @@ impl PageFormApp {
             properties_pinned: crate::prefs::is_pinned(pinned.as_deref()),
             persist_panel: false,
             context_field: None,
+            inline: None,
             show_preferences: false,
             show_about: false,
             show_help: false,
@@ -313,6 +333,101 @@ impl PageFormApp {
 
     fn open_properties(&mut self) {
         self.set_properties_open(true);
+    }
+
+    /// Start canvas editing for an item that shows text. Returns false for shapes and other items.
+    fn begin_inline(&mut self, id: FieldId) -> bool {
+        if self.inline.as_ref().is_some_and(|edit| edit.id == id) {
+            return true;
+        }
+        let started = self.doc.field(id).and_then(|field| {
+            inline_target(field.kind(), field.style().multiline).map(|(target, multiline)| {
+                let text = match target {
+                    InlineTarget::Caption => field.caption().to_string(),
+                    InlineTarget::DefaultValue => field.style().default_value.clone(),
+                };
+                (target, multiline, text)
+            })
+        });
+        let Some((target, multiline, text)) = started else {
+            return false;
+        };
+        if self.inline.is_some() {
+            self.finish_inline();
+        }
+        self.inline = Some(InlineEdit {
+            id,
+            target,
+            buffer: text.clone(),
+            original: text,
+            multiline,
+            request_focus: true,
+        });
+        self.name_for = None;
+        self.sync_field_buffers();
+        self.status = if multiline {
+            "Editing text. Enter finishes, Shift+Enter adds a line, Esc cancels.".to_string()
+        } else {
+            "Editing text. Enter or a click outside finishes, Esc cancels.".to_string()
+        };
+        true
+    }
+
+    fn inline_hides_text(&self, id: FieldId) -> bool {
+        self.inline.as_ref().is_some_and(|edit| edit.id == id)
+    }
+
+    fn apply_inline(&mut self) {
+        let Some(edit) = self.inline.as_ref() else {
+            return;
+        };
+        let id = edit.id;
+        let target = edit.target;
+        let text = edit.buffer.clone();
+        match target {
+            InlineTarget::Caption => {
+                let _ = self.doc.set_caption(id, &text);
+            }
+            InlineTarget::DefaultValue => self.doc.set_default_value(id, &text),
+        }
+        if self.name_for == Some(id) {
+            match target {
+                InlineTarget::Caption => self.caption_buf.clone_from(&text),
+                InlineTarget::DefaultValue => self.value_buf.clone_from(&text),
+            }
+        }
+    }
+
+    fn cancel_inline(&mut self) {
+        let Some(edit) = self.inline.take() else {
+            return;
+        };
+        match edit.target {
+            InlineTarget::Caption => {
+                let _ = self.doc.set_caption(edit.id, &edit.original);
+            }
+            InlineTarget::DefaultValue => self.doc.set_default_value(edit.id, &edit.original),
+        }
+        if self.name_for == Some(edit.id) {
+            match edit.target {
+                InlineTarget::Caption => self.caption_buf = edit.original,
+                InlineTarget::DefaultValue => self.value_buf = edit.original,
+            }
+        }
+    }
+
+    fn finish_inline(&mut self) {
+        self.apply_inline();
+        self.inline = None;
+    }
+
+    /// Sidebar edits land in the canvas editor when both show the same item.
+    fn note_sidebar_text(&mut self, id: FieldId, target: InlineTarget, text: &str) {
+        if let Some(edit) = &mut self.inline {
+            if edit.id == id && edit.target == target && edit.buffer != text {
+                edit.buffer = text.to_string();
+            }
+        }
     }
 
     /// Unpinned panels close when the user is done with the selection.
@@ -968,6 +1083,7 @@ impl PageFormApp {
         self.paint(&painter, response.rect);
         self.hover_cursor(&response, ui.ctx());
         self.field_context_menu(&response);
+        self.inline_editor(ui);
     }
 
     fn handle_input(&mut self, response: &egui::Response, ctx: &egui::Context) {
@@ -1002,10 +1118,10 @@ impl PageFormApp {
 
         if response.double_clicked() && self.tool == Tool::Select {
             if let Some(pdf) = self.pointer_pdf(ctx) {
-                if let Some(id) = self.hit_field_id(pdf) {
+                if let Some(id) = self.hit_text_item(pdf) {
                     self.selection = vec![id];
                     self.drag = None;
-                    self.open_properties();
+                    self.begin_inline(id);
                     return;
                 }
             }
@@ -1194,6 +1310,95 @@ impl PageFormApp {
         }
     }
 
+    fn hit_text_item(&self, pdf: PdfPoint) -> Option<FieldId> {
+        if let Some(id) = self.hit_field_id(pdf) {
+            let editable = self.doc.field(id).is_some_and(|field| {
+                inline_target(field.kind(), field.style().multiline).is_some()
+            });
+            if editable {
+                return Some(id);
+            }
+        }
+        self.doc.fields().iter().rev().find_map(|field| {
+            if !matches!(field.kind(), FieldKind::Radio | FieldKind::Checkbox) {
+                return None;
+            }
+            adjacent_label_rect(field.rect())
+                .contains(pdf)
+                .then_some(field.id())
+        })
+    }
+
+    fn inline_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.inline.as_ref().map(|edit| edit.id) else {
+            return;
+        };
+        let Some(field) = self.doc.field(id) else {
+            self.inline = None;
+            return;
+        };
+        let kind = field.kind();
+        let style = field.style().clone();
+        let rect = inline_screen_rect(&self.view, field.rect(), kind);
+        let font = canvas_font(&style, self.view.zoom);
+        let light_fill = style
+            .fill
+            .is_some_and(|fill| fill.r + fill.g + fill.b > 1.5);
+        let color = canvas_text_color(
+            style.text_color,
+            light_fill && !matches!(kind, FieldKind::Radio | FieldKind::Checkbox),
+            &crate::theme::canvas_colors(self.dark),
+        );
+        let multiline = self.inline.as_ref().is_some_and(|edit| edit.multiline);
+        let request_focus = self.inline.as_ref().is_some_and(|edit| edit.request_focus);
+        let edit_id = egui::Id::new(("canvas-inline", id.0));
+        let hint = inline_hint(kind, &style, field.name());
+
+        let response = {
+            let edit = self.inline.as_mut().unwrap();
+            let mut widget = if multiline {
+                egui::TextEdit::multiline(&mut edit.buffer).return_key(egui::KeyboardShortcut::new(
+                    egui::Modifiers::SHIFT,
+                    egui::Key::Enter,
+                ))
+            } else {
+                egui::TextEdit::singleline(&mut edit.buffer).return_key(
+                    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Enter),
+                )
+            };
+            widget = widget
+                .id(edit_id)
+                .font(font)
+                .text_color(color)
+                .frame(false)
+                .desired_width(rect.width());
+            if !hint.is_empty() {
+                widget = widget.hint_text(hint);
+            }
+            ui.put(rect, widget)
+        };
+        if request_focus {
+            response.request_focus();
+            if let Some(edit) = &mut self.inline {
+                edit.request_focus = false;
+            }
+        }
+        if response.changed() {
+            self.apply_inline();
+        }
+        let escape = ui.input(|input| input.key_pressed(Key::Escape));
+        let enter = ui.input(|input| input.key_pressed(Key::Enter) && !input.modifiers.shift);
+        if escape && (response.has_focus() || response.lost_focus()) {
+            self.cancel_inline();
+            ui.memory_mut(|memory| memory.surrender_focus(edit_id));
+        } else if multiline && enter && response.has_focus() {
+            self.finish_inline();
+            ui.memory_mut(|memory| memory.surrender_focus(edit_id));
+        } else if response.lost_focus() {
+            self.finish_inline();
+        }
+    }
+
     fn field_context_menu(&mut self, response: &egui::Response) {
         let popup_id = response.id.with("popup");
         if response.secondary_clicked() && self.context_field.is_none() {
@@ -1348,7 +1553,10 @@ impl PageFormApp {
             if style.checked() {
                 painter.circle_filled(center, radius * 0.45, text_color);
             }
-            if self.doc.radio_labels() && !field.caption().is_empty() {
+            if self.doc.radio_labels()
+                && !field.caption().is_empty()
+                && !self.inline_hides_text(field.id())
+            {
                 painter.text(
                     screen.right_center() + Vec2::new(6.0, 0.0),
                     Align2::LEFT_CENTER,
@@ -1420,35 +1628,39 @@ impl PageFormApp {
                     }
                     _ => "",
                 };
-                paint_label(
-                    painter,
-                    screen,
-                    label,
-                    &font,
-                    text_color,
-                    style.align,
-                    style.multiline && kind == FieldKind::Text,
-                );
+                if !self.inline_hides_text(field.id()) {
+                    paint_label(
+                        painter,
+                        screen,
+                        label,
+                        &font,
+                        text_color,
+                        style.align,
+                        style.multiline && kind == FieldKind::Text,
+                    );
+                }
                 if kind == FieldKind::Dropdown {
                     painter.text(
                         screen.right_center() - Vec2::new(8.0, 0.0),
                         Align2::RIGHT_CENTER,
                         "v",
-                        font,
+                        font.clone(),
                         text_color,
                     );
                 }
             }
             FieldKind::StaticText => {
-                paint_label(
-                    painter,
-                    screen,
-                    field.caption(),
-                    &font,
-                    text_color,
-                    style.align,
-                    false,
-                );
+                if !self.inline_hides_text(field.id()) {
+                    paint_label(
+                        painter,
+                        screen,
+                        field.caption(),
+                        &font,
+                        text_color,
+                        style.align,
+                        false,
+                    );
+                }
             }
             FieldKind::Table => {
                 let stroke =
@@ -1470,15 +1682,17 @@ impl PageFormApp {
                 }
             }
             FieldKind::TextBox => {
-                paint_label(
-                    painter,
-                    screen,
-                    field.caption(),
-                    &font,
-                    text_color,
-                    style.align,
-                    style.multiline,
-                );
+                if !self.inline_hides_text(field.id()) {
+                    paint_label(
+                        painter,
+                        screen,
+                        field.caption(),
+                        &font,
+                        text_color,
+                        style.align,
+                        style.multiline,
+                    );
+                }
             }
             FieldKind::Image => {
                 painter.line_segment(
@@ -1497,7 +1711,7 @@ impl PageFormApp {
                     } else {
                         field.caption()
                     },
-                    font,
+                    font.clone(),
                     text_color,
                 );
             }
@@ -1506,6 +1720,18 @@ impl PageFormApp {
             }
             FieldKind::Checkbox | FieldKind::Rectangle | FieldKind::Line | FieldKind::Radio => {}
             _ => {}
+        }
+        if kind == FieldKind::Checkbox
+            && !field.caption().is_empty()
+            && !self.inline_hides_text(field.id())
+        {
+            painter.text(
+                screen.right_center() + Vec2::new(6.0, 0.0),
+                Align2::LEFT_CENTER,
+                field.caption(),
+                font.clone(),
+                text_color,
+            );
         }
     }
 
@@ -1892,7 +2118,11 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "How do I open properties?",
-        "The properties panel starts hidden. Open it from View → Properties, the toolbar properties icon, a right-click Properties command, or a double-click on an item. The header has a close button and a pin. Pinned panels stay open. Unpinned panels close when you click empty canvas. Shift-click or Ctrl-click selects more than one item.",
+        "The properties panel starts hidden. Open it from View → Properties, the toolbar properties icon, or a right-click Properties command. The header has a close button and a pin. Pinned panels stay open. Unpinned panels close when you click empty canvas. Shift-click or Ctrl-click selects more than one item.",
+    ),
+    (
+        "How do I edit text on the page?",
+        "Double-click static text, a text box, a radio or checkbox label, a signature word, or the default text in a text, date, or drop-down field. Type in the box. Enter, or a click outside, finishes. Esc restores the previous text. On a multi-line item, Shift+Enter starts a new line and Enter finishes. The sidebar text field shows the same words while you type.",
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
@@ -2086,6 +2316,45 @@ fn kind_note(kind: FieldKind) -> &'static str {
         FieldKind::Rectangle => "Rectangle on the page. Not a fillable field.",
         FieldKind::TextBox => "Static text box. Not a fillable field.",
         FieldKind::Image => "Image placeholder. Choosing a file is not available yet.",
+    }
+}
+
+fn inline_target(kind: FieldKind, multiline: bool) -> Option<(InlineTarget, bool)> {
+    match kind {
+        FieldKind::StaticText | FieldKind::Radio | FieldKind::Checkbox | FieldKind::Signature => {
+            Some((InlineTarget::Caption, false))
+        }
+        FieldKind::TextBox => Some((InlineTarget::Caption, multiline)),
+        FieldKind::Text => Some((InlineTarget::DefaultValue, multiline)),
+        FieldKind::Date | FieldKind::Dropdown => Some((InlineTarget::DefaultValue, false)),
+        FieldKind::Line | FieldKind::Rectangle | FieldKind::Image | FieldKind::Table => None,
+    }
+}
+
+fn adjacent_label_rect(rect: RectPt) -> RectPt {
+    RectPt {
+        x: rect.right() + 4.0,
+        y: rect.y,
+        w: 140.0,
+        h: rect.h.max(12.0),
+    }
+}
+
+fn inline_screen_rect(view: &ViewTransform, rect: RectPt, kind: FieldKind) -> Rect {
+    let screen = to_egui(view.pdf_rect_to_screen(rect));
+    if matches!(kind, FieldKind::Radio | FieldKind::Checkbox) {
+        let label = adjacent_label_rect(rect);
+        to_egui(view.pdf_rect_to_screen(label))
+    } else {
+        screen
+    }
+}
+
+fn inline_hint(kind: FieldKind, style: &pageform_core::FieldStyle, name: &str) -> String {
+    match kind {
+        FieldKind::Text if style.default_value.is_empty() => name.to_string(),
+        FieldKind::Date if style.default_value.is_empty() => style.date_format.clone(),
+        _ => String::new(),
     }
 }
 
@@ -2501,6 +2770,48 @@ mod tests {
             vec![first, second]
         );
         assert_eq!(selection_after_click(&[first], second, false), vec![second]);
+    }
+
+    #[test]
+    fn canvas_text_edit_updates_the_field_and_escape_restores_it() {
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::StaticText);
+        let id = app.primary().unwrap();
+        assert!(app.begin_inline(id));
+        assert!(!app.properties_open);
+        assert_eq!(app.inline.as_ref().map(|edit| edit.multiline), Some(false));
+        app.inline.as_mut().unwrap().buffer = "Full name".to_string();
+        app.apply_inline();
+        assert_eq!(app.doc.field(id).unwrap().caption(), "Full name");
+        assert_eq!(app.caption_buf, "Full name");
+        app.cancel_inline();
+        assert!(app.inline.is_none());
+        assert_eq!(app.doc.field(id).unwrap().caption(), "Label");
+        assert_eq!(app.caption_buf, "Label");
+
+        app.insert_at_view(FieldKind::TextBox);
+        let text_box = app.primary().unwrap();
+        assert!(app.begin_inline(text_box));
+        assert!(app.inline.as_ref().unwrap().multiline);
+        app.inline.as_mut().unwrap().buffer = "Line one\nLine two".to_string();
+        app.apply_inline();
+        assert_eq!(
+            app.doc.field(text_box).unwrap().caption(),
+            "Line one\nLine two"
+        );
+
+        app.insert_at_view(FieldKind::Text);
+        let text = app.primary().unwrap();
+        assert!(app.begin_inline(text));
+        app.inline.as_mut().unwrap().buffer = "Ada".to_string();
+        app.apply_inline();
+        assert_eq!(app.doc.field(text).unwrap().style().default_value, "Ada");
+        assert_eq!(app.value_buf, "Ada");
+
+        app.insert_at_view(FieldKind::Rectangle);
+        let shape = app.primary().unwrap();
+        assert!(!app.begin_inline(shape));
+        assert_eq!(app.inline.as_ref().map(|edit| edit.id), Some(text));
     }
 
     #[test]

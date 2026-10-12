@@ -296,6 +296,8 @@ impl PageFormApp {
                 .add(egui::TextEdit::singleline(&mut self.value_buf).desired_width(f32::INFINITY));
             if value.changed() {
                 self.doc.set_default_value(id, &self.value_buf);
+                let text = self.value_buf.clone();
+                self.note_sidebar_text(id, super::InlineTarget::DefaultValue, &text);
             }
         }
         if let Some(error) = &self.name_error {
@@ -595,6 +597,8 @@ impl PageFormApp {
                 .set_caption(id, &self.caption_buf)
                 .err()
                 .map(|err| err.to_string());
+            let text = self.caption_buf.clone();
+            self.note_sidebar_text(id, super::InlineTarget::Caption, &text);
         }
     }
 
@@ -643,7 +647,7 @@ impl PageFormApp {
         });
     }
 
-    fn sync_field_buffers(&mut self) {
+    pub(super) fn sync_field_buffers(&mut self) {
         let id = self.primary();
         if self.name_for == id {
             return;

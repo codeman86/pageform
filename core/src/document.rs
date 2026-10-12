@@ -518,9 +518,10 @@ impl Document {
         Ok(())
     }
 
-    /// Caption for static text or the label beside a radio button.
+    /// Caption for static text, a text box, or the label beside a radio or checkbox.
+    /// A newline is kept so a text box can break lines. Other control characters are rejected.
     pub fn set_caption(&mut self, id: FieldId, caption: &str) -> Result<(), NameError> {
-        if caption.chars().any(|ch| ch.is_control()) {
+        if caption.chars().any(|ch| ch.is_control() && ch != '\n') {
             return Err(NameError::Control);
         }
         let Some(field) = self.fields.iter().find(|field| field.id == id) else {
@@ -1103,6 +1104,16 @@ mod tests {
         let other = doc.add_field(FieldKind::Radio, SAMPLE_CHECK_RECT);
         assert_ne!(doc.field(other).unwrap().name(), "Answer");
         assert_eq!(doc.field(other).unwrap().caption(), "Yes");
+    }
+
+    #[test]
+    fn caption_keeps_a_newline_and_rejects_other_controls() {
+        let mut doc = Document::letter();
+        let id = doc.add_field(FieldKind::TextBox, SAMPLE_TEXT_RECT);
+        assert_eq!(doc.set_caption(id, "Line one\nLine two"), Ok(()));
+        assert_eq!(doc.field(id).unwrap().caption(), "Line one\nLine two");
+        assert_eq!(doc.set_caption(id, "bad\u{0001}"), Err(NameError::Control));
+        assert_eq!(doc.field(id).unwrap().caption(), "Line one\nLine two");
     }
 
     #[test]

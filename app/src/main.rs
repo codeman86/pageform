@@ -98,7 +98,9 @@ Scroll to zoom. Middle-drag or Space-drag to pan.
 The window opens in the dark theme. Edit → Preferences, View → Dark / Light,
 or the toolbar moon/sun icon switches it, and the choice is restored next launch.
 The properties panel starts hidden. View → Properties, the toolbar icon,
-right-click Properties, or a double-click opens it. Pin keeps it open.
+or right-click Properties opens it. Double-click edits visible text on the
+page. Enter finishes, Esc cancels, and Shift+Enter adds a line in a text box
+or multiline field. Pin keeps the panel open.
 Unpinned, it closes when you click empty canvas with Select, or when the
 selection is deleted. Preferences stores that open and pinned choice.
 Nothing selected edits the page. One item edits that item. Shift-click or
