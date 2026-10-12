@@ -96,7 +96,8 @@ Usage:
 Scroll to zoom. Middle-drag or Space-drag to pan.
 The window opens in the dark theme. Edit → Preferences, View → Dark / Light,
 or the toolbar moon/sun icon switches it, and the choice is restored next launch.
-File: New, Open, Save, Save As, and Print are not implemented yet.
+File: New opens New Blank and New from Template. Those, plus Open, Save,
+Save As, and Print, are not implemented yet.
 Export PDF writes sample-form.pdf. Exit closes the window.
 Edit: Select and Delete work. Select All, Copy, Cut, and Paste are not
 implemented yet. Preferences is a dialog for the theme and radio labels.

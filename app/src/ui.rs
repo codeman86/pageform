@@ -303,6 +303,17 @@ impl PageFormApp {
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
+                "New" => {
+                    ui.menu_button("New", |ui| {
+                        ui.set_min_width(180.0);
+                        for item in NEW_MENU {
+                            if ui.button(*item).clicked() {
+                                self.mark_not_implemented(item);
+                                ui.close_kind(egui::UiKind::Menu);
+                            }
+                        }
+                    });
+                }
                 other => self.stub_item(ui, other),
             }
         }
@@ -517,18 +528,23 @@ impl PageFormApp {
         }
         let mut close = false;
         let response = egui::Modal::new(egui::Id::new("pageform_preferences")).show(ctx, |ui| {
-            ui.set_min_width(280.0);
-            ui.heading("Preferences");
+            ui.set_min_width(560.0);
+            ui.set_min_height(280.0);
+            ui.heading(egui::RichText::new("Preferences").size(28.0));
+            ui.add_space(8.0);
             ui.separator();
-            ui.label("Theme");
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new("Theme").size(18.0));
+            ui.add_space(6.0);
             let before = self.dark;
             ui.radio_value(&mut self.dark, true, "Dark");
             ui.radio_value(&mut self.dark, false, "Light");
             if self.dark != before {
                 self.persist_theme = true;
             }
-            ui.label("Saved on this computer. Dark is the default.");
             ui.add_space(8.0);
+            ui.label("Saved on this computer. Dark is the default.");
+            ui.add_space(18.0);
             let mut show_labels = self.doc.radio_labels();
             if ui
                 .checkbox(&mut show_labels, "Radio labels")
@@ -544,7 +560,7 @@ impl PageFormApp {
                     "Radio labels off".to_string()
                 };
             }
-            ui.add_space(12.0);
+            ui.add_space(22.0);
             if ui.button("Close").clicked() {
                 close = true;
             }
@@ -640,24 +656,11 @@ impl PageFormApp {
     fn toolbar_documents(&mut self, ui: &mut egui::Ui) {
         for label in icons::DOC_COMMANDS {
             match *label {
-                "New" => self.icon_choices(
-                    ui,
-                    icons::Icon::New,
-                    false,
-                    "New",
-                    &[
-                        ("New Blank", "New Blank"),
-                        ("New from Template", "New from Template"),
-                    ],
-                ),
+                "New" => self.icon_choices(ui, icons::Icon::New, false, "New", NEW_MENU),
                 "Open" => self.stub_icon(ui, icons::Icon::Open, "Open"),
-                "Save" => self.icon_choices(
-                    ui,
-                    icons::Icon::Save,
-                    false,
-                    "Save",
-                    &[("Save", "Save"), ("Save As", "Save As")],
-                ),
+                "Save" => {
+                    self.icon_choices(ui, icons::Icon::Save, false, "Save", &["Save", "Save As"])
+                }
                 "Print" => self.stub_icon(ui, icons::Icon::Print, "Print"),
                 _ => {}
             }
@@ -790,14 +793,14 @@ impl PageFormApp {
         icon: icons::Icon,
         selected: bool,
         tip: &str,
-        items: &[(&str, &str)],
+        items: &[&str],
     ) {
         let response = icons::icon_menu(ui, icon, selected, tip);
         egui::Popup::menu(&response).show(|ui| {
             ui.set_min_width(180.0);
-            for (label, command) in items {
+            for label in items {
                 if ui.button(*label).clicked() {
-                    self.mark_not_implemented(command);
+                    self.mark_not_implemented(label);
                     ui.close();
                 }
             }
@@ -1701,6 +1704,8 @@ const FILE_MENU: &[&str] = &[
     "Exit",
 ];
 
+const NEW_MENU: &[&str] = &["New Blank", "New from Template"];
+
 const EDIT_MENU: &[&str] = &[
     "Select",
     "Select All",
@@ -1736,7 +1741,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "They are not implemented yet, including the toolbar copies. File → Export PDF writes sample-form.pdf. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
+        "File → New lists New Blank and New from Template. Those, plus Open, Save, Save As, and Print, are not implemented yet. File → Export PDF writes sample-form.pdf. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
     ),
     (
         "Is there a list box?",
@@ -1955,6 +1960,7 @@ mod tests {
             ]
         );
         assert_eq!(menu_entries(HELP_MENU), ["Help", "About"]);
+        assert_eq!(NEW_MENU, ["New Blank", "New from Template"]);
         assert_eq!(
             ABOUT_TAGLINE,
             "Open-Source Native Form and Document Editor Written in Rust"
@@ -2269,8 +2275,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = PageFormApp::new(false, None);
 
-        click_menu(&ctx, &mut app, "New", |app, ui| app.file_menu(ui));
-        assert_eq!(app.status, "New is not implemented yet");
+        click_menu(&ctx, &mut app, "Open", |app, ui| app.file_menu(ui));
+        assert_eq!(app.status, "Open is not implemented yet");
         click_menu(&ctx, &mut app, "Save As", |app, ui| app.file_menu(ui));
         assert_eq!(app.status, "Save As is not implemented yet");
         click_menu(&ctx, &mut app, "Print", |app, ui| app.file_menu(ui));

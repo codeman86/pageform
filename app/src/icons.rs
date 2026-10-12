@@ -1,7 +1,8 @@
-//! Small toolbar glyphs drawn with egui's painter.
+//! Colored toolbar glyphs drawn with egui's painter.
 //!
-//! No icon font and no image pack. Each glyph is a few strokes in a unit box
-//! so it stays readable in the light and dark themes.
+//! These are original geometric icons: filled shapes, dark outlines, and a
+//! small fixed palette. They are not copied from another application's art,
+//! and the repo does not include an icon pack.
 
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
@@ -35,8 +36,23 @@ pub const VIEW_ICONS: [Icon; 5] = [
     Icon::Snap,
 ];
 
-const BUTTON: f32 = 26.0;
-const MENU_BUTTON: f32 = 36.0;
+const BUTTON: f32 = 28.0;
+const MENU_BUTTON: f32 = 40.0;
+
+const OUTLINE: Color32 = Color32::from_rgb(36, 40, 48);
+const PAPER: Color32 = Color32::from_rgb(252, 249, 242);
+const PAPER_EDGE: Color32 = Color32::from_rgb(186, 178, 164);
+const FOLDER: Color32 = Color32::from_rgb(232, 176, 52);
+const FOLDER_DARK: Color32 = Color32::from_rgb(186, 128, 28);
+const BLUE: Color32 = Color32::from_rgb(36, 112, 204);
+const BLUE_DARK: Color32 = Color32::from_rgb(22, 72, 148);
+const GREEN: Color32 = Color32::from_rgb(46, 150, 72);
+const RED: Color32 = Color32::from_rgb(196, 58, 52);
+const GOLD: Color32 = Color32::from_rgb(240, 186, 48);
+const SLATE: Color32 = Color32::from_rgb(132, 142, 156);
+const SLATE_DARK: Color32 = Color32::from_rgb(78, 86, 98);
+const WHITE: Color32 = Color32::from_rgb(255, 255, 255);
+const NAVY: Color32 = Color32::from_rgb(28, 36, 58);
 
 #[derive(Clone, Copy)]
 pub enum Icon {
@@ -93,41 +109,36 @@ fn icon_widget(
         ui.painter()
             .rect_stroke(rect, 4.0, visuals.bg_stroke, StrokeKind::Inside);
     }
-    let color = visuals.fg_stroke.color;
     let glyph = if caret {
-        Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), Vec2::splat(18.0))
+        Rect::from_min_size(rect.min + Vec2::new(3.0, 4.0), Vec2::splat(20.0))
     } else {
-        Rect::from_center_size(rect.center(), Vec2::splat(16.0))
+        Rect::from_center_size(rect.center(), Vec2::splat(20.0))
     };
-    paint(ui.painter(), glyph, color, icon);
+    paint(ui.painter(), glyph, icon);
     if caret {
         let caret_box = Rect::from_center_size(
             Pos2::new(rect.right() - 8.0, rect.center().y + 1.0),
-            Vec2::new(7.0, 5.0),
+            Vec2::new(8.0, 6.0),
         );
-        paint_caret(ui.painter(), caret_box, color);
+        paint_caret(ui.painter(), caret_box, visuals.fg_stroke.color);
     }
     response.on_hover_text(tip)
 }
 
-fn paint(painter: &egui::Painter, rect: Rect, color: Color32, icon: Icon) {
-    let ink = Ink {
-        painter,
-        rect,
-        color,
-    };
+fn paint(painter: &egui::Painter, rect: Rect, icon: Icon) {
+    let ink = Ink { painter, rect };
     match icon {
-        Icon::New => ink.page_plus(0.78),
+        Icon::New => ink.new_doc(),
         Icon::Open => ink.folder(),
         Icon::Save => ink.floppy(),
         Icon::Print => ink.printer(),
         Icon::Select => ink.pointer(),
-        Icon::InsertPage => ink.page_plus(0.62),
+        Icon::InsertPage => ink.insert_page(),
         Icon::Checkbox => ink.checkbox(),
         Icon::Date => ink.calendar(),
         Icon::Dropdown => ink.dropdown(),
         Icon::Image => ink.picture(),
-        Icon::Line => ink.line((0.08, 0.78), (0.92, 0.22)),
+        Icon::Line => ink.rule(),
         Icon::Radio => ink.radio(),
         Icon::Shapes => ink.shapes(),
         Icon::Signature => ink.signature(),
@@ -149,7 +160,6 @@ fn paint(painter: &egui::Painter, rect: Rect, color: Color32, icon: Icon) {
 struct Ink<'a> {
     painter: &'a egui::Painter,
     rect: Rect,
-    color: Color32,
 }
 
 impl Ink<'_> {
@@ -160,248 +170,325 @@ impl Ink<'_> {
         )
     }
 
-    fn stroke(&self) -> Stroke {
-        Stroke::new(1.4_f32, self.color)
+    fn box_at(&self, x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect::from_min_max(self.at(x, y), self.at(x + w, y + h))
     }
 
-    fn line(&self, a: (f32, f32), b: (f32, f32)) {
+    fn fill(&self, x: f32, y: f32, w: f32, h: f32, color: Color32) {
         self.painter
-            .line_segment([self.at(a.0, a.1), self.at(b.0, b.1)], self.stroke());
+            .rect_filled(self.box_at(x, y, w, h), 1.0, color);
     }
 
-    fn poly(&self, points: &[(f32, f32)]) {
-        for pair in points.windows(2) {
-            self.line(pair[0], pair[1]);
-        }
+    fn stroke_box(&self, x: f32, y: f32, w: f32, h: f32) {
+        self.painter.rect_stroke(
+            self.box_at(x, y, w, h),
+            1.0,
+            Stroke::new(1.35_f32, OUTLINE),
+            StrokeKind::Inside,
+        );
     }
 
-    fn frame(&self, x: f32, y: f32, w: f32, h: f32) {
-        let rect = Rect::from_min_max(self.at(x, y), self.at(x + w, y + h));
+    fn disk(&self, x: f32, y: f32, radius: f32, color: Color32) {
         self.painter
-            .rect_stroke(rect, 0.0, self.stroke(), StrokeKind::Inside);
+            .circle_filled(self.at(x, y), self.rect.width() * radius, color);
     }
 
-    fn dot(&self, x: f32, y: f32, radius: f32) {
-        self.painter
-            .circle_filled(self.at(x, y), radius, self.color);
+    fn ring(&self, x: f32, y: f32, radius: f32) {
+        self.painter.circle_stroke(
+            self.at(x, y),
+            self.rect.width() * radius,
+            Stroke::new(1.35_f32, OUTLINE),
+        );
     }
 
-    fn dash(&self, a: (f32, f32), b: (f32, f32)) {
-        let start = self.at(a.0, a.1);
-        let end = self.at(b.0, b.1);
-        let delta = end - start;
-        let len = delta.length();
-        if len < 1.0 {
-            return;
-        }
-        let dir = delta / len;
-        let mut traveled = 0.0;
-        while traveled < len {
-            let stop = (traveled + 3.0).min(len);
-            self.painter
-                .line_segment([start + dir * traveled, start + dir * stop], self.stroke());
-            traveled += 5.0;
-        }
+    fn poly(&self, points: &[(f32, f32)], fill: Color32) {
+        let mapped = points
+            .iter()
+            .map(|(x, y)| self.at(*x, *y))
+            .collect::<Vec<_>>();
+        self.painter.add(egui::Shape::convex_polygon(
+            mapped,
+            fill,
+            Stroke::new(1.2_f32, OUTLINE),
+        ));
     }
 
-    fn page_plus(&self, plus_at: f32) {
-        self.frame(0.08, 0.06, 0.62, 0.88);
-        self.line((0.52, 0.06), (0.70, 0.24));
-        self.line((0.52, 0.06), (0.52, 0.24));
-        self.line((0.52, 0.24), (0.70, 0.24));
-        self.line((plus_at - 0.16, plus_at), (plus_at + 0.16, plus_at));
-        self.line((plus_at, plus_at - 0.16), (plus_at, plus_at + 0.16));
+    fn thick(&self, a: (f32, f32), b: (f32, f32), color: Color32, width: f32) {
+        self.painter.line_segment(
+            [self.at(a.0, a.1), self.at(b.0, b.1)],
+            Stroke::new(width, color),
+        );
+    }
+
+    fn page(&self, x: f32, y: f32, w: f32, h: f32) {
+        self.fill(x + 0.04, y + 0.04, w, h, PAPER_EDGE);
+        self.fill(x, y, w, h, PAPER);
+        let fold = 0.22 * w;
+        self.poly(
+            &[
+                (x + w - fold, y),
+                (x + w, y + fold),
+                (x + w - fold, y + fold),
+            ],
+            PAPER_EDGE,
+        );
+        self.stroke_box(x, y, w, h);
+    }
+
+    fn new_doc(&self) {
+        self.page(0.02, 0.06, 0.62, 0.78);
+        self.disk(0.74, 0.72, 0.22, GREEN);
+        self.ring(0.74, 0.72, 0.22);
+        self.thick((0.74, 0.58), (0.74, 0.86), WHITE, 2.2);
+        self.thick((0.60, 0.72), (0.88, 0.72), WHITE, 2.2);
     }
 
     fn folder(&self) {
-        self.poly(&[
-            (0.08, 0.28),
-            (0.08, 0.84),
-            (0.92, 0.84),
-            (0.92, 0.36),
-            (0.46, 0.36),
-            (0.36, 0.18),
-            (0.08, 0.18),
-            (0.08, 0.28),
-        ]);
+        self.fill(0.12, 0.18, 0.42, 0.18, FOLDER_DARK);
+        self.stroke_box(0.12, 0.18, 0.42, 0.18);
+        self.fill(0.06, 0.32, 0.88, 0.58, FOLDER);
+        self.stroke_box(0.06, 0.32, 0.88, 0.58);
+        self.fill(0.10, 0.40, 0.80, 0.08, FOLDER_DARK);
     }
 
     fn floppy(&self) {
-        self.frame(0.14, 0.08, 0.72, 0.84);
-        self.frame(0.30, 0.08, 0.40, 0.28);
-        self.frame(0.28, 0.52, 0.44, 0.40);
+        self.fill(0.12, 0.08, 0.76, 0.84, BLUE);
+        self.stroke_box(0.12, 0.08, 0.76, 0.84);
+        self.fill(0.30, 0.08, 0.40, 0.26, SLATE_DARK);
+        self.fill(0.36, 0.12, 0.10, 0.12, SLATE);
+        self.fill(0.24, 0.50, 0.52, 0.36, WHITE);
+        self.stroke_box(0.24, 0.50, 0.52, 0.36);
+        self.thick((0.34, 0.60), (0.66, 0.60), BLUE, 1.6);
+        self.thick((0.34, 0.70), (0.66, 0.70), BLUE, 1.6);
     }
 
     fn printer(&self) {
-        self.frame(0.28, 0.04, 0.44, 0.24);
-        self.frame(0.08, 0.30, 0.84, 0.36);
-        self.frame(0.24, 0.58, 0.52, 0.36);
-        self.line((0.18, 0.42), (0.32, 0.42));
+        self.fill(0.28, 0.04, 0.44, 0.22, WHITE);
+        self.stroke_box(0.28, 0.04, 0.44, 0.22);
+        self.fill(0.06, 0.28, 0.88, 0.40, SLATE);
+        self.stroke_box(0.06, 0.28, 0.88, 0.40);
+        self.fill(0.14, 0.36, 0.18, 0.08, SLATE_DARK);
+        self.disk(0.78, 0.42, 0.06, GREEN);
+        self.fill(0.22, 0.56, 0.56, 0.36, WHITE);
+        self.stroke_box(0.22, 0.56, 0.56, 0.36);
+        self.thick((0.32, 0.68), (0.68, 0.68), SLATE_DARK, 1.3);
+        self.thick((0.32, 0.78), (0.58, 0.78), SLATE_DARK, 1.3);
     }
 
     fn pointer(&self) {
-        self.poly(&[
-            (0.18, 0.06),
-            (0.18, 0.90),
-            (0.40, 0.66),
-            (0.56, 0.84),
-            (0.70, 0.72),
-            (0.52, 0.54),
-            (0.78, 0.50),
-            (0.18, 0.06),
-        ]);
+        self.poly(
+            &[
+                (0.18, 0.04),
+                (0.18, 0.90),
+                (0.42, 0.64),
+                (0.56, 0.52),
+                (0.84, 0.48),
+            ],
+            NAVY,
+        );
+        self.poly(
+            &[(0.40, 0.66), (0.58, 0.88), (0.74, 0.74), (0.54, 0.56)],
+            NAVY,
+        );
+    }
+
+    fn insert_page(&self) {
+        self.page(0.16, 0.02, 0.58, 0.72);
+        self.fill(0.04, 0.16, 0.58, 0.72, PAPER);
+        self.stroke_box(0.04, 0.16, 0.58, 0.72);
+        self.disk(0.74, 0.74, 0.20, BLUE);
+        self.ring(0.74, 0.74, 0.20);
+        self.thick((0.74, 0.62), (0.74, 0.86), WHITE, 2.0);
+        self.thick((0.62, 0.74), (0.86, 0.74), WHITE, 2.0);
     }
 
     fn checkbox(&self) {
-        self.frame(0.12, 0.12, 0.76, 0.76);
-        self.poly(&[(0.28, 0.52), (0.44, 0.70), (0.76, 0.30)]);
+        self.fill(0.10, 0.10, 0.80, 0.80, WHITE);
+        self.stroke_box(0.10, 0.10, 0.80, 0.80);
+        self.thick((0.26, 0.52), (0.44, 0.72), GREEN, 2.6);
+        self.thick((0.44, 0.72), (0.78, 0.30), GREEN, 2.6);
     }
 
     fn calendar(&self) {
-        self.frame(0.10, 0.16, 0.80, 0.74);
-        self.line((0.10, 0.36), (0.90, 0.36));
-        self.line((0.30, 0.08), (0.30, 0.24));
-        self.line((0.70, 0.08), (0.70, 0.24));
+        self.fill(0.08, 0.16, 0.84, 0.76, WHITE);
+        self.stroke_box(0.08, 0.16, 0.84, 0.76);
+        self.fill(0.08, 0.16, 0.84, 0.22, RED);
+        self.fill(0.26, 0.06, 0.10, 0.20, NAVY);
+        self.fill(0.64, 0.06, 0.10, 0.20, NAVY);
+        self.disk(0.32, 0.58, 0.06, BLUE);
+        self.disk(0.50, 0.58, 0.06, BLUE);
+        self.disk(0.68, 0.58, 0.06, BLUE);
     }
 
     fn dropdown(&self) {
-        self.frame(0.06, 0.28, 0.88, 0.44);
-        self.line((0.68, 0.28), (0.68, 0.72));
-        self.poly(&[(0.74, 0.42), (0.82, 0.56), (0.90, 0.42)]);
+        self.fill(0.04, 0.26, 0.92, 0.48, WHITE);
+        self.stroke_box(0.04, 0.26, 0.92, 0.48);
+        self.fill(0.66, 0.26, 0.30, 0.48, BLUE);
+        self.poly(&[(0.74, 0.42), (0.90, 0.42), (0.82, 0.60)], WHITE);
     }
 
     fn picture(&self) {
-        self.frame(0.08, 0.16, 0.84, 0.68);
-        self.painter
-            .circle_stroke(self.at(0.32, 0.36), self.rect.width() * 0.08, self.stroke());
-        self.poly(&[(0.16, 0.72), (0.40, 0.48), (0.58, 0.64), (0.84, 0.40)]);
+        self.fill(0.06, 0.14, 0.88, 0.72, WHITE);
+        self.stroke_box(0.06, 0.14, 0.88, 0.72);
+        self.fill(0.06, 0.14, 0.88, 0.40, Color32::from_rgb(126, 186, 232));
+        self.disk(0.28, 0.30, 0.10, GOLD);
+        self.poly(&[(0.10, 0.78), (0.40, 0.46), (0.62, 0.78)], GREEN);
+        self.poly(
+            &[(0.40, 0.78), (0.70, 0.40), (0.92, 0.78)],
+            Color32::from_rgb(36, 130, 72),
+        );
+    }
+
+    fn rule(&self) {
+        self.disk(0.16, 0.78, 0.08, BLUE_DARK);
+        self.disk(0.84, 0.22, 0.08, BLUE_DARK);
+        self.thick((0.16, 0.78), (0.84, 0.22), BLUE, 3.0);
     }
 
     fn radio(&self) {
-        let center = self.at(0.5, 0.5);
-        let radius = self.rect.width() * 0.36;
-        self.painter.circle_stroke(center, radius, self.stroke());
-        self.painter
-            .circle_filled(center, radius * 0.38, self.color);
+        self.disk(0.50, 0.50, 0.40, WHITE);
+        self.ring(0.50, 0.50, 0.40);
+        self.disk(0.50, 0.50, 0.18, BLUE);
     }
 
     fn shapes(&self) {
-        self.frame(0.06, 0.28, 0.58, 0.62);
-        self.frame(0.36, 0.08, 0.56, 0.50);
+        self.fill(0.28, 0.04, 0.64, 0.56, GOLD);
+        self.stroke_box(0.28, 0.04, 0.64, 0.56);
+        self.fill(0.04, 0.36, 0.62, 0.56, BLUE);
+        self.stroke_box(0.04, 0.36, 0.62, 0.56);
     }
 
     fn signature(&self) {
-        self.poly(&[
-            (0.06, 0.62),
-            (0.22, 0.38),
-            (0.36, 0.70),
-            (0.52, 0.30),
-            (0.68, 0.66),
-            (0.94, 0.28),
-        ]);
+        self.fill(0.04, 0.22, 0.92, 0.56, PAPER);
+        self.stroke_box(0.04, 0.22, 0.92, 0.56);
+        self.thick((0.12, 0.58), (0.28, 0.40), NAVY, 2.0);
+        self.thick((0.28, 0.40), (0.42, 0.66), NAVY, 2.0);
+        self.thick((0.42, 0.66), (0.58, 0.36), NAVY, 2.0);
+        self.thick((0.58, 0.36), (0.88, 0.62), NAVY, 2.0);
     }
 
     fn table(&self) {
-        self.frame(0.08, 0.12, 0.84, 0.76);
-        self.line((0.08, 0.50), (0.92, 0.50));
-        self.line((0.50, 0.12), (0.50, 0.88));
+        self.fill(0.06, 0.10, 0.88, 0.80, WHITE);
+        self.stroke_box(0.06, 0.10, 0.88, 0.80);
+        self.fill(0.06, 0.10, 0.88, 0.22, BLUE);
+        self.thick((0.06, 0.50), (0.94, 0.50), OUTLINE, 1.3);
+        self.thick((0.50, 0.10), (0.50, 0.90), OUTLINE, 1.3);
     }
 
     fn letter_t(&self) {
-        self.line((0.16, 0.16), (0.84, 0.16));
-        self.line((0.50, 0.16), (0.50, 0.88));
+        self.fill(0.06, 0.08, 0.88, 0.84, PAPER);
+        self.stroke_box(0.06, 0.08, 0.88, 0.84);
+        self.fill(0.18, 0.22, 0.64, 0.16, NAVY);
+        self.fill(0.42, 0.22, 0.16, 0.58, NAVY);
     }
 
     fn text_box(&self) {
-        self.frame(0.08, 0.12, 0.84, 0.76);
-        self.line((0.20, 0.32), (0.80, 0.32));
-        self.line((0.20, 0.50), (0.80, 0.50));
-        self.line((0.20, 0.68), (0.62, 0.68));
+        self.fill(0.06, 0.10, 0.88, 0.80, PAPER);
+        self.stroke_box(0.06, 0.10, 0.88, 0.80);
+        self.fill(0.18, 0.26, 0.64, 0.10, BLUE);
+        self.fill(0.18, 0.44, 0.64, 0.10, NAVY);
+        self.fill(0.18, 0.62, 0.42, 0.10, NAVY);
     }
 
     fn text_field(&self) {
-        self.frame(0.06, 0.28, 0.88, 0.44);
-        self.line((0.22, 0.38), (0.22, 0.62));
+        self.fill(0.04, 0.28, 0.92, 0.44, WHITE);
+        self.stroke_box(0.04, 0.28, 0.92, 0.44);
+        self.fill(0.04, 0.62, 0.92, 0.10, BLUE);
+        self.thick((0.22, 0.36), (0.22, 0.58), NAVY, 1.8);
     }
 
     fn grid(&self) {
-        for step in [0.18, 0.50, 0.82] {
-            self.line((step, 0.10), (step, 0.90));
-            self.line((0.10, step), (0.90, step));
+        self.fill(0.06, 0.06, 0.88, 0.88, PAPER);
+        self.stroke_box(0.06, 0.06, 0.88, 0.88);
+        for step in [0.34, 0.62] {
+            self.thick((step, 0.06), (step, 0.94), BLUE, 1.5);
+            self.thick((0.06, step), (0.94, step), BLUE, 1.5);
         }
     }
 
     fn page_number(&self) {
-        self.frame(0.16, 0.06, 0.68, 0.88);
-        self.line((0.42, 0.28), (0.56, 0.18));
-        self.line((0.56, 0.18), (0.56, 0.74));
-        self.line((0.42, 0.74), (0.70, 0.74));
+        self.page(0.12, 0.04, 0.70, 0.90);
+        self.fill(0.40, 0.28, 0.14, 0.48, BLUE);
+        self.poly(&[(0.34, 0.40), (0.54, 0.26), (0.54, 0.40)], BLUE);
+        self.fill(0.34, 0.70, 0.28, 0.08, BLUE);
     }
 
     fn dots(&self) {
-        for x in [0.22, 0.50, 0.78] {
-            for y in [0.22, 0.50, 0.78] {
-                self.dot(x, y, 1.5);
+        self.fill(0.06, 0.06, 0.88, 0.88, PAPER);
+        self.stroke_box(0.06, 0.06, 0.88, 0.88);
+        for x in [0.28, 0.50, 0.72] {
+            for y in [0.28, 0.50, 0.72] {
+                self.disk(x, y, 0.07, BLUE);
             }
         }
     }
 
     fn guides(&self) {
-        self.dash((0.50, 0.06), (0.50, 0.94));
-        self.dash((0.06, 0.50), (0.94, 0.50));
+        self.page(0.10, 0.06, 0.80, 0.88);
+        self.thick((0.50, 0.10), (0.50, 0.90), RED, 1.8);
+        self.thick((0.16, 0.50), (0.84, 0.50), RED, 1.8);
     }
 
     fn margins(&self) {
-        self.frame(0.08, 0.08, 0.84, 0.84);
-        self.dash((0.28, 0.28), (0.72, 0.28));
-        self.dash((0.72, 0.28), (0.72, 0.72));
-        self.dash((0.72, 0.72), (0.28, 0.72));
-        self.dash((0.28, 0.72), (0.28, 0.28));
+        self.page(0.06, 0.06, 0.88, 0.88);
+        self.stroke_only(0.26, 0.26, 0.48, 0.48, BLUE);
+    }
+
+    fn stroke_only(&self, x: f32, y: f32, w: f32, h: f32, color: Color32) {
+        self.painter.rect_stroke(
+            self.box_at(x, y, w, h),
+            1.0,
+            Stroke::new(1.6_f32, color),
+            StrokeKind::Inside,
+        );
     }
 
     fn snap(&self) {
-        self.line((0.50, 0.08), (0.50, 0.92));
-        self.line((0.08, 0.50), (0.92, 0.50));
-        self.dot(0.50, 0.50, 2.4);
+        self.disk(0.50, 0.36, 0.34, RED);
+        self.disk(0.50, 0.40, 0.16, Color32::from_rgb(210, 214, 220));
+        self.fill(0.16, 0.36, 0.20, 0.40, RED);
+        self.fill(0.64, 0.36, 0.20, 0.40, RED);
+        self.fill(0.16, 0.68, 0.20, 0.22, SLATE);
+        self.fill(0.64, 0.68, 0.20, 0.22, SLATE);
+        self.stroke_box(0.16, 0.68, 0.20, 0.22);
+        self.stroke_box(0.64, 0.68, 0.20, 0.22);
     }
 
     fn moon(&self) {
-        self.poly(&[
-            (0.62, 0.12),
-            (0.40, 0.18),
-            (0.24, 0.40),
-            (0.24, 0.64),
-            (0.42, 0.88),
-            (0.68, 0.84),
-            (0.48, 0.68),
-            (0.44, 0.48),
-            (0.54, 0.28),
-            (0.62, 0.12),
-        ]);
+        let steps = 8;
+        let mut points = Vec::with_capacity(steps + 1);
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            let angle = std::f32::consts::FRAC_PI_2 + t * std::f32::consts::PI;
+            points.push((0.64 + 0.34 * angle.cos(), 0.50 + 0.40 * angle.sin()));
+        }
+        self.poly(&points, GOLD);
     }
 
     fn sun(&self) {
-        self.painter
-            .circle_stroke(self.at(0.50, 0.50), self.rect.width() * 0.22, self.stroke());
+        self.disk(0.50, 0.50, 0.24, GOLD);
+        self.ring(0.50, 0.50, 0.24);
         for (x0, y0, x1, y1) in [
-            (0.50, 0.06, 0.50, 0.20),
-            (0.50, 0.80, 0.50, 0.94),
-            (0.06, 0.50, 0.20, 0.50),
-            (0.80, 0.50, 0.94, 0.50),
-            (0.18, 0.18, 0.28, 0.28),
-            (0.72, 0.72, 0.82, 0.82),
-            (0.18, 0.82, 0.28, 0.72),
-            (0.72, 0.28, 0.82, 0.18),
+            (0.50, 0.04, 0.50, 0.18),
+            (0.50, 0.82, 0.50, 0.96),
+            (0.04, 0.50, 0.18, 0.50),
+            (0.82, 0.50, 0.96, 0.50),
+            (0.16, 0.16, 0.28, 0.28),
+            (0.72, 0.72, 0.84, 0.84),
+            (0.16, 0.84, 0.28, 0.72),
+            (0.72, 0.28, 0.84, 0.16),
         ] {
-            self.line((x0, y0), (x1, y1));
+            self.thick((x0, y0), (x1, y1), Color32::from_rgb(214, 120, 28), 2.2);
         }
     }
 }
 
 fn paint_caret(painter: &egui::Painter, rect: Rect, color: Color32) {
-    let stroke = Stroke::new(1.4_f32, color);
-    painter.line_segment([rect.left_top(), rect.center_bottom()], stroke);
-    painter.line_segment([rect.right_top(), rect.center_bottom()], stroke);
+    painter.add(egui::Shape::convex_polygon(
+        vec![rect.left_top(), rect.right_top(), rect.center_bottom()],
+        color,
+        Stroke::NONE,
+    ));
 }
 
 #[cfg(test)]
