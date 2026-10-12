@@ -174,19 +174,19 @@ impl PageFormApp {
         ui.label("Points. Y is up from the bottom of the page.");
         let mut next = rect;
         let mut moved = false;
-        if let Some(value) = drag_pt(ui, "X", rect.x, 0.0..=2000.0) {
+        if let Some(value) = drag_pt_wheel(ui, "X", rect.x, 0.0..=2000.0) {
             next.x = value;
             moved = true;
         }
-        if let Some(value) = drag_pt(ui, "Y", rect.y, 0.0..=2000.0) {
+        if let Some(value) = drag_pt_wheel(ui, "Y", rect.y, 0.0..=2000.0) {
             next.y = value;
             moved = true;
         }
-        if let Some(value) = drag_pt(ui, "W", rect.w, 1.0..=2000.0) {
+        if let Some(value) = drag_pt_wheel(ui, "W", rect.w, 1.0..=2000.0) {
             next.w = value;
             moved = true;
         }
-        if let Some(value) = drag_pt(ui, "H", rect.h, 1.0..=2000.0) {
+        if let Some(value) = drag_pt_wheel(ui, "H", rect.h, 1.0..=2000.0) {
             next.h = value;
             moved = true;
         }
@@ -440,7 +440,7 @@ impl PageFormApp {
         if font != style.font {
             self.doc.update_style(id, |style| style.font = font);
         }
-        if let Some(size) = drag_pt(ui, "Size", style.font_size, 4.0..=96.0) {
+        if let Some(size) = drag_pt_wheel(ui, "Size", style.font_size, 4.0..=96.0) {
             self.doc.update_style(id, |style| style.font_size = size);
         }
         if let Some(color) = color_row(ui, "Text color", style.text_color) {
@@ -456,7 +456,7 @@ impl PageFormApp {
         style: &pageform_core::FieldStyle,
     ) {
         section(ui, "Border");
-        if let Some(width) = drag_pt(ui, "Width", style.border_width, 0.0..=24.0) {
+        if let Some(width) = drag_pt_wheel(ui, "Width", style.border_width, 0.0..=24.0) {
             self.doc
                 .update_style(id, |style| style.border_width = width);
         }
@@ -702,19 +702,94 @@ fn drag_pt(
     value: f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> Option<f32> {
+    drag_pt_impl(ui, label, value, range, false)
+}
+
+/// Wheel changes the value by 1 pt. Shift+wheel uses 0.5 pt. The scroll is consumed.
+fn drag_pt_wheel(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> Option<f32> {
+    drag_pt_impl(ui, label, value, range, true)
+}
+
+fn drag_pt_impl(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    wheel: bool,
+) -> Option<f32> {
     let mut value = value;
     let response = ui
         .horizontal(|ui| {
             ui.add_sized(Vec2::new(88.0, 18.0), egui::Label::new(label));
-            ui.add(
+            let mut drag = ui.add(
                 egui::DragValue::new(&mut value)
-                    .range(range)
+                    .range(range.clone())
                     .speed(0.5)
                     .max_decimals(1),
-            )
+            );
+            if wheel {
+                drag =
+                    drag.on_hover_text("Scroll to adjust by 1 pt. Shift+scroll adjusts by 0.5 pt.");
+            }
+            drag
         })
         .inner;
-    response.changed().then_some(value)
+    let mut changed = response.changed();
+    if wheel && response.hovered() {
+        let delta = wheel_delta_from_events(&ui.input(|input| input.events.clone()));
+        // Eat the notch and the smoothed tail so the sidebar and the canvas do not move.
+        // Shift+wheel is a horizontal delta on some platforms; the events above still carry it.
+        ui.ctx().input_mut(|input| {
+            input.raw_scroll_delta = egui::Vec2::ZERO;
+            input.smooth_scroll_delta = egui::Vec2::ZERO;
+        });
+        if delta != 0.0 {
+            let next = (value + delta).clamp(*range.start(), *range.end());
+            if (next - value).abs() > f32::EPSILON {
+                value = next;
+                changed = true;
+            }
+        }
+    }
+    changed.then_some(value)
+}
+
+/// Points to add for the wheel events in this frame.
+///
+/// A vertical notch and a Shift+wheel notch that egui (or the OS) turned into a
+/// horizontal delta both count. Shift selects the 0.5 pt step.
+fn wheel_delta_from_events(events: &[egui::Event]) -> f32 {
+    let mut total = 0.0;
+    for event in events {
+        let egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+        } = event
+        else {
+            continue;
+        };
+        let amount = if delta.y.abs() >= delta.x.abs() {
+            delta.y
+        } else {
+            delta.x
+        };
+        if amount == 0.0 {
+            continue;
+        }
+        let notches = match unit {
+            egui::MouseWheelUnit::Point => (amount.abs() / 40.0).round().max(1.0),
+            egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => amount.abs().max(1.0),
+        };
+        let step = if modifiers.shift { 0.5 } else { 1.0 };
+        total += amount.signum() * step * notches;
+    }
+    total
 }
 
 fn color_row(ui: &mut egui::Ui, label: &str, color: Rgb) -> Option<Rgb> {
@@ -736,4 +811,184 @@ fn color_row(ui: &mut egui::Ui, label: &str, color: Rgb) -> Option<Rgb> {
             bytes[2] as f32 / 255.0,
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wheel(delta: egui::Vec2, shift: bool) -> egui::Event {
+        let modifiers = egui::Modifiers {
+            shift,
+            ..Default::default()
+        };
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn wheel_steps_are_one_point_and_shift_is_half_on_either_axis() {
+        assert_eq!(
+            wheel_delta_from_events(&[wheel(egui::vec2(0.0, 1.0), false)]),
+            1.0
+        );
+        assert_eq!(
+            wheel_delta_from_events(&[wheel(egui::vec2(0.0, -1.0), false)]),
+            -1.0
+        );
+        // egui and some OSes turn Shift+wheel into a horizontal delta.
+        assert_eq!(
+            wheel_delta_from_events(&[wheel(egui::vec2(1.0, 0.0), true)]),
+            0.5
+        );
+        assert_eq!(
+            wheel_delta_from_events(&[wheel(egui::vec2(0.0, -2.0), true)]),
+            -1.0
+        );
+        assert_eq!(
+            wheel_delta_from_events(&[egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 14.0),
+                modifiers: egui::Modifiers::default(),
+            }]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn hovered_font_size_wheel_changes_the_value_and_consumes_scroll() {
+        let ctx = egui::Context::default();
+        let mut value = 12.0_f32;
+        let mut time = 0.0_f64;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let input = |time: f64, events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let show = |ctx: &egui::Context, value: &mut f32| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_min_height(2000.0);
+                    if let Some(next) = drag_pt_wheel(ui, "Size", *value, 4.0..=96.0) {
+                        *value = next;
+                    }
+                });
+            });
+        };
+
+        time += 1.0;
+        let placed = ctx.run(input(time, vec![]), |ctx| show(ctx, &mut value));
+        let at = galley_center(&placed, "12.0").or_else(|| galley_center(&placed, "12"));
+        let at = at.expect("font size value");
+
+        time += 1.0;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    wheel(egui::vec2(0.0, 1.0), false),
+                ],
+            ),
+            |ctx| show(ctx, &mut value),
+        );
+        assert_eq!(value, 13.0, "wheel up adds 1 pt");
+        assert_eq!(
+            ctx.input(|input| input.raw_scroll_delta),
+            egui::Vec2::ZERO,
+            "the notch must not remain for the canvas to zoom"
+        );
+        assert_eq!(
+            ctx.input(|input| input.smooth_scroll_delta),
+            egui::Vec2::ZERO,
+            "the notch must not remain for the sidebar to scroll"
+        );
+
+        time += 1.0;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    wheel(egui::vec2(-1.0, 0.0), true),
+                ],
+            ),
+            |ctx| show(ctx, &mut value),
+        );
+        assert_eq!(value, 12.5, "Shift+horizontal wheel subtracts 0.5 pt");
+
+        value = 96.0;
+        time += 1.0;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    wheel(egui::vec2(0.0, 3.0), false),
+                ],
+            ),
+            |ctx| show(ctx, &mut value),
+        );
+        assert_eq!(value, 96.0, "font size stays inside 4..=96");
+
+        value = 0.0;
+        time += 1.0;
+        let _ = ctx.run(input(time, vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(next) = drag_pt_wheel(ui, "Width", value, 0.0..=24.0) {
+                    value = next;
+                }
+            });
+        });
+        // The width field is in a different place. Re-find it next frame.
+        time += 1.0;
+        let placed = ctx.run(input(time, vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = drag_pt_wheel(ui, "Width", value, 0.0..=24.0);
+            });
+        });
+        let width_at = galley_center(&placed, "0.0").or_else(|| galley_center(&placed, "0"));
+        let width_at = width_at.expect("border width value");
+        time += 1.0;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(width_at),
+                    wheel(egui::vec2(0.0, -1.0), false),
+                ],
+            ),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(next) = drag_pt_wheel(ui, "Width", value, 0.0..=24.0) {
+                        value = next;
+                    }
+                });
+            },
+        );
+        assert_eq!(value, 0.0, "border width does not go below 0");
+    }
+
+    fn galley_center(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+        fn walk(shape: &egui::epaint::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text().trim() == label => {
+                    Some(text.pos + egui::vec2(4.0, text.galley.size().y * 0.5))
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| walk(shape, label))
+                }
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| walk(&clipped.shape, label))
+    }
 }
