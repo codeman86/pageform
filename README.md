@@ -39,6 +39,25 @@ cargo run -p pageform -- --export sample-form.pdf
 
 Scroll to zoom. Middle-drag, or hold Space and drag, to pan. `cargo run -p pageform -- --demo` opens the sample fields used by the export test.
 
+## Download
+
+GitHub Actions uploads two desktop builds from this repository.
+
+Windows: download the `pageform-windows-exe` artifact and unzip it. `PageForm.exe` is at the zip root.
+
+Linux: download the `pageform-linux-appimage` artifact and unzip it. `PageForm-x86_64.AppImage` is at the zip root. It is built on Ubuntu's glibc and runs on newer glibc desktops, including Arch, without installing PageForm's own libraries. A desktop session (Wayland or X11) and the host OpenGL libraries (`libGL` / `libEGL` from the GPU driver) still have to be present. The GPU driver is not inside the AppImage.
+
+```bash
+chmod +x PageForm-x86_64.AppImage
+./PageForm-x86_64.AppImage
+```
+
+If Arch says FUSE is missing:
+
+```bash
+./PageForm-x86_64.AppImage --appimage-extract-and-run
+```
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
