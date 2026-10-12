@@ -10,5 +10,7 @@ description = "Desktop UI for designing a fillable PDF form"
 [dependencies]
 pageform-core = { path = "../core" }
 eframe = { version = "0.33", features = ["persistence"] }
+lyon_path = "1.0"
+lyon_tessellation = "1.0"
 png = "0.18"
 font8x8 = "0.3"
