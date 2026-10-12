@@ -80,7 +80,7 @@ pub fn default_size(kind: FieldKind, grid: GridSize) -> (f32, f32) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FieldId(pub u64);
 
-/// Insert menu order. Designer objects are not form fields.
+/// Page objects. Designer objects are not form fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {
     /// One-line fillable AcroForm text field.
@@ -110,6 +110,7 @@ pub enum FieldKind {
 }
 
 impl FieldKind {
+    /// Toolbar order. The Insert menu lists these labels alphabetically.
     pub const INSERT: [FieldKind; 12] = [
         FieldKind::Text,
         FieldKind::StaticText,
@@ -730,7 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn insert_order_is_the_menu() {
+    fn insert_order_is_the_toolbar() {
+        // The Insert menu sorts these labels. This array stays the toolbar order.
         let labels: Vec<_> = FieldKind::INSERT.iter().map(|kind| kind.label()).collect();
         assert_eq!(
             labels,

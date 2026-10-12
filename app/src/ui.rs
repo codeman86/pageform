@@ -131,6 +131,9 @@ struct PageFormApp {
     status: String,
     dark: bool,
     persist_theme: bool,
+    show_preferences: bool,
+    show_about: bool,
+    show_help: bool,
 }
 
 impl PageFormApp {
@@ -171,6 +174,9 @@ impl PageFormApp {
             },
             dark: crate::theme::is_dark(stored.as_deref()),
             persist_theme: false,
+            show_preferences: false,
+            show_about: false,
+            show_help: false,
         }
     }
 
@@ -247,68 +253,126 @@ impl PageFormApp {
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| self.file_menu(ui));
-            ui.menu_button("Edit", |ui| self.edit_menu(ui));
-            ui.menu_button("Insert", |ui| self.insert_menu(ui));
-            ui.menu_button("View", |ui| self.view_menu(ui));
+            for label in MENU_BAR {
+                match *label {
+                    "File" => {
+                        ui.menu_button(*label, |ui| self.file_menu(ui));
+                    }
+                    "Edit" => {
+                        ui.menu_button(*label, |ui| self.edit_menu(ui));
+                    }
+                    "Insert" => {
+                        ui.menu_button(*label, |ui| self.insert_menu(ui));
+                    }
+                    "View" => {
+                        ui.menu_button(*label, |ui| self.view_menu(ui));
+                    }
+                    "Help" => {
+                        ui.menu_button(*label, |ui| self.help_menu(ui));
+                    }
+                    _ => unreachable!("unknown menu {label}"),
+                }
+            }
         });
     }
 
     fn file_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(200.0);
-        let export = ui.button("Export PDF").on_hover_text(
-            "Write a fillable PDF to the path in the toolbar. Guides and margins stay on the canvas.",
-        );
-        if export.clicked() {
-            self.export_current();
-            ui.close();
-        }
-        ui.separator();
-        if ui.button(quit_label()).clicked() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        for label in FILE_MENU {
+            if label.is_empty() {
+                ui.separator();
+                continue;
+            }
+            match *label {
+                "Export PDF" => {
+                    let export = ui.button(*label).on_hover_text(
+                        "Write a fillable PDF to the path in the toolbar. Guides and margins stay on the canvas.",
+                    );
+                    if export.clicked() {
+                        self.export_current();
+                        ui.close();
+                    }
+                }
+                "Exit" => {
+                    if ui.button(*label).clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                other => self.stub_item(ui, other),
+            }
         }
     }
 
     fn edit_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(200.0);
-        if menu_command(ui, "Select", Some("Esc"), self.tool == Tool::Select) {
-            self.tool = Tool::Select;
+        for label in EDIT_MENU {
+            if label.is_empty() {
+                ui.separator();
+                continue;
+            }
+            match *label {
+                "Select" => {
+                    if menu_command(ui, label, Some("Esc"), self.tool == Tool::Select) {
+                        self.tool = Tool::Select;
+                    }
+                }
+                "Delete" => {
+                    let delete = ui.add_enabled(
+                        self.selection.is_some(),
+                        egui::Button::new(*label).shortcut_text("Del"),
+                    );
+                    if delete.clicked() {
+                        self.delete_selection();
+                        ui.close();
+                    }
+                }
+                "Preferences" => {
+                    if ui.button(*label).clicked() {
+                        self.show_preferences = true;
+                        ui.close();
+                    }
+                }
+                other => self.stub_item(ui, other),
+            }
         }
-        ui.separator();
-        let delete = ui.add_enabled(
-            self.selection.is_some(),
-            egui::Button::new("Delete").shortcut_text("Del"),
-        );
-        if delete.clicked() {
-            self.delete_selection();
-            ui.close();
-        }
-        ui.separator();
-        ui.menu_button("Preferences", |ui| self.preferences_menu(ui));
     }
 
-    fn preferences_menu(&mut self, ui: &mut egui::Ui) {
-        ui.set_min_width(240.0);
-        let mut show = self.doc.radio_labels();
-        if ui
-            .checkbox(&mut show, "Radio labels")
-            .on_hover_text(
-                "Text beside each radio button. Off hides those labels on the canvas and in the export.",
-            )
-            .changed()
-        {
-            self.doc.set_radio_labels(show);
-            self.status = if show {
-                "Radio labels on".to_string()
-            } else {
-                "Radio labels off".to_string()
-            };
+    fn help_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(160.0);
+        for label in HELP_MENU {
+            match *label {
+                "Help" => {
+                    if ui.button(*label).clicked() {
+                        self.show_help = true;
+                        ui.close();
+                    }
+                }
+                "About" => {
+                    if ui.button(*label).clicked() {
+                        self.show_about = true;
+                        ui.close();
+                    }
+                }
+                other => self.stub_item(ui, other),
+            }
         }
+    }
+
+    fn stub_item(&mut self, ui: &mut egui::Ui, label: &str) {
+        let button = ui.button(label).on_hover_text("Not implemented yet");
+        if button.clicked() {
+            self.mark_not_implemented(label);
+            ui.close();
+        }
+    }
+
+    fn mark_not_implemented(&mut self, command: &str) {
+        self.status = format!("{command} is not implemented yet");
     }
 
     fn insert_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(240.0);
-        for kind in FieldKind::INSERT {
+        for kind in sorted_insert_kinds() {
             let button = ui.button(kind.label()).on_hover_text(insert_tip(kind));
             if button.clicked() {
                 self.insert_at_view(kind);
@@ -442,6 +506,121 @@ impl PageFormApp {
         }
     }
 
+    fn preferences_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_preferences {
+            return;
+        }
+        let mut close = false;
+        let response = egui::Modal::new(egui::Id::new("pageform_preferences")).show(ctx, |ui| {
+            ui.set_min_width(280.0);
+            ui.heading("Preferences");
+            ui.separator();
+            ui.label("Theme");
+            let before = self.dark;
+            ui.radio_value(&mut self.dark, true, "Dark");
+            ui.radio_value(&mut self.dark, false, "Light");
+            if self.dark != before {
+                self.persist_theme = true;
+            }
+            ui.label("Saved on this computer. Dark is the default.");
+            ui.add_space(8.0);
+            let mut show_labels = self.doc.radio_labels();
+            if ui
+                .checkbox(&mut show_labels, "Radio labels")
+                .on_hover_text(
+                    "Text beside each radio button. Off hides those labels on the canvas and in the export.",
+                )
+                .changed()
+            {
+                self.doc.set_radio_labels(show_labels);
+                self.status = if show_labels {
+                    "Radio labels on".to_string()
+                } else {
+                    "Radio labels off".to_string()
+                };
+            }
+            ui.add_space(12.0);
+            if ui.button("Close").clicked() {
+                close = true;
+            }
+        });
+        if close || response.should_close() {
+            self.show_preferences = false;
+        }
+    }
+
+    fn about_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_about {
+            return;
+        }
+        let mut close = false;
+        let response = egui::Modal::new(egui::Id::new("pageform_about")).show(ctx, |ui| {
+            ui.set_min_width(460.0);
+            ui.vertical_centered(|ui| {
+                placeholder_icon(ui);
+                ui.add_space(8.0);
+                ui.heading("PageForm");
+                ui.add_space(4.0);
+                ui.label(ABOUT_TAGLINE);
+                ui.add_space(6.0);
+                ui.label(format!("Version {}", app_version()));
+                ui.add_space(12.0);
+                if ui.button("OK").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close || response.should_close() {
+            self.show_about = false;
+        }
+    }
+
+    /// Separate OS window when the backend supports viewports, so the FAQ can
+    /// sit on another screen. A titled egui window is the fallback.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let dark = self.dark;
+        let host = ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("pageform-help"),
+            egui::ViewportBuilder::default()
+                .with_title("PageForm Help")
+                .with_inner_size([520.0, 640.0])
+                .with_min_inner_size([380.0, 320.0])
+                .with_close_button(true)
+                .with_decorations(true),
+            |ctx, class| {
+                if class == egui::ViewportClass::Embedded {
+                    return HelpHost::Embedded;
+                }
+                crate::theme::apply(ctx, dark);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    help_faq(ui);
+                });
+                let close = ctx.input(|input| input.viewport().close_requested());
+                HelpHost::Native { close }
+            },
+        );
+        match host {
+            HelpHost::Embedded => {
+                egui::Window::new("PageForm Help")
+                    .collapsible(true)
+                    .resizable(true)
+                    .default_size([520.0, 640.0])
+                    .open(&mut self.show_help)
+                    .show(ctx, |ui| {
+                        help_faq(ui);
+                    });
+            }
+            HelpHost::Native { close } => {
+                if close {
+                    self.show_help = false;
+                }
+            }
+        }
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.tool, Tool::Select, "Select");
@@ -518,7 +697,7 @@ impl PageFormApp {
         ));
         ui.label("Snap uses the minor spacing, even if dots or guides are hidden, so columns and rows stay even.");
         ui.label("Insert drops a default-sized item in the view. The matching toolbar tool draws on the page.");
-        ui.label("Edit → Preferences turns radio labels on or off.");
+        ui.label("Edit → Preferences sets Dark or Light and radio labels.");
         ui.separator();
         ui.heading("Field");
 
@@ -588,7 +767,7 @@ impl PageFormApp {
                     .map(|err| err.to_string());
             }
             if kind == FieldKind::Radio && !self.doc.radio_labels() {
-                ui.label("Hidden until Edit → Preferences → Radio labels is on.");
+                ui.label("Hidden until Radio labels is on in Edit → Preferences.");
             }
         }
         if kind == FieldKind::Dropdown {
@@ -1305,6 +1484,9 @@ impl eframe::App for PageFormApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.canvas(ui);
         });
+        self.preferences_dialog(ctx);
+        self.about_dialog(ctx);
+        self.help_window(ctx);
     }
 }
 
@@ -1374,13 +1556,116 @@ fn on_step(value: f32, step: f32) -> bool {
     ((value / step).round() * step - value).abs() < 0.05
 }
 
-/// File → Quit on Linux. File → Exit on Windows.
-fn quit_label() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "Exit"
-    } else {
-        "Quit"
-    }
+const MENU_BAR: &[&str] = &["File", "Edit", "Insert", "View", "Help"];
+
+const FILE_MENU: &[&str] = &[
+    "New",
+    "Open",
+    "",
+    "Save",
+    "Save As",
+    "",
+    "Print",
+    "Export PDF",
+    "",
+    "Exit",
+];
+
+const EDIT_MENU: &[&str] = &[
+    "Select",
+    "Select All",
+    "",
+    "Copy",
+    "Cut",
+    "Paste",
+    "Delete",
+    "",
+    "Preferences",
+];
+
+const HELP_MENU: &[&str] = &["Help", "About"];
+
+const ABOUT_TAGLINE: &str = "Open-Source Native Form and Document Editor Written in Rust";
+
+const HELP_FAQ: &[(&str, &str)] = &[
+    (
+        "What is PageForm?",
+        "PageForm is an open-source native form and document editor written in Rust. This version edits one US Letter page.",
+    ),
+    (
+        "How do I place something?",
+        "The Insert menu drops a default-sized item at the center of the visible page. The toolbar button with the same name arms that tool so you can drag on the page.",
+    ),
+    (
+        "How do I select, move, and delete?",
+        "Edit → Select, or the Select tool. Drag a selected item to move it, and drag a handle to resize it. Edit → Delete, or the Delete key, removes the selection.",
+    ),
+    (
+        "Where are theme and radio labels?",
+        "Edit → Preferences. Dark is the default, and the choice is saved. Radio labels shows or hides the text beside each radio button. The toolbar theme button switches Dark and Light as well.",
+    ),
+    (
+        "What do New, Open, Save, Save As, and Print do?",
+        "They are not implemented yet. File → Export PDF writes a fillable PDF to the path in the toolbar. Guides, margins, the header, the footer, and the page number stay on the canvas.",
+    ),
+    (
+        "Is there a list box?",
+        "No. Drop-down is a combo box.",
+    ),
+    (
+        "What is still a placeholder?",
+        "Table is a 3 by 2 grid and the cells are not editable. Image is a crossed box until a file can be chosen. Signature is a real unsigned field; the app does not capture ink.",
+    ),
+];
+
+enum HelpHost {
+    Embedded,
+    Native { close: bool },
+}
+
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+#[cfg(test)]
+fn menu_entries<'a>(labels: &'a [&'a str]) -> Vec<&'a str> {
+    labels
+        .iter()
+        .copied()
+        .filter(|label| !label.is_empty())
+        .collect()
+}
+
+fn sorted_insert_kinds() -> [FieldKind; 12] {
+    let mut kinds = FieldKind::INSERT;
+    kinds.sort_by(|left, right| left.label().cmp(right.label()));
+    kinds
+}
+
+fn placeholder_icon(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(72.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 10.0, egui::Color32::from_rgb(32, 36, 44));
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "E",
+        FontId::proportional(40.0),
+        egui::Color32::WHITE,
+    );
+}
+
+fn help_faq(ui: &mut egui::Ui) {
+    ui.heading("PageForm Help");
+    ui.label("Frequently asked questions");
+    ui.separator();
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for (question, answer) in HELP_FAQ {
+            ui.strong(*question);
+            ui.label(*answer);
+            ui.add_space(10.0);
+        }
+    });
 }
 
 fn anchor_for_center(center: PdfPoint, w: f32, h: f32) -> PdfPoint {
@@ -1487,12 +1772,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quit_label_matches_the_desktop() {
-        let label = quit_label();
-        if cfg!(target_os = "windows") {
-            assert_eq!(label, "Exit");
-        } else {
-            assert_eq!(label, "Quit");
+    fn menu_bar_order_is_file_edit_insert_view_help() {
+        assert_eq!(
+            MENU_BAR,
+            ["File", "Edit", "Insert", "View", "Help"].as_slice()
+        );
+        assert_eq!(
+            menu_entries(FILE_MENU),
+            [
+                "New",
+                "Open",
+                "Save",
+                "Save As",
+                "Print",
+                "Export PDF",
+                "Exit"
+            ]
+        );
+        assert_eq!(
+            menu_entries(EDIT_MENU),
+            [
+                "Select",
+                "Select All",
+                "Copy",
+                "Cut",
+                "Paste",
+                "Delete",
+                "Preferences"
+            ]
+        );
+        assert_eq!(menu_entries(HELP_MENU), ["Help", "About"]);
+        assert_eq!(
+            ABOUT_TAGLINE,
+            "Open-Source Native Form and Document Editor Written in Rust"
+        );
+        assert!(!app_version().is_empty());
+        assert!(HELP_FAQ.len() >= 5);
+    }
+
+    #[test]
+    fn insert_menu_is_alphabetical_and_the_toolbar_order_stays() {
+        let menu: Vec<_> = sorted_insert_kinds()
+            .into_iter()
+            .map(FieldKind::label)
+            .collect();
+        let mut expected = menu.clone();
+        expected.sort();
+        assert_eq!(menu, expected);
+        assert_eq!(
+            menu,
+            [
+                "Checkbox",
+                "Date",
+                "Drop-down",
+                "Image",
+                "Line",
+                "Radio",
+                "Signature",
+                "Square/Rectangle",
+                "Table",
+                "Text",
+                "Text Box",
+                "Text Field",
+            ]
+        );
+        let toolbar: Vec<_> = FieldKind::INSERT
+            .into_iter()
+            .map(FieldKind::label)
+            .collect();
+        assert_ne!(toolbar, menu);
+        assert_eq!(toolbar.len(), menu.len());
+    }
+
+    #[test]
+    fn file_and_edit_stubs_report_in_the_status_bar() {
+        let mut app = PageFormApp::new(false, None);
+        assert!(!app.show_preferences);
+        assert!(!app.show_about);
+        assert!(!app.show_help);
+        for command in [
+            "New",
+            "Open",
+            "Save",
+            "Save As",
+            "Print",
+            "Select All",
+            "Copy",
+            "Cut",
+            "Paste",
+        ] {
+            app.mark_not_implemented(command);
+            assert_eq!(app.status, format!("{command} is not implemented yet"));
         }
     }
 
@@ -1649,5 +2019,233 @@ mod tests {
         app.set_dark(true);
         assert!(app.dark);
         assert!(app.persist_theme);
+    }
+
+    #[test]
+    fn menus_and_dialogs_paint_their_items() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+
+        let bar = panel(&ctx, &mut app, |app, ui| app.menu_bar(ui));
+        assert_eq!(ordered_hits(&galley_texts(&bar), MENU_BAR), MENU_BAR);
+
+        let file = panel(&ctx, &mut app, |app, ui| app.file_menu(ui));
+        assert_eq!(
+            ordered_hits(&galley_texts(&file), &menu_entries(FILE_MENU)),
+            menu_entries(FILE_MENU)
+        );
+        let edit = panel(&ctx, &mut app, |app, ui| app.edit_menu(ui));
+        assert_eq!(
+            ordered_hits(&galley_texts(&edit), &menu_entries(EDIT_MENU)),
+            menu_entries(EDIT_MENU)
+        );
+        let insert = panel(&ctx, &mut app, |app, ui| app.insert_menu(ui));
+        let insert_labels = sorted_insert_kinds().map(FieldKind::label);
+        assert_eq!(
+            ordered_hits(&galley_texts(&insert), &insert_labels),
+            insert_labels.to_vec()
+        );
+        let help = panel(&ctx, &mut app, |app, ui| app.help_menu(ui));
+        assert_eq!(
+            ordered_hits(&galley_texts(&help), HELP_MENU),
+            HELP_MENU.to_vec()
+        );
+
+        app.show_preferences = true;
+        app.show_about = true;
+        app.show_help = true;
+        let dialogs = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.preferences_dialog(ctx);
+            app.about_dialog(ctx);
+            app.help_window(ctx);
+        });
+        let texts = galley_texts(&dialogs);
+        assert!(texts.iter().any(|text| text == "Preferences"));
+        assert!(texts.iter().any(|text| text == "Dark"));
+        assert!(texts.iter().any(|text| text == "Light"));
+        assert!(texts.iter().any(|text| text == "Radio labels"));
+        assert!(texts.iter().any(|text| text == "PageForm"));
+        assert!(texts.iter().any(|text| text == ABOUT_TAGLINE));
+        assert!(texts
+            .iter()
+            .any(|text| text == &format!("Version {}", app_version())));
+        assert!(texts.iter().any(|text| text == "OK"));
+        assert!(texts.iter().any(|text| text == "E"));
+        assert!(texts.iter().any(|text| text == "PageForm Help"));
+        assert!(texts.iter().any(|text| text == "What is PageForm?"));
+        assert!(app.show_help, "headless help uses the embedded window");
+    }
+
+    #[test]
+    fn clicking_a_stub_and_preferences_updates_state() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+
+        click_menu(&ctx, &mut app, "New", |app, ui| app.file_menu(ui));
+        assert_eq!(app.status, "New is not implemented yet");
+        click_menu(&ctx, &mut app, "Save As", |app, ui| app.file_menu(ui));
+        assert_eq!(app.status, "Save As is not implemented yet");
+        click_menu(&ctx, &mut app, "Print", |app, ui| app.file_menu(ui));
+        assert_eq!(app.status, "Print is not implemented yet");
+        click_menu(&ctx, &mut app, "Select All", |app, ui| app.edit_menu(ui));
+        assert_eq!(app.status, "Select All is not implemented yet");
+        click_menu(&ctx, &mut app, "Paste", |app, ui| app.edit_menu(ui));
+        assert_eq!(app.status, "Paste is not implemented yet");
+
+        click_menu(&ctx, &mut app, "Preferences", |app, ui| app.edit_menu(ui));
+        assert!(app.show_preferences);
+        click_menu(&ctx, &mut app, "Help", |app, ui| app.help_menu(ui));
+        assert!(app.show_help);
+        click_menu(&ctx, &mut app, "About", |app, ui| app.help_menu(ui));
+        assert!(app.show_about);
+
+        let prefs = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.preferences_dialog(ctx);
+        });
+        let light_at = text_center(&prefs, "Light").expect("Light");
+        click_at(&ctx, &mut app, light_at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.preferences_dialog(ctx);
+        });
+        assert!(!app.dark);
+        assert!(app.persist_theme);
+    }
+
+    fn screen_input() -> egui::RawInput {
+        use std::cell::Cell;
+        thread_local! {
+            static TIME: Cell<f64> = const { Cell::new(0.0) };
+        }
+        let time = TIME.with(|time| {
+            let next = time.get() + 1.0;
+            time.set(next);
+            next
+        });
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0))),
+            time: Some(time),
+            ..Default::default()
+        }
+    }
+
+    fn run_ui(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        input: egui::RawInput,
+        mut show: impl FnMut(&mut PageFormApp, &egui::Context),
+    ) -> egui::FullOutput {
+        ctx.run(input, |ctx| show(app, ctx))
+    }
+
+    /// Areas and windows measure themselves on the first frame and paint on the next.
+    fn show_settled(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        mut show: impl FnMut(&mut PageFormApp, &egui::Context),
+    ) -> egui::FullOutput {
+        let _ = run_ui(ctx, app, screen_input(), &mut show);
+        run_ui(ctx, app, screen_input(), show)
+    }
+
+    fn panel(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        mut show: impl FnMut(&mut PageFormApp, &mut egui::Ui),
+    ) -> egui::FullOutput {
+        run_ui(ctx, app, screen_input(), |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(app, ui));
+        })
+    }
+
+    fn click_menu(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        label: &str,
+        mut show: impl FnMut(&mut PageFormApp, &mut egui::Ui) + Clone,
+    ) {
+        let output = panel(ctx, app, show.clone());
+        let at = text_center(&output, label).unwrap_or_else(|| panic!("missing {label}"));
+        click_at(ctx, app, at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(app, ui));
+        });
+    }
+
+    fn click_at(
+        ctx: &egui::Context,
+        app: &mut PageFormApp,
+        pos: Pos2,
+        mut show: impl FnMut(&mut PageFormApp, &egui::Context),
+    ) {
+        let mut raw = screen_input();
+        raw.events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let _ = run_ui(ctx, app, raw, &mut show);
+    }
+
+    fn ordered_hits(texts: &[String], wanted: &[&str]) -> Vec<String> {
+        let wanted: std::collections::HashSet<&str> = wanted.iter().copied().collect();
+        texts
+            .iter()
+            .filter(|text| wanted.contains(text.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    fn galley_texts(output: &egui::FullOutput) -> Vec<String> {
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn collect_text(shape: &egui::epaint::Shape, texts: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                let value = text.galley.text().trim();
+                if !value.is_empty() {
+                    texts.push(value.to_string());
+                }
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, texts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn text_center(output: &egui::FullOutput, label: &str) -> Option<Pos2> {
+        fn walk(shape: &egui::epaint::Shape, label: &str) -> Option<Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(text) if text.galley.text().trim() == label => {
+                    Some(text.pos + Vec2::new(4.0, text.galley.size().y * 0.5))
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    shapes.iter().find_map(|shape| walk(shape, label))
+                }
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| walk(&clipped.shape, label))
     }
 }

@@ -94,17 +94,22 @@ Usage:
       Write the sample form without opening a window.
 
 Scroll to zoom. Middle-drag or Space-drag to pan.
-The window opens in the dark theme. View → Dark / Light, or the toolbar
-button, switches it and the choice is restored next launch.
-File exports the toolbar path. Edit selects, deletes, or opens Preferences.
-Insert drops a default item in the view: Text Field, Text (static label),
-Checkbox, Radio, Table, Signature, Date, Drop-down, Line, Square/Rectangle,
-Text Box, and Image. The matching toolbar tool arms drawing on the page.
+The window opens in the dark theme. Edit → Preferences, View → Dark / Light,
+or the toolbar button switches it, and the choice is restored next launch.
+File: New, Open, Save, Save As, and Print are not implemented yet.
+Export PDF writes the toolbar path. Exit closes the window.
+Edit: Select and Delete work. Select All, Copy, Cut, and Paste are not
+implemented yet. Preferences is a dialog for the theme and radio labels.
+Insert drops a default item in the view, listed alphabetically: Checkbox,
+Date, Drop-down, Image, Line, Radio, Signature, Square/Rectangle, Table,
+Text (static label), Text Box, and Text Field. The toolbar keeps the
+earlier order and arms drawing on the page.
 A selected radio makes the next radio join that group. Preferences can hide
 the label beside each radio. There is no list box.
 View toggles grid dots, guide lines, the print-safe margin, header, footer,
 page numbers, and snap, and chooses the grid size and Dark or Light.
 Header, footer, and page numbers are canvas only.
+Help opens a separate FAQ window. About opens a centered dialog.
 Grid sizes: Small (1/16 in), Medium (1/8 in, default), Large (1/4 in).
 Snap follows the active size so columns and rows stay even."
     );
