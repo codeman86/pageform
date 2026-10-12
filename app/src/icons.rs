@@ -395,14 +395,14 @@ mod tests {
                 "note-stack-add-outline",
                 "check-box-outline",
                 "calendar-today-outline",
-                "dropdown-menu-outline",
+                "form-select-outline",
                 "image-outline",
                 "horizontal-rule",
                 "radio-button-checked",
                 "shapes-outline",
                 "signature-outline-rounded",
                 "table-outline",
-                "title",
+                "material-symbols:title",
                 "text-snippet-outline",
                 "text-fields",
                 "grid-on-outline",
@@ -433,7 +433,50 @@ mod tests {
         assert_visible_stroke(Icon::Dropdown, 14.0, 8.0, 40.0);
         assert_visible_stroke(Icon::Line, 12.0, 2.4, 30.0);
         assert_eq!(Icon::TextField.iconify_name(), "text-fields");
-        assert_eq!(Icon::Text.iconify_name(), "title");
+        assert_eq!(Icon::Text.iconify_name(), "material-symbols:title");
+        let text = tessellate(Icon::Text);
+        assert!(covers(&text, 12.0, 5.5), "Text crossbar");
+        assert!(covers(&text, 7.0, 5.5), "Text crossbar left");
+        assert!(covers(&text, 17.0, 5.5), "Text crossbar right");
+        assert!(covers(&text, 12.0, 13.0), "Text stem");
+        assert!(covers(&text, 12.0, 18.5), "Text stem reaches the bottom");
+        assert!(
+            !covers(&text, 8.0, 14.0),
+            "Text stem is not the whole width"
+        );
+        let dropdown = tessellate(Icon::Dropdown);
+        assert!(covers(&dropdown, 8.0, 8.8), "combo text line");
+        assert!(covers(&dropdown, 7.0, 12.7), "combo second text line");
+        assert!(covers(&dropdown, 18.3, 10.2), "combo chevron");
+        assert!(covers(&dropdown, 12.0, 5.8), "combo frame");
+        assert!(
+            !covers(&dropdown, 8.0, 10.8),
+            "combo field is not a filled plate"
+        );
+        assert!(
+            !covers(&dropdown, 18.3, 15.2),
+            "chevron button is not a filled square"
+        );
+    }
+
+    fn covers(tess: &Tess, x: f32, y: f32) -> bool {
+        let mut index = 0;
+        while index + 2 < tess.indices.len() {
+            let a = tess.vertices[tess.indices[index] as usize];
+            let b = tess.vertices[tess.indices[index + 1] as usize];
+            let c = tess.vertices[tess.indices[index + 2] as usize];
+            let side = |p: Pos2, q: Pos2| (x - q.x) * (p.y - q.y) - (p.x - q.x) * (y - q.y);
+            let d1 = side(a, b);
+            let d2 = side(b, c);
+            let d3 = side(c, a);
+            let has_neg = d1 < -0.05 || d2 < -0.05 || d3 < -0.05;
+            let has_pos = d1 > 0.05 || d2 > 0.05 || d3 > 0.05;
+            if !(has_neg && has_pos) {
+                return true;
+            }
+            index += 3;
+        }
+        false
     }
 
     fn assert_visible_stroke(icon: Icon, min_width: f32, min_height: f32, min_area: f32) {
