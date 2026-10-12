@@ -148,11 +148,7 @@ fn icon_widget(
         ui.painter()
             .rect_stroke(rect, 4.0, visuals.bg_stroke, StrokeKind::Inside);
     }
-    let glyph = if caret {
-        Rect::from_min_size(rect.min + Vec2::new(4.0, 5.0), Vec2::splat(18.0))
-    } else {
-        Rect::from_center_size(rect.center(), Vec2::splat(18.0))
-    };
+    let glyph = glyph_rect(rect, caret, icon);
     paint_icon(ui.painter(), glyph, visuals.fg_stroke.color, icon);
     if caret {
         let caret_box = Rect::from_center_size(
@@ -162,6 +158,24 @@ fn icon_widget(
         paint_caret(ui.painter(), caret_box, visuals.fg_stroke.color);
     }
     response.on_hover_text(tip)
+}
+
+fn glyph_rect(rect: Rect, caret: bool, icon: Icon) -> Rect {
+    // New sits further inside the button so the page corner is not clipped
+    // by the dropdown caret. Text Field is larger so the T stem stays visible.
+    let (size, left_pad) = match icon {
+        Icon::New => (16.0, 7.0),
+        Icon::TextField => (22.0, 3.0),
+        _ => (18.0, 5.0),
+    };
+    if caret {
+        Rect::from_min_size(
+            rect.min + Vec2::new(left_pad, (rect.height() - size) * 0.5),
+            Vec2::splat(size),
+        )
+    } else {
+        Rect::from_center_size(rect.center(), Vec2::splat(size))
+    }
 }
 
 struct Tess {
@@ -374,7 +388,7 @@ mod tests {
         assert_eq!(
             names,
             [
-                "note-add-outline",
+                "description-outline",
                 "folder-open-outline",
                 "save-outline",
                 "print-outline",
@@ -382,16 +396,16 @@ mod tests {
                 "note-stack-add-outline",
                 "check-box-outline",
                 "calendar-today-outline",
-                "dropdown-outline",
+                "arrow-drop-down",
                 "image-outline",
                 "horizontal-rule",
-                "radio-button-unchecked",
+                "radio-button-checked",
                 "shapes-outline",
                 "signature-outline-rounded",
                 "table-outline",
                 "title",
                 "text-snippet-outline",
-                "text-fields",
+                "material-symbols:title",
                 "grid-on-outline",
                 "looks-one-outline",
                 "grain",

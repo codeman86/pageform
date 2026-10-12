@@ -44,6 +44,7 @@ enum Tool {
     Date,
     Dropdown,
     Line,
+    Square,
     Rectangle,
     TextBox,
     Image,
@@ -62,7 +63,7 @@ impl Tool {
             Tool::Date => Some(FieldKind::Date),
             Tool::Dropdown => Some(FieldKind::Dropdown),
             Tool::Line => Some(FieldKind::Line),
-            Tool::Rectangle => Some(FieldKind::Rectangle),
+            Tool::Square | Tool::Rectangle => Some(FieldKind::Rectangle),
             Tool::TextBox => Some(FieldKind::TextBox),
             Tool::Image => Some(FieldKind::Image),
         }
@@ -212,9 +213,17 @@ impl PageFormApp {
         let dx = x0 - x1;
         let dy = y0 - y1;
         let page = self.doc.page();
+        let square = self.tool == Tool::Square && kind == FieldKind::Rectangle;
         if dx * dx + dy * dy < 16.0 {
-            let (w, h) = default_size(kind, self.grid_size);
+            let (mut w, mut h) = default_size(kind, self.grid_size);
+            if square {
+                let side = w.min(h);
+                w = side;
+                h = side;
+            }
             place_default(start, w, h, self.snap_grid(), &page)
+        } else if square {
+            square_from_drag(start, current, self.snap_grid(), self.min_size(), &page)
         } else {
             rect_from_drag(start, current, self.snap_grid(), self.min_size(), &page)
         }
@@ -695,15 +704,22 @@ impl PageFormApp {
         let response = icons::icon_menu(
             ui,
             icons::Icon::Shapes,
-            self.tool == Tool::Rectangle,
+            self.tool == Tool::Square || self.tool == Tool::Rectangle,
             "Shapes",
         );
         egui::Popup::menu(&response).show(|ui| {
-            ui.set_min_width(180.0);
-            let selected = self.tool == Tool::Rectangle;
+            ui.set_min_width(160.0);
             if ui
-                .selectable_label(selected, "Square/Rectangle")
-                .on_hover_text(toolbar_tip(FieldKind::Rectangle))
+                .selectable_label(self.tool == Tool::Square, "Square")
+                .on_hover_text("Draw a square. The sides stay equal.")
+                .clicked()
+            {
+                self.tool = Tool::Square;
+                ui.close();
+            }
+            if ui
+                .selectable_label(self.tool == Tool::Rectangle, "Rectangle")
+                .on_hover_text("Draw a rectangle. Width and height are independent.")
                 .clicked()
             {
                 self.tool = Tool::Rectangle;
@@ -1704,7 +1720,7 @@ const FILE_MENU: &[&str] = &[
     "Exit",
 ];
 
-const NEW_MENU: &[&str] = &["New Blank", "New from Template"];
+const NEW_MENU: &[&str] = &["New Blank Document", "New from Template"];
 
 const EDIT_MENU: &[&str] = &[
     "Select",
@@ -1741,7 +1757,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File → New lists New Blank and New from Template. Those, plus Open, Save, Save As, and Print, are not implemented yet. File → Export PDF writes sample-form.pdf. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
+        "File → New lists New Blank Document and New from Template. Those, plus Open, Save, Save As, and Print, are not implemented yet. File → Export PDF writes sample-form.pdf. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
     ),
     (
         "Is there a list box?",
@@ -1815,6 +1831,23 @@ fn same_rect(a: RectPt, b: RectPt) -> bool {
         && (a.y - b.y).abs() < 0.5
         && (a.w - b.w).abs() < 0.5
         && (a.h - b.h).abs() < 0.5
+}
+
+fn square_from_drag(
+    start: PdfPoint,
+    end: PdfPoint,
+    grid: Option<f32>,
+    min: f32,
+    page: &pageform_core::Page,
+) -> pageform_core::RectPt {
+    let start = snap_point(start, grid);
+    let end = snap_point(end, grid);
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let side = dx.abs().max(dy.abs()).max(min.max(1.0));
+    let ex = start.x + if dx < 0.0 { -side } else { side };
+    let ey = start.y + if dy < 0.0 { -side } else { side };
+    rect_from_drag(start, PdfPoint { x: ex, y: ey }, None, min, page)
 }
 
 fn rects_overlap(a: RectPt, b: RectPt) -> bool {
@@ -1960,7 +1993,7 @@ mod tests {
             ]
         );
         assert_eq!(menu_entries(HELP_MENU), ["Help", "About"]);
-        assert_eq!(NEW_MENU, ["New Blank", "New from Template"]);
+        assert_eq!(NEW_MENU, ["New Blank Document", "New from Template"]);
         assert_eq!(
             ABOUT_TAGLINE,
             "Open-Source Native Form and Document Editor Written in Rust"
@@ -2035,6 +2068,20 @@ mod tests {
     }
 
     #[test]
+    fn square_drag_keeps_equal_sides_and_rectangle_drag_does_not() {
+        let page = Page::letter();
+        let start = PdfPoint { x: 72.0, y: 200.0 };
+        let end = PdfPoint { x: 180.0, y: 140.0 };
+        let square = square_from_drag(start, end, None, 9.0, &page);
+        assert!((square.w - square.h).abs() < 0.1);
+        assert!((square.w - 108.0).abs() < 0.1);
+        let rect = rect_from_drag(start, end, None, 9.0, &page);
+        assert!((rect.w - 108.0).abs() < 0.1);
+        assert!((rect.h - 60.0).abs() < 0.1);
+        assert!((rect.w - rect.h).abs() > 1.0);
+    }
+
+    #[test]
     fn file_and_edit_stubs_report_in_the_status_bar() {
         let mut app = PageFormApp::new(false, None);
         assert!(!app.show_preferences);
@@ -2050,7 +2097,7 @@ mod tests {
             "Copy",
             "Cut",
             "Paste",
-            "New Blank",
+            "New Blank Document",
             "New from Template",
             "Insert Page",
         ] {
