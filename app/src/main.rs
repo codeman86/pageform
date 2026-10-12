@@ -1,3 +1,4 @@
+mod prefs;
 mod preview;
 mod theme;
 mod ui;
@@ -96,6 +97,13 @@ Usage:
 Scroll to zoom. Middle-drag or Space-drag to pan.
 The window opens in the dark theme. Edit → Preferences, View → Dark / Light,
 or the toolbar moon/sun icon switches it, and the choice is restored next launch.
+The properties panel starts hidden. View → Properties, the toolbar icon,
+right-click Properties, or a double-click opens it. Pin keeps it open.
+Unpinned, it closes when you click empty canvas with Select, or when the
+selection is deleted. Preferences stores that open and pinned choice.
+Nothing selected edits the page. One item edits that item. Shift-click or
+Ctrl-click selects several items for align, distribute, and match size.
+Calculations are a placeholder. Margins, header, and footer stay on the canvas.
 File: New opens New Blank Document and New from Template. Those, plus Open, Save,
 Save As, and Print, are not implemented yet.
 Export PDF writes sample-form.pdf. Exit closes the window.

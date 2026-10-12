@@ -26,12 +26,27 @@ impl Page {
 
 /// Rectangle inside the print-safe margin. Canvas guide only.
 pub fn print_safe_rect(page: &Page) -> RectPt {
-    let inset = PRINT_SAFE_MARGIN_PT;
+    inset_rect(
+        page,
+        PRINT_SAFE_MARGIN_PT,
+        PRINT_SAFE_MARGIN_PT,
+        PRINT_SAFE_MARGIN_PT,
+        PRINT_SAFE_MARGIN_PT,
+    )
+}
+
+/// Canvas guide inset by the page margins. Not written into the PDF.
+pub fn inset_rect(page: &Page, top: f32, right: f32, bottom: f32, left: f32) -> RectPt {
+    let cap = page.width.min(page.height) * 0.45;
+    let top = top.clamp(0.0, cap);
+    let right = right.clamp(0.0, cap);
+    let bottom = bottom.clamp(0.0, cap);
+    let left = left.clamp(0.0, cap);
     RectPt {
-        x: inset,
-        y: inset,
-        w: (page.width - inset * 2.0).max(1.0),
-        h: (page.height - inset * 2.0).max(1.0),
+        x: left,
+        y: bottom,
+        w: (page.width - left - right).max(1.0),
+        h: (page.height - top - bottom).max(1.0),
     }
 }
 
@@ -321,6 +336,99 @@ pub fn place_default(anchor: PdfPoint, w: f32, h: f32, grid: Option<f32>, page: 
     )
 }
 
+/// How a multi-selection lines up. Top is the visual top (larger PDF y).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlignEdge {
+    Left,
+    Center,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// Move every rect so the chosen edge matches the selection bounds.
+pub fn align_rects(rects: &mut [RectPt], edge: AlignEdge) {
+    if rects.len() < 2 {
+        return;
+    }
+    let min_x = rects.iter().map(|rect| rect.x).fold(f32::MAX, f32::min);
+    let max_right = rects
+        .iter()
+        .map(|rect| rect.right())
+        .fold(f32::MIN, f32::max);
+    let min_y = rects.iter().map(|rect| rect.y).fold(f32::MAX, f32::min);
+    let max_top = rects.iter().map(|rect| rect.top()).fold(f32::MIN, f32::max);
+    let mid_x = (min_x + max_right) * 0.5;
+    for rect in rects.iter_mut() {
+        match edge {
+            AlignEdge::Left => rect.x = min_x,
+            AlignEdge::Center => rect.x = mid_x - rect.w * 0.5,
+            AlignEdge::Right => rect.x = max_right - rect.w,
+            AlignEdge::Bottom => rect.y = min_y,
+            AlignEdge::Top => rect.y = max_top - rect.h,
+        }
+    }
+}
+
+/// Equal gaps between items. The first and last stay put. Needs three items.
+pub fn distribute_rects(rects: &mut [RectPt], horizontal: bool) {
+    if rects.len() < 3 {
+        return;
+    }
+    let mut order: Vec<usize> = (0..rects.len()).collect();
+    if horizontal {
+        order.sort_by(|a, b| {
+            rects[*a]
+                .x
+                .partial_cmp(&rects[*b].x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let first = rects[order[0]].x;
+        let last = rects[*order.last().unwrap()].right();
+        let total: f32 = order.iter().map(|index| rects[*index].w).sum();
+        let gap = (last - first - total) / (order.len() - 1) as f32;
+        let mut cursor = first;
+        for index in order {
+            rects[index].x = cursor;
+            cursor += rects[index].w + gap;
+        }
+    } else {
+        order.sort_by(|a, b| {
+            rects[*a]
+                .y
+                .partial_cmp(&rects[*b].y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let first = rects[order[0]].y;
+        let last = rects[*order.last().unwrap()].top();
+        let total: f32 = order.iter().map(|index| rects[*index].h).sum();
+        let gap = (last - first - total) / (order.len() - 1) as f32;
+        let mut cursor = first;
+        for index in order {
+            rects[index].y = cursor;
+            cursor += rects[index].h + gap;
+        }
+    }
+}
+
+/// Copy width and/or height from `reference` onto the other rects.
+pub fn match_size(rects: &mut [RectPt], reference: usize, width: bool, height: bool) {
+    let Some(source) = rects.get(reference).copied() else {
+        return;
+    };
+    for (index, rect) in rects.iter_mut().enumerate() {
+        if index == reference {
+            continue;
+        }
+        if width {
+            rect.w = source.w;
+        }
+        if height {
+            rect.h = source.h;
+        }
+    }
+}
+
 pub fn hit_handle(rect: RectPt, point: PdfPoint, radius: f32) -> Option<Handle> {
     let radius_sq = radius * radius;
     Handle::ALL.into_iter().find(|handle| {
@@ -459,6 +567,84 @@ mod tests {
         close(safe.y, 36.0);
         close(safe.w, 612.0 - 72.0);
         close(safe.h, 792.0 - 72.0);
+    }
+
+    #[test]
+    fn align_distribute_and_match_use_the_selection_bounds() {
+        let mut rects = [
+            RectPt {
+                x: 10.0,
+                y: 10.0,
+                w: 20.0,
+                h: 10.0,
+            },
+            RectPt {
+                x: 50.0,
+                y: 40.0,
+                w: 30.0,
+                h: 20.0,
+            },
+            RectPt {
+                x: 100.0,
+                y: 80.0,
+                w: 10.0,
+                h: 40.0,
+            },
+        ];
+        align_rects(&mut rects, AlignEdge::Left);
+        assert!((rects[0].x - 10.0).abs() < 0.01);
+        assert!((rects[1].x - 10.0).abs() < 0.01);
+        assert!((rects[2].x - 10.0).abs() < 0.01);
+
+        rects[0].x = 10.0;
+        rects[1].x = 50.0;
+        rects[2].x = 100.0;
+        align_rects(&mut rects, AlignEdge::Right);
+        close(rects[0].right(), 110.0);
+        close(rects[1].right(), 110.0);
+        close(rects[2].right(), 110.0);
+
+        align_rects(&mut rects, AlignEdge::Top);
+        close(rects[0].top(), 120.0);
+        close(rects[1].top(), 120.0);
+        close(rects[2].top(), 120.0);
+
+        let mut row = [
+            RectPt {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+            RectPt {
+                x: 40.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+            RectPt {
+                x: 80.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            },
+        ];
+        distribute_rects(&mut row, true);
+        close(row[0].x, 0.0);
+        close(row[1].x, 40.0);
+        close(row[2].x, 80.0);
+        let gap = row[1].x - row[0].right();
+        close(gap, row[2].x - row[1].right());
+
+        match_size(&mut row, 2, true, true);
+        close(row[0].w, 10.0);
+        close(row[0].h, 10.0);
+        row[2].w = 25.0;
+        row[2].h = 8.0;
+        match_size(&mut row, 2, true, false);
+        close(row[0].w, 25.0);
+        close(row[1].w, 25.0);
+        close(row[0].h, 10.0);
     }
 
     #[test]
