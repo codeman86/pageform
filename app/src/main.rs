@@ -95,15 +95,16 @@ Usage:
 
 Scroll to zoom. Middle-drag or Space-drag to pan.
 The window opens in the dark theme. Edit → Preferences, View → Dark / Light,
-or the toolbar button switches it, and the choice is restored next launch.
+or the toolbar moon/sun icon switches it, and the choice is restored next launch.
 File: New, Open, Save, Save As, and Print are not implemented yet.
-Export PDF writes the toolbar path. Exit closes the window.
+Export PDF writes sample-form.pdf. Exit closes the window.
 Edit: Select and Delete work. Select All, Copy, Cut, and Paste are not
 implemented yet. Preferences is a dialog for the theme and radio labels.
 Insert drops a default item in the view, listed alphabetically: Checkbox,
 Date, Drop-down, Image, Line, Radio, Signature, Square/Rectangle, Table,
-Text (static label), Text Box, and Text Field. The toolbar keeps the
-earlier order and arms drawing on the page.
+Text (static label), Text Box, and Text Field. Toolbar icons use that same
+order, with Square/Rectangle under one Shapes icon. Insert Page is not
+implemented yet. Header and footer are in the View menu only.
 A selected radio makes the next radio join that group. Preferences can hide
 the label beside each radio. There is no list box.
 View toggles grid dots, guide lines, the print-safe margin, header, footer,

@@ -110,7 +110,7 @@ pub enum FieldKind {
 }
 
 impl FieldKind {
-    /// Toolbar order. The Insert menu lists these labels alphabetically.
+    /// Known page objects. The Insert menu and the toolbar sort their own labels.
     pub const INSERT: [FieldKind; 12] = [
         FieldKind::Text,
         FieldKind::StaticText,
@@ -731,8 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn insert_order_is_the_toolbar() {
-        // The Insert menu sorts these labels. This array stays the toolbar order.
+    fn insert_kinds_keep_their_labels() {
+        // The Insert menu and the toolbar sort these labels themselves.
         let labels: Vec<_> = FieldKind::INSERT.iter().map(|kind| kind.label()).collect();
         assert_eq!(
             labels,

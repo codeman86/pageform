@@ -1,5 +1,8 @@
 //! egui canvas. Geometry and PDF export live in `pageform-core`.
 
+#[path = "icons.rs"]
+mod icons;
+
 use eframe::egui::{
     self, Align2, CursorIcon, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2,
 };
@@ -285,9 +288,11 @@ impl PageFormApp {
             }
             match *label {
                 "Export PDF" => {
-                    let export = ui.button(*label).on_hover_text(
-                        "Write a fillable PDF to the path in the toolbar. Guides and margins stay on the canvas.",
+                    let tip = format!(
+                        "Write a fillable PDF to {}. Guides and margins stay on the canvas.",
+                        self.export_path
                     );
+                    let export = ui.button(*label).on_hover_text(tip);
                     if export.clicked() {
                         self.export_current();
                         ui.close();
@@ -623,53 +628,178 @@ impl PageFormApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.tool, Tool::Select, "Select");
-            for kind in FieldKind::INSERT {
-                ui.selectable_value(&mut self.tool, Tool::for_kind(kind), kind.label())
-                    .on_hover_text(toolbar_tip(kind));
-            }
+            ui.spacing_mut().item_spacing.x = 3.0;
+            self.toolbar_documents(ui);
             ui.separator();
-            ui.toggle_value(&mut self.dots_visible, "Dots")
-                .on_hover_text("Grid dots");
-            ui.toggle_value(&mut self.guides_visible, "Guides")
-                .on_hover_text("Guide lines. Canvas only.");
-            ui.toggle_value(&mut self.margins_visible, "Margins")
-                .on_hover_text("Print-safe margin. Canvas only.");
-            ui.toggle_value(&mut self.header_visible, "Header")
-                .on_hover_text("Header band. Canvas only.");
-            ui.toggle_value(&mut self.footer_visible, "Footer")
-                .on_hover_text("Footer band. Canvas only.");
-            ui.toggle_value(&mut self.page_numbers_visible, "Page #")
-                .on_hover_text("Page number. Canvas only.");
-            for size in GridSize::ALL {
-                ui.selectable_value(&mut self.grid_size, size, size.label());
-            }
-            ui.toggle_value(&mut self.snap, "Snap");
-            ui.label(self.grid_size.minor_label());
+            self.toolbar_tools(ui);
             ui.separator();
-            if ui.button("Fit").clicked() {
-                if let Some(rect) = self.canvas_rect {
-                    self.fit(rect);
+            self.toolbar_view(ui);
+        });
+    }
+
+    fn toolbar_documents(&mut self, ui: &mut egui::Ui) {
+        for label in icons::DOC_COMMANDS {
+            match *label {
+                "New" => self.icon_choices(
+                    ui,
+                    icons::Icon::New,
+                    false,
+                    "New",
+                    &[
+                        ("New Blank", "New Blank"),
+                        ("New from Template", "New from Template"),
+                    ],
+                ),
+                "Open" => self.stub_icon(ui, icons::Icon::Open, "Open"),
+                "Save" => self.icon_choices(
+                    ui,
+                    icons::Icon::Save,
+                    false,
+                    "Save",
+                    &[("Save", "Save"), ("Save As", "Save As")],
+                ),
+                "Print" => self.stub_icon(ui, icons::Icon::Print, "Print"),
+                _ => {}
+            }
+        }
+    }
+
+    fn toolbar_tools(&mut self, ui: &mut egui::Ui) {
+        let select =
+            icons::icon_button(ui, icons::Icon::Select, self.tool == Tool::Select, "Select");
+        if select.clicked() {
+            self.tool = Tool::Select;
+        }
+        if icons::icon_button(ui, icons::Icon::InsertPage, false, "Insert Page").clicked() {
+            self.mark_not_implemented("Insert Page");
+        }
+        for label in icons::INSERT_TOOLS {
+            if *label == "Shapes" {
+                self.shapes_menu(ui);
+            } else if let Some(kind) = kind_for_toolbar_label(label) {
+                let tool = Tool::for_kind(kind);
+                let response =
+                    icons::icon_button(ui, icon_for_kind(kind), self.tool == tool, kind.label())
+                        .on_hover_text(toolbar_tip(kind));
+                if response.clicked() {
+                    self.tool = tool;
                 }
             }
-            ui.label(format!("{}%", (self.view.zoom * 100.0).round() as i32));
-            ui.separator();
-            ui.label("Export");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.export_path)
-                    .desired_width(160.0)
-                    .hint_text("sample-form.pdf"),
-            );
-            if ui.button("Export PDF").clicked() {
-                self.export_current();
-            }
-            ui.separator();
+        }
+    }
+
+    fn shapes_menu(&mut self, ui: &mut egui::Ui) {
+        let response = icons::icon_menu(
+            ui,
+            icons::Icon::Shapes,
+            self.tool == Tool::Rectangle,
+            "Shapes",
+        );
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(180.0);
+            let selected = self.tool == Tool::Rectangle;
             if ui
-                .button(crate::theme::toggle_label(self.dark))
-                .on_hover_text(crate::theme::toggle_tip(self.dark))
+                .selectable_label(selected, "Square/Rectangle")
+                .on_hover_text(toolbar_tip(FieldKind::Rectangle))
                 .clicked()
             {
-                self.set_dark(!self.dark);
+                self.tool = Tool::Rectangle;
+                ui.close();
+            }
+        });
+    }
+
+    fn toolbar_view(&mut self, ui: &mut egui::Ui) {
+        let response = icons::icon_menu(ui, icons::Icon::Grid, false, "Grid size");
+        let current = self.grid_size;
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(140.0);
+            for size in GridSize::ALL {
+                if ui
+                    .selectable_label(current == size, size.label())
+                    .on_hover_text(size.minor_label())
+                    .clicked()
+                {
+                    self.grid_size = size;
+                    ui.close();
+                }
+            }
+        });
+        for ((label, icon), detail) in icons::VIEW_TOGGLES
+            .iter()
+            .copied()
+            .zip(icons::VIEW_ICONS)
+            .zip([
+                "Grid dots",
+                "Guide lines. Canvas only.",
+                "Print-safe margin. Canvas only.",
+                "Page number. Canvas only.",
+                "Snap to the minor grid spacing.",
+            ])
+        {
+            self.toggle_view(ui, icon, label, detail);
+        }
+        let theme_icon = if self.dark {
+            icons::Icon::Moon
+        } else {
+            icons::Icon::Sun
+        };
+        let theme_tip = format!(
+            "{} — {}",
+            crate::theme::toggle_label(self.dark),
+            crate::theme::toggle_tip(self.dark)
+        );
+        if icons::icon_button(ui, theme_icon, false, &theme_tip).clicked() {
+            self.set_dark(!self.dark);
+        }
+    }
+
+    fn toggle_view(&mut self, ui: &mut egui::Ui, icon: icons::Icon, tip: &str, detail: &str) {
+        let on = match tip {
+            "Dots" => self.dots_visible,
+            "Guides" => self.guides_visible,
+            "Margins" => self.margins_visible,
+            "Page numbers" => self.page_numbers_visible,
+            "Snap" => self.snap,
+            _ => return,
+        };
+        if icons::icon_button(ui, icon, on, tip)
+            .on_hover_text(detail)
+            .clicked()
+        {
+            match tip {
+                "Dots" => self.dots_visible = !self.dots_visible,
+                "Guides" => self.guides_visible = !self.guides_visible,
+                "Margins" => self.margins_visible = !self.margins_visible,
+                "Page numbers" => self.page_numbers_visible = !self.page_numbers_visible,
+                "Snap" => self.snap = !self.snap,
+                _ => {}
+            }
+        }
+    }
+
+    fn stub_icon(&mut self, ui: &mut egui::Ui, icon: icons::Icon, label: &str) {
+        if icons::icon_button(ui, icon, false, label).clicked() {
+            self.mark_not_implemented(label);
+        }
+    }
+
+    fn icon_choices(
+        &mut self,
+        ui: &mut egui::Ui,
+        icon: icons::Icon,
+        selected: bool,
+        tip: &str,
+        items: &[(&str, &str)],
+    ) {
+        let response = icons::icon_menu(ui, icon, selected, tip);
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(180.0);
+            for (label, command) in items {
+                if ui.button(*label).clicked() {
+                    self.mark_not_implemented(command);
+                    ui.close();
+                }
             }
         });
     }
@@ -696,7 +826,7 @@ impl PageFormApp {
             PRINT_SAFE_MARGIN_PT
         ));
         ui.label("Snap uses the minor spacing, even if dots or guides are hidden, so columns and rows stay even.");
-        ui.label("Insert drops a default-sized item in the view. The matching toolbar tool draws on the page.");
+        ui.label("Insert drops a default-sized item in the view. A toolbar icon draws on the page. Square/Rectangle is under Shapes.");
         ui.label("Edit → Preferences sets Dark or Light and radio labels.");
         ui.separator();
         ui.heading("Field");
@@ -720,7 +850,7 @@ impl PageFormApp {
 
         let Some(id) = self.selection else {
             ui.label("Nothing selected.");
-            ui.label("Insert drops a default item. A toolbar tool draws on the page.");
+            ui.label("Insert drops a default item. A toolbar icon draws on the page.");
             return;
         };
         let (kind, rect, group_name) = {
@@ -1594,7 +1724,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "How do I place something?",
-        "The Insert menu drops a default-sized item at the center of the visible page. The toolbar button with the same name arms that tool so you can drag on the page.",
+        "The Insert menu drops a default-sized item at the center of the visible page. A toolbar icon arms that tool so you can drag on the page. Square/Rectangle is the Shapes icon.",
     ),
     (
         "How do I select, move, and delete?",
@@ -1606,7 +1736,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "They are not implemented yet. File → Export PDF writes a fillable PDF to the path in the toolbar. Guides, margins, the header, the footer, and the page number stay on the canvas.",
+        "They are not implemented yet, including the toolbar copies. File → Export PDF writes sample-form.pdf. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
     ),
     (
         "Is there a list box?",
@@ -1717,6 +1847,29 @@ fn insert_tip(kind: FieldKind) -> &'static str {
         FieldKind::TextBox => "Drop a static text box. It is not a fillable field.",
         FieldKind::Image => "Drop an image placeholder. Choosing a file is not available yet.",
     }
+}
+
+fn icon_for_kind(kind: FieldKind) -> icons::Icon {
+    match kind {
+        FieldKind::Text => icons::Icon::TextField,
+        FieldKind::StaticText => icons::Icon::Text,
+        FieldKind::Checkbox => icons::Icon::Checkbox,
+        FieldKind::Radio => icons::Icon::Radio,
+        FieldKind::Table => icons::Icon::Table,
+        FieldKind::Signature => icons::Icon::Signature,
+        FieldKind::Date => icons::Icon::Date,
+        FieldKind::Dropdown => icons::Icon::Dropdown,
+        FieldKind::Line => icons::Icon::Line,
+        FieldKind::Rectangle => icons::Icon::Shapes,
+        FieldKind::TextBox => icons::Icon::TextBox,
+        FieldKind::Image => icons::Icon::Image,
+    }
+}
+
+fn kind_for_toolbar_label(label: &str) -> Option<FieldKind> {
+    FieldKind::INSERT
+        .into_iter()
+        .find(|kind| kind.label() == label)
 }
 
 fn toolbar_tip(kind: FieldKind) -> &'static str {
@@ -1836,12 +1989,43 @@ mod tests {
                 "Text Field",
             ]
         );
-        let toolbar: Vec<_> = FieldKind::INSERT
-            .into_iter()
-            .map(FieldKind::label)
-            .collect();
-        assert_ne!(toolbar, menu);
-        assert_eq!(toolbar.len(), menu.len());
+        assert_eq!(icons::INSERT_TOOLS.len(), 12);
+        assert!(icons::INSERT_TOOLS.contains(&"Shapes"));
+        assert!(!icons::INSERT_TOOLS.contains(&"Square/Rectangle"));
+        assert!(!icons::VIEW_TOGGLES.contains(&"Header"));
+        assert!(!icons::VIEW_TOGGLES.contains(&"Footer"));
+        assert_ne!(menu, icons::INSERT_TOOLS);
+        assert_eq!(
+            kind_for_toolbar_label("Checkbox"),
+            Some(FieldKind::Checkbox)
+        );
+        assert_eq!(kind_for_toolbar_label("Shapes"), None);
+        assert!(matches!(
+            icon_for_kind(FieldKind::Rectangle),
+            icons::Icon::Shapes
+        ));
+        assert!(matches!(
+            icon_for_kind(FieldKind::Text),
+            icons::Icon::TextField
+        ));
+        assert!(matches!(
+            icon_for_kind(FieldKind::StaticText),
+            icons::Icon::Text
+        ));
+    }
+
+    #[test]
+    fn toolbar_does_not_paint_removed_commands() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let output = panel(&ctx, &mut app, |app, ui| app.toolbar(ui));
+        let joined = galley_texts(&output).join("\n");
+        for banned in ["Export PDF", "Header", "Footer", "Fit", "Square/Rectangle"] {
+            assert!(
+                !joined.contains(banned),
+                "{banned} showed up on the toolbar: {joined}"
+            );
+        }
     }
 
     #[test]
@@ -1860,6 +2044,9 @@ mod tests {
             "Copy",
             "Cut",
             "Paste",
+            "New Blank",
+            "New from Template",
+            "Insert Page",
         ] {
             app.mark_not_implemented(command);
             assert_eq!(app.status, format!("{command} is not implemented yet"));
