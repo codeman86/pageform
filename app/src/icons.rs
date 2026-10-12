@@ -162,10 +162,9 @@ fn icon_widget(
 
 fn glyph_rect(rect: Rect, caret: bool, icon: Icon) -> Rect {
     // New sits further inside the button so the page corner is not clipped
-    // by the dropdown caret. Text Field is larger so the T stem stays visible.
+    // by the dropdown caret.
     let (size, left_pad) = match icon {
         Icon::New => (16.0, 7.0),
-        Icon::TextField => (22.0, 3.0),
         _ => (18.0, 5.0),
     };
     if caret {
@@ -396,7 +395,7 @@ mod tests {
                 "note-stack-add-outline",
                 "check-box-outline",
                 "calendar-today-outline",
-                "arrow-drop-down",
+                "dropdown-menu-outline",
                 "image-outline",
                 "horizontal-rule",
                 "radio-button-checked",
@@ -405,7 +404,7 @@ mod tests {
                 "table-outline",
                 "title",
                 "text-snippet-outline",
-                "material-symbols:title",
+                "text-fields",
                 "grid-on-outline",
                 "looks-one-outline",
                 "grain",
@@ -431,6 +430,41 @@ mod tests {
                 area
             );
         }
+        assert_visible_stroke(Icon::Dropdown, 14.0, 8.0, 40.0);
+        assert_visible_stroke(Icon::Line, 12.0, 2.4, 30.0);
+        assert_eq!(Icon::TextField.iconify_name(), "text-fields");
+        assert_eq!(Icon::Text.iconify_name(), "title");
+    }
+
+    fn assert_visible_stroke(icon: Icon, min_width: f32, min_height: f32, min_area: f32) {
+        let tess = tessellate(icon);
+        let (min, max) = mesh_bounds(&tess);
+        let width = max.x - min.x;
+        let height = max.y - min.y;
+        let area = mesh_area(&tess);
+        assert!(
+            width >= min_width && height >= min_height && area >= min_area,
+            "{} spans {:.1}×{:.1} and fills {:.0}; expected at least {:.0}×{:.0} and {:.0}",
+            icon.iconify_name(),
+            width,
+            height,
+            area,
+            min_width,
+            min_height,
+            min_area
+        );
+    }
+
+    fn mesh_bounds(tess: &Tess) -> (Pos2, Pos2) {
+        let mut min = Pos2::new(f32::MAX, f32::MAX);
+        let mut max = Pos2::new(f32::MIN, f32::MIN);
+        for pos in &tess.vertices {
+            min.x = min.x.min(pos.x);
+            min.y = min.y.min(pos.y);
+            max.x = max.x.max(pos.x);
+            max.y = max.y.max(pos.y);
+        }
+        (min, max)
     }
 
     fn mesh_area(tess: &Tess) -> f32 {
