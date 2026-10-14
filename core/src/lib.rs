@@ -10,8 +10,9 @@ mod grid;
 mod style;
 
 pub use document::{
-    default_size, Document, Field, FieldId, FieldKind, NameError, DATE_HINT, SAMPLE_CHECK_NAME,
-    SAMPLE_CHECK_RECT, SAMPLE_TEXT_NAME, SAMPLE_TEXT_RECT, TABLE_COLUMNS, TABLE_ROWS,
+    default_size, Document, Field, FieldId, FieldKind, LoadedProject, NameError, ProjectKind,
+    DATE_HINT, SAMPLE_CHECK_NAME, SAMPLE_CHECK_RECT, SAMPLE_TEXT_NAME, SAMPLE_TEXT_RECT,
+    TABLE_COLUMNS, TABLE_ROWS,
 };
 pub use export::{export_pdf, ExportError};
 pub use geom::{

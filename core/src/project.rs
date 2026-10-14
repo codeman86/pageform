@@ -1,5 +1,7 @@
-//! Version 1 `.pageform` project file.
+//! Version 1 PageForm project file.
 //!
+//! `.pgd` is a PageForm Document and `.pgt` is a PageForm Template. Both use
+//! this file. Older `.pageform` files are the same version without `kind`.
 //! One file holds a list of pages. This app edits the first page. Every item
 //! property the panel can change is stored.
 
@@ -10,9 +12,27 @@ use crate::style::{FieldStyle, Margins, Orientation, PageSize};
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Whether the file is a document or a template. Missing `kind` is a document,
+/// so version 1 `.pageform` files still open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ProjectKind {
+    #[default]
+    Document,
+    Template,
+}
+
+/// A project file plus the kind stored in it.
+#[derive(Debug)]
+pub struct LoadedProject {
+    pub document: Document,
+    pub kind: ProjectKind,
+}
+
 #[derive(Serialize, Deserialize)]
 struct ProjectFile {
     version: u32,
+    #[serde(default)]
+    kind: ProjectKind,
     radio_labels: bool,
     pages: Vec<ProjectPage>,
 }
@@ -40,7 +60,7 @@ struct ProjectItem {
 }
 
 impl Document {
-    pub fn to_project_ron(&self) -> Result<String, String> {
+    pub fn to_project_ron(&self, kind: ProjectKind) -> Result<String, String> {
         let page = ProjectPage {
             size: self.page_size,
             orientation: self.orientation,
@@ -64,6 +84,7 @@ impl Document {
         };
         let file = ProjectFile {
             version: FORMAT_VERSION,
+            kind,
             radio_labels: self.radio_labels,
             pages: vec![page],
         };
@@ -71,7 +92,7 @@ impl Document {
             .map_err(|err| format!("could not write the project: {err}"))
     }
 
-    pub fn from_project_ron(text: &str) -> Result<Self, String> {
+    pub fn from_project_ron(text: &str) -> Result<LoadedProject, String> {
         let file: ProjectFile =
             ron::from_str(text).map_err(|err| format!("could not read the project: {err}"))?;
         if file.version != FORMAT_VERSION {
@@ -108,7 +129,10 @@ impl Document {
             }
         }
         doc.mark_clean();
-        Ok(doc)
+        Ok(LoadedProject {
+            document: doc,
+            kind: file.kind,
+        })
     }
 }
 
@@ -131,15 +155,18 @@ mod tests {
             PdfPoint { x: 140.0, y: 120.0 },
         );
         assert!(doc.is_dirty());
-        let text = doc.to_project_ron().unwrap();
+        let text = doc.to_project_ron(ProjectKind::Document).unwrap();
         assert!(text.contains("version: 1"), "{text}");
+        assert!(text.contains("kind: Document"), "{text}");
         assert!(text.contains("person"), "{text}");
         let loaded = Document::from_project_ron(&text).unwrap();
-        assert!(!loaded.is_dirty());
-        assert_eq!(loaded.page_size(), PageSize::A4);
-        assert_eq!(loaded.header_text(), "Hello");
-        assert_eq!(loaded.fields().len(), 2);
+        assert_eq!(loaded.kind, ProjectKind::Document);
+        assert!(!loaded.document.is_dirty());
+        assert_eq!(loaded.document.page_size(), PageSize::A4);
+        assert_eq!(loaded.document.header_text(), "Hello");
+        assert_eq!(loaded.document.fields().len(), 2);
         let person = loaded
+            .document
             .fields()
             .iter()
             .find(|field| field.name() == "person")
@@ -147,6 +174,7 @@ mod tests {
         assert_eq!(person.style().default_value, "Ada");
         assert!((person.rect().x - SAMPLE_TEXT_RECT.x).abs() < 0.01);
         let line = loaded
+            .document
             .fields()
             .iter()
             .find(|field| field.kind() == FieldKind::Line)
@@ -154,6 +182,27 @@ mod tests {
         let (start, end) = line.line_ends().unwrap();
         assert!((start.y - 80.0).abs() < 0.01);
         assert!((end.y - 120.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_template_round_trip_keeps_the_template_kind() {
+        let doc = Document::letter();
+        let text = doc.to_project_ron(ProjectKind::Template).unwrap();
+        assert!(text.contains("kind: Template"), "{text}");
+        let loaded = Document::from_project_ron(&text).unwrap();
+        assert_eq!(loaded.kind, ProjectKind::Template);
+        assert!(!loaded.document.is_dirty());
+    }
+
+    #[test]
+    fn a_project_without_kind_loads_as_a_document() {
+        let doc = Document::letter();
+        let text = doc.to_project_ron(ProjectKind::Document).unwrap();
+        let legacy = text.replacen("kind: Document,\n", "", 1);
+        assert!(!legacy.contains("kind:"), "{legacy}");
+        let loaded = Document::from_project_ron(&legacy).unwrap();
+        assert_eq!(loaded.kind, ProjectKind::Document);
+        assert!(!loaded.document.is_dirty());
     }
 
     #[test]

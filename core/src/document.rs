@@ -16,6 +16,8 @@ use crate::style::{clean_text, FieldStyle, Margins, Orientation, PageSize, Rgb};
 #[path = "project.rs"]
 mod project;
 
+pub use project::{LoadedProject, ProjectKind};
+
 pub const SAMPLE_TEXT_NAME: &str = "full_name";
 pub const SAMPLE_CHECK_NAME: &str = "agree";
 
@@ -330,6 +332,10 @@ impl Document {
 
     pub fn mark_clean(&mut self) {
         self.dirty = false;
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
     }
 
     fn touch(&mut self) {

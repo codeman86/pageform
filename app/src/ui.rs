@@ -11,7 +11,7 @@ use eframe::egui::{
 use pageform_core::{
     default_size, export_pdf, hit_handle, move_rect, place_default, rect_from_drag, resize_rect,
     snap_point, AlignEdge, BorderStyleKind, CheckboxStyle, Document, Field, FieldId, FieldKind,
-    FontFamily, GridSize, Handle, Page, PdfPoint, RectPt, Rgb, ScreenRect, TextAlign,
+    FontFamily, GridSize, Handle, Page, PdfPoint, ProjectKind, RectPt, Rgb, ScreenRect, TextAlign,
     ViewTransform, TABLE_COLUMNS, TABLE_ROWS,
 };
 
@@ -148,11 +148,12 @@ enum NativePick {
     Fallback,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptKind {
     ExportPdf,
     SaveProject,
     OpenProject,
+    OpenTemplate,
 }
 
 #[derive(Clone)]
@@ -160,6 +161,7 @@ enum PendingFileAction {
     NewBlank,
     Open,
     OpenPath(String),
+    NewFromTemplate,
     Exit,
 }
 
@@ -170,6 +172,8 @@ struct FilePrompt {
     file_name: String,
     /// The chosen path already exists. The next Save replaces it.
     replace: bool,
+    /// Save As writes a `.pgt` template instead of a `.pgd` document.
+    save_as_template: bool,
 }
 
 struct PageFormApp {
@@ -477,6 +481,7 @@ impl PageFormApp {
             PendingFileAction::OpenPath(path) => {
                 self.read_project_file(std::path::Path::new(&path))
             }
+            PendingFileAction::NewFromTemplate => self.begin_new_from_template(),
             PendingFileAction::Exit => self.allow_close = true,
         }
     }
@@ -485,8 +490,7 @@ impl PageFormApp {
         match pick_native(
             true,
             "Export PDF",
-            "PDF",
-            "pdf",
+            &[("PDF", &["pdf"])],
             &export_file_name(&self.export_path),
         ) {
             NativePick::Path(mut path) => {
@@ -502,29 +506,40 @@ impl PageFormApp {
     }
 
     fn begin_open(&mut self) {
-        match pick_native(false, "Open PageForm", "PageForm", "pageform", "") {
+        match pick_native(false, "Open PageForm", OPEN_FILTERS, "") {
             NativePick::Path(path) => self.read_project_file(&path),
             NativePick::Cancel => self.status = "Open cancelled".to_string(),
             NativePick::Fallback => self.open_builtin_prompt(PromptKind::OpenProject),
         }
     }
 
+    fn begin_new_from_template(&mut self) {
+        match pick_native(false, "New from Template", TEMPLATE_FILTERS, "") {
+            NativePick::Path(path) => self.read_project_file_as_untitled(&path),
+            NativePick::Cancel => self.status = "New from Template cancelled".to_string(),
+            NativePick::Fallback => self.open_builtin_prompt(PromptKind::OpenTemplate),
+        }
+    }
+
     fn save_project(&mut self) {
-        if let Some(path) = self.project_path.clone() {
+        if let Some(path) = self.bound_project_path() {
             self.write_project_file(std::path::Path::new(&path));
         } else {
             self.save_project_as();
         }
     }
 
+    /// A saved `.pgd` or legacy `.pageform`. A template is never the bound file.
+    fn bound_project_path(&self) -> Option<String> {
+        self.project_path
+            .clone()
+            .filter(|path| !is_template_path(std::path::Path::new(path)))
+    }
+
     fn save_project_as(&mut self) {
-        let name = self
-            .project_path
-            .as_deref()
-            .map(export_file_name)
-            .unwrap_or_else(|| "Untitled.pageform".to_string());
-        match pick_native(true, "Save PageForm", "PageForm", "pageform", &name) {
-            NativePick::Path(path) => self.write_project_file(&ensure_extension(path, "pageform")),
+        let name = suggested_project_name(self.project_path.as_deref(), false);
+        match pick_native(true, "Save PageForm", SAVE_FILTERS, &name) {
+            NativePick::Path(path) => self.write_project_file(&native_project_save_path(path)),
             NativePick::Cancel => {
                 self.after_save = None;
                 self.status = "Save cancelled".to_string();
@@ -541,22 +556,27 @@ impl PageFormApp {
                 "Choose where to save the PDF.",
             ),
             PromptKind::SaveProject => {
-                let name = self
-                    .project_path
-                    .as_deref()
-                    .map(export_file_name)
-                    .unwrap_or_else(|| "Untitled.pageform".to_string());
+                let name = suggested_project_name(self.project_path.as_deref(), false);
                 let directory = self
                     .project_path
                     .as_deref()
                     .map(parent_dir)
                     .unwrap_or_else(default_export_dir);
-                (directory, name, "Choose where to save the project.")
+                (
+                    directory,
+                    name,
+                    "Choose Document (.pgd) or Template (.pgt).",
+                )
             }
             PromptKind::OpenProject => (
                 default_export_dir(),
                 String::new(),
-                "Enter the path of a .pageform file.",
+                "Enter a .pgd or .pgt path. Legacy .pageform files still open.",
+            ),
+            PromptKind::OpenTemplate => (
+                default_export_dir(),
+                String::new(),
+                "Choose a .pgt template. It opens as a new untitled document.",
             ),
         };
         self.file_prompt = Some(FilePrompt {
@@ -564,6 +584,7 @@ impl PageFormApp {
             directory,
             file_name,
             replace: false,
+            save_as_template: false,
         });
         self.status = status.to_string();
     }
@@ -588,19 +609,34 @@ impl PageFormApp {
                 PromptKind::ExportPdf => "Export PDF",
                 PromptKind::SaveProject => "Save PageForm",
                 PromptKind::OpenProject => "Open PageForm",
+                PromptKind::OpenTemplate => "New from Template",
             });
             ui.add_space(8.0);
-            if kind == PromptKind::OpenProject {
+            if is_open_prompt(kind) {
                 ui.label("Path");
+                let hint = if kind == PromptKind::OpenTemplate {
+                    "/path/to/form.pgt"
+                } else {
+                    "/path/to/form.pgd"
+                };
                 ui.add(
                     egui::TextEdit::singleline(&mut prompt.file_name)
                         .desired_width(f32::INFINITY)
-                        .hint_text("/path/to/form.pageform"),
+                        .hint_text(hint),
                 );
-                if !recent.is_empty() {
+                let shown: Vec<String> = if kind == PromptKind::OpenTemplate {
+                    recent
+                        .iter()
+                        .filter(|path| is_template_path(std::path::Path::new(path)))
+                        .cloned()
+                        .collect()
+                } else {
+                    recent.clone()
+                };
+                if !shown.is_empty() {
                     ui.add_space(8.0);
                     ui.label("Recent");
-                    for path in &recent {
+                    for path in &shown {
                         if ui.button(path).clicked() {
                             open_recent = Some(path.clone());
                         }
@@ -616,13 +652,31 @@ impl PageFormApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut prompt.file_name).desired_width(f32::INFINITY),
                 );
-                let ext = if kind == PromptKind::ExportPdf {
-                    "pdf"
+                if kind == PromptKind::SaveProject {
+                    ui.add_space(6.0);
+                    ui.label("Type");
+                    let was_template = prompt.save_as_template;
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut prompt.save_as_template, false, "Document (.pgd)");
+                        ui.radio_value(&mut prompt.save_as_template, true, "Template (.pgt)");
+                    });
+                    if prompt.save_as_template != was_template {
+                        prompt.file_name =
+                            retarget_project_name(&prompt.file_name, prompt.save_as_template);
+                    }
+                }
+                let path = if kind == PromptKind::ExportPdf {
+                    ensure_extension(
+                        export_file_path(&prompt.directory, &prompt.file_name),
+                        "pdf",
+                    )
                 } else {
-                    "pageform"
+                    project_save_path(
+                        &prompt.directory,
+                        &prompt.file_name,
+                        prompt.save_as_template,
+                    )
                 };
-                let path = export_file_path(&prompt.directory, &prompt.file_name);
-                let path = ensure_extension(path, ext);
                 ui.add_space(6.0);
                 ui.label(path.display().to_string());
                 if prompt.replace {
@@ -635,7 +689,7 @@ impl PageFormApp {
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let label = if kind == PromptKind::OpenProject {
+                let label = if is_open_prompt(kind) {
                     "Open"
                 } else if prompt.replace {
                     "Replace"
@@ -661,7 +715,11 @@ impl PageFormApp {
         }
         if let Some(path) = open_recent {
             self.file_prompt = None;
-            self.read_project_file(std::path::Path::new(&path));
+            if kind == PromptKind::OpenTemplate {
+                self.read_project_file_as_untitled(std::path::Path::new(&path));
+            } else {
+                self.read_project_file(std::path::Path::new(&path));
+            }
             return;
         }
         if close || response.should_close() {
@@ -669,29 +727,38 @@ impl PageFormApp {
             self.after_save = None;
             self.status = match kind {
                 PromptKind::OpenProject => "Open cancelled".to_string(),
+                PromptKind::OpenTemplate => "New from Template cancelled".to_string(),
                 PromptKind::SaveProject => "Save cancelled".to_string(),
                 PromptKind::ExportPdf => "Export cancelled".to_string(),
             };
             return;
         }
         if save {
-            if kind == PromptKind::OpenProject {
+            if is_open_prompt(kind) {
                 let path = prompt.file_name.trim().to_string();
+                let as_untitled = kind == PromptKind::OpenTemplate;
                 self.file_prompt = None;
                 if path.is_empty() {
                     self.status = "Enter a file path to open".to_string();
+                } else if as_untitled {
+                    self.read_project_file_as_untitled(std::path::Path::new(&path));
                 } else {
                     self.read_project_file(std::path::Path::new(&path));
                 }
                 return;
             }
-            let ext = if kind == PromptKind::ExportPdf {
-                "pdf"
+            let path = if kind == PromptKind::ExportPdf {
+                ensure_extension(
+                    export_file_path(&prompt.directory, &prompt.file_name),
+                    "pdf",
+                )
             } else {
-                "pageform"
+                project_save_path(
+                    &prompt.directory,
+                    &prompt.file_name,
+                    prompt.save_as_template,
+                )
             };
-            let path =
-                ensure_extension(export_file_path(&prompt.directory, &prompt.file_name), ext);
             if path.exists() && !prompt.replace {
                 prompt.replace = true;
                 self.file_prompt = Some(prompt);
@@ -704,7 +771,7 @@ impl PageFormApp {
                     self.write_export();
                 }
                 PromptKind::SaveProject => self.write_project_file(&path),
-                PromptKind::OpenProject => {}
+                PromptKind::OpenProject | PromptKind::OpenTemplate => {}
             }
             return;
         }
@@ -712,14 +779,33 @@ impl PageFormApp {
     }
 
     fn write_project_file(&mut self, path: &std::path::Path) {
-        match self.doc.to_project_ron() {
+        let template = is_template_path(path);
+        let kind = if template {
+            ProjectKind::Template
+        } else {
+            ProjectKind::Document
+        };
+        match self.doc.to_project_ron(kind) {
             Ok(text) => match std::fs::write(path, text) {
                 Ok(()) => {
-                    self.project_path = Some(path.display().to_string());
-                    self.doc.mark_clean();
                     self.remember_recent(path);
-                    self.status = format!("Saved {}", path.display());
-                    self.saved_follow_up = true;
+                    if template {
+                        self.after_save = None;
+                        self.saved_follow_up = false;
+                        self.status = if self.project_path.is_none() {
+                            format!(
+                                "Saved template {}. Save will store a new .pgd document.",
+                                path.display()
+                            )
+                        } else {
+                            format!("Saved template {}.", path.display())
+                        };
+                    } else {
+                        self.project_path = Some(path.display().to_string());
+                        self.doc.mark_clean();
+                        self.status = format!("Saved {}", path.display());
+                        self.saved_follow_up = true;
+                    }
                 }
                 Err(err) => {
                     self.after_save = None;
@@ -734,6 +820,15 @@ impl PageFormApp {
     }
 
     fn read_project_file(&mut self, path: &std::path::Path) {
+        self.load_project(path, false);
+    }
+
+    /// File > New from Template. The chosen file stays unchanged.
+    fn read_project_file_as_untitled(&mut self, path: &std::path::Path) {
+        self.load_project(path, true);
+    }
+
+    fn load_project(&mut self, path: &std::path::Path, force_untitled: bool) {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) => {
@@ -742,9 +837,11 @@ impl PageFormApp {
             }
         };
         match Document::from_project_ron(&text) {
-            Ok(doc) => {
-                self.doc = doc;
-                self.project_path = Some(path.display().to_string());
+            Ok(loaded) => {
+                let untitled = force_untitled
+                    || is_template_path(path)
+                    || loaded.kind == ProjectKind::Template;
+                self.doc = loaded.document;
                 self.selection.clear();
                 self.inline = None;
                 self.drag = None;
@@ -752,7 +849,17 @@ impl PageFormApp {
                 self.navigated = false;
                 self.view.page_height = self.doc.page().height;
                 self.remember_recent(path);
-                self.status = format!("Opened {}", path.display());
+                if untitled {
+                    self.project_path = None;
+                    self.doc.mark_dirty();
+                    self.status = format!(
+                        "Opened {} as a new document. Save stores a .pgd and does not change this file.",
+                        path.display()
+                    );
+                } else {
+                    self.project_path = Some(path.display().to_string());
+                    self.status = format!("Opened {}", path.display());
+                }
             }
             Err(err) => self.status = err,
         }
@@ -1277,6 +1384,8 @@ impl PageFormApp {
             if ui.button(*item).clicked() {
                 if *item == "New Blank Document" {
                     self.request_new_blank();
+                } else if *item == "New from Template" {
+                    self.ask_or_run(PendingFileAction::NewFromTemplate);
                 } else {
                     self.mark_not_implemented(item);
                 }
@@ -1613,7 +1722,7 @@ impl PageFormApp {
                         ui,
                         icons::Icon::Open,
                         false,
-                        "Open a .pageform file",
+                        "Open a .pgd or .pgt file",
                     )
                     .clicked() =>
                 {
@@ -3073,7 +3182,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File > New Blank Document starts a blank page and asks before discarding unsaved work. New from Template is not implemented yet. Open, Save, Save As, and Print work. Save uses Ctrl or Cmd+S, Save As uses Ctrl or Cmd+Shift+S, and Print uses Ctrl or Cmd+P. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent lists the last files. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print writes a temporary PDF and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
+        "File > New Blank Document starts a blank page and asks before discarding unsaved work. New from Template opens a .pgt template as a new untitled document and does not change the template. Open reads .pgd documents, .pgt templates, and older .pageform files. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, asks for a .pgd name. Save As uses Ctrl or Cmd+Shift+S and can store a Document (.pgd) or a Template (.pgt). Saving a template does not make that file the open document, so a later Save cannot overwrite it. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent lists the last .pgd and .pgt files. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
     ),
     (
         "Is there a list box?",
@@ -3138,20 +3247,84 @@ fn ensure_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathB
     path
 }
 
+const OPEN_FILTERS: &[(&str, &[&str])] = &[("PageForm", &["pgd", "pgt", "pageform"])];
+
+const SAVE_FILTERS: &[(&str, &[&str])] = &[
+    ("PageForm Document", &["pgd"]),
+    ("PageForm Template", &["pgt"]),
+];
+
+const TEMPLATE_FILTERS: &[(&str, &[&str])] = &[("PageForm Template", &["pgt"])];
+
+fn is_open_prompt(kind: PromptKind) -> bool {
+    matches!(kind, PromptKind::OpenProject | PromptKind::OpenTemplate)
+}
+
+fn extension_is(path: &std::path::Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(ext))
+}
+
+fn is_template_path(path: &std::path::Path) -> bool {
+    extension_is(path, "pgt")
+}
+
+fn retarget_project_name(file_name: &str, template: bool) -> String {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() {
+        return if template {
+            "Untitled.pgt".to_string()
+        } else {
+            "Untitled.pgd".to_string()
+        };
+    }
+    let ext = if template { "pgt" } else { "pgd" };
+    std::path::PathBuf::from(trimmed)
+        .with_extension(ext)
+        .display()
+        .to_string()
+}
+
+fn suggested_project_name(project_path: Option<&str>, template: bool) -> String {
+    match project_path {
+        Some(path) => retarget_project_name(&export_file_name(path), template),
+        None => retarget_project_name("Untitled.pgd", template),
+    }
+}
+
+fn project_save_path(directory: &str, file_name: &str, template: bool) -> std::path::PathBuf {
+    let name = retarget_project_name(file_name, template);
+    let mut path = std::path::PathBuf::from(directory.trim());
+    if path.as_os_str().is_empty() {
+        path = std::path::PathBuf::from(default_export_dir());
+    }
+    path.push(name);
+    path
+}
+
+/// A missing extension becomes `.pgd`. `.pgt`, `.pgd`, and legacy `.pageform` stay.
+fn native_project_save_path(mut path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.extension().is_none() {
+        path.set_extension("pgd");
+    }
+    path
+}
+
 fn pick_native(
     save: bool,
     title: &str,
-    filter_name: &str,
-    extension: &str,
+    filters: &[(&str, &[&str])],
     file_name: &str,
 ) -> NativePick {
     if !native_save_dialog_available() {
         return NativePick::Fallback;
     }
     let started = std::time::Instant::now();
-    let dialog = rfd::FileDialog::new()
-        .set_title(title)
-        .add_filter(filter_name, &[extension]);
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    for (name, extensions) in filters {
+        dialog = dialog.add_filter(*name, extensions);
+    }
     let dialog = if file_name.is_empty() {
         dialog
     } else {
@@ -4187,10 +4360,8 @@ mod tests {
 
     #[test]
     fn save_then_open_restores_the_project_and_clears_the_dirty_flag() {
-        let path = std::env::temp_dir().join(format!(
-            "pageform-roundtrip-{}.pageform",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("pageform-roundtrip-{}.pgd", std::process::id()));
         let mut app = PageFormApp::new(false, None);
         assert!(!app.doc.is_dirty());
         assert_eq!(app.window_title(), "Untitled - PageForm");
@@ -4209,7 +4380,172 @@ mod tests {
         assert_eq!(app.doc.header_text(), "Header");
         assert_eq!(app.doc.fields().len(), 1);
         assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("kind: Document"), "{saved}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_template_opens_as_untitled_and_save_does_not_overwrite_it() {
+        let dir = std::env::temp_dir();
+        let template = dir.join(format!("pageform-template-{}.pgt", std::process::id()));
+        let document = dir.join(format!("pageform-from-template-{}.pgd", std::process::id()));
+        let legacy = dir.join(format!("pageform-legacy-{}.pageform", std::process::id()));
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.doc.set_default_value(id, "Ada");
+        app.write_project_file(&template);
+        assert!(app.project_path.is_none());
+        assert!(app.doc.is_dirty());
+        assert!(app.window_title().starts_with("Untitled"));
+        let template_bytes = std::fs::read(&template).unwrap();
+        let template_text = String::from_utf8(template_bytes.clone()).unwrap();
+        assert!(template_text.contains("kind: Template"), "{template_text}");
+
+        app.new_blank();
+        app.read_project_file(&template);
+        assert!(app.project_path.is_none());
+        assert!(app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled * - PageForm");
+        assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
+        assert!(app.bound_project_path().is_none());
+        assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
+        assert_eq!(app.recent[0], template.display().to_string());
+
+        app.read_project_file_as_untitled(&template);
+        assert!(app.project_path.is_none());
+        assert_eq!(app.window_title(), "Untitled * - PageForm");
+        assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
+
+        app.write_project_file(&document);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(
+            app.project_path.as_deref(),
+            Some(document.to_str().unwrap())
+        );
+        assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
+        let document_bytes = std::fs::read(&document).unwrap();
+        app.write_project_file(&template);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(
+            app.project_path.as_deref(),
+            Some(document.to_str().unwrap())
+        );
+        assert_eq!(std::fs::read(&document).unwrap(), document_bytes);
+        assert!(app.recent.contains(&template.display().to_string()));
+        assert!(app.recent.contains(&document.display().to_string()));
+
+        let legacy_text = template_text.replacen("kind: Template,\n", "", 1);
+        std::fs::write(&legacy, &legacy_text).unwrap();
+        app.read_project_file(&legacy);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.project_path.as_deref(), Some(legacy.to_str().unwrap()));
+        assert!(app.window_title().contains(".pageform"));
+
+        let mut fresh = PageFormApp::new(false, None);
+        fresh.open_builtin_prompt(PromptKind::SaveProject);
+        let prompt = fresh.file_prompt.clone().expect("save dialog");
+        assert!(!prompt.save_as_template);
+        assert_eq!(prompt.file_name, "Untitled.pgd");
+        fresh.open_builtin_prompt(PromptKind::OpenTemplate);
+        assert_eq!(
+            fresh.file_prompt.expect("template dialog").kind,
+            PromptKind::OpenTemplate
+        );
+        assert_eq!(
+            suggested_project_name(None, false),
+            "Untitled.pgd".to_string()
+        );
+        assert_eq!(
+            project_save_path("/tmp/forms", "card.pgd", true),
+            std::path::PathBuf::from("/tmp/forms/card.pgt")
+        );
+        assert_eq!(
+            project_save_path("/tmp/forms", "card.pageform", false),
+            std::path::PathBuf::from("/tmp/forms/card.pgd")
+        );
+        assert_eq!(
+            native_project_save_path(std::path::PathBuf::from("/tmp/forms/card")),
+            std::path::PathBuf::from("/tmp/forms/card.pgd")
+        );
+        assert!(is_template_path(&template));
+        let suggested = suggested_project_name(app.project_path.as_deref(), false);
+        assert!(suggested.ends_with(".pgd"), "{suggested}");
+        assert!(!suggested.ends_with(".pageform"), "{suggested}");
+
+        let _ = std::fs::remove_file(&template);
+        let _ = std::fs::remove_file(&document);
+        let _ = std::fs::remove_file(&legacy);
+    }
+
+    #[test]
+    fn save_as_dialog_switches_between_document_and_template() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.open_builtin_prompt(PromptKind::SaveProject);
+        let output = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&output);
+        assert!(
+            texts.iter().any(|text| text.contains("Document (.pgd)")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("Template (.pgt)")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("Untitled.pgd")),
+            "{texts:?}"
+        );
+        let at = text_center(&output, "Template (.pgt)").expect("template type");
+        click_at(&ctx, &mut app, at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let prompt = app.file_prompt.clone().expect("dialog stays open");
+        assert!(prompt.save_as_template);
+        assert_eq!(prompt.file_name, "Untitled.pgt");
+    }
+
+    #[test]
+    fn open_dialog_lists_documents_templates_and_legacy_recent_files() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.recent = vec![
+            "/tmp/form.pgd".to_string(),
+            "/tmp/form.pgt".to_string(),
+            "/tmp/old.pageform".to_string(),
+        ];
+        app.open_builtin_prompt(PromptKind::OpenProject);
+        let output = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&output);
+        for path in ["/tmp/form.pgd", "/tmp/form.pgt", "/tmp/old.pageform"] {
+            assert!(
+                texts.iter().any(|text| text == path),
+                "{path} missing from {texts:?}"
+            );
+        }
+        app.open_builtin_prompt(PromptKind::OpenTemplate);
+        let output = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&output);
+        assert!(
+            texts.iter().any(|text| text == "/tmp/form.pgt"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().all(|text| text != "/tmp/form.pgd"),
+            "{texts:?}"
+        );
     }
 
     #[test]
