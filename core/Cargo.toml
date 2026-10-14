@@ -9,6 +9,8 @@ description = "Document model, geometry, snapping, and fillable PDF export for P
 
 [dependencies]
 pdf-writer = "0.15"
+ron = "0.11"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 lopdf = "0.34"

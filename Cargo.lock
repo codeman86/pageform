@@ -2517,6 +2517,8 @@ version = "0.1.0"
 dependencies = [
  "lopdf",
  "pdf-writer",
+ "ron",
+ "serde",
 ]
 
 [[package]]

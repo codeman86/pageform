@@ -166,10 +166,14 @@ canvas to draw a selection box. Shift-click or Ctrl-click selects several
 items. Edit > Align, the properties panel, and the right-click menu align,
 distribute, and match size.
 Calculations are a placeholder. Margins, header, and footer stay on the canvas.
-File: New opens New Blank Document and New from Template. Those are not
-implemented yet. Open, Save, Save As, and Print are disabled and say Coming soon.
+File: New Blank Document starts a blank page and asks before discarding
+unsaved work. New from Template is not implemented yet. Open, Save, Save As,
+and Print work. Ctrl or Cmd+S saves (or asks for a name the first time).
+Ctrl or Cmd+Shift+S is Save As. Ctrl or Cmd+P prints. The window title shows
+the file name and a * when there are unsaved changes. Exit asks before
+closing a changed file.
 Export PDF asks where to save the PDF. If there is no system file dialog,
-PageForm asks for the folder and file name. Exit closes the window.
+PageForm asks for the folder and file name.
 Edit: Select, Select All, Copy, Cut, Paste, and Delete work. Ctrl or Cmd
 with A, C, X, V, and the Delete key do the same. Preferences is a dialog
 for the theme and radio labels.

@@ -13,6 +13,9 @@ use crate::geom::{
 use crate::grid::GridSize;
 use crate::style::{clean_text, FieldStyle, Margins, Orientation, PageSize, Rgb};
 
+#[path = "project.rs"]
+mod project;
+
 pub const SAMPLE_TEXT_NAME: &str = "full_name";
 pub const SAMPLE_CHECK_NAME: &str = "agree";
 
@@ -85,7 +88,7 @@ pub fn default_size(kind: FieldKind, grid: GridSize) -> (f32, f32) {
 pub struct FieldId(pub u64);
 
 /// Page objects. Designer objects are not form fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FieldKind {
     /// One-line fillable AcroForm text field.
     Text,
@@ -278,6 +281,8 @@ pub struct Document {
     next_id: u64,
     /// Adjacent radio captions. Off hides them on the canvas and in the export.
     radio_labels: bool,
+    /// Not written into the project file. Set by edits, cleared by save and open.
+    dirty: bool,
 }
 
 impl Document {
@@ -292,6 +297,7 @@ impl Document {
             fields: Vec::new(),
             next_id: 1,
             radio_labels: true,
+            dirty: false,
         }
     }
 
@@ -314,7 +320,20 @@ impl Document {
             String::new(),
             Vec::new(),
         );
+        doc.mark_clean();
         doc
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    fn touch(&mut self) {
+        self.dirty = true;
     }
 
     pub fn page(&self) -> Page {
@@ -335,6 +354,7 @@ impl Document {
 
     pub fn set_radio_labels(&mut self, show: bool) {
         self.radio_labels = show;
+        self.touch();
     }
 
     pub fn page_size(&self) -> PageSize {
@@ -372,11 +392,13 @@ impl Document {
     pub fn set_page_size(&mut self, size: PageSize) {
         self.page_size = size;
         self.rebuild_page();
+        self.touch();
     }
 
     pub fn set_orientation(&mut self, orientation: Orientation) {
         self.orientation = orientation;
         self.rebuild_page();
+        self.touch();
     }
 
     pub fn set_margins(&mut self, margins: Margins) {
@@ -387,14 +409,17 @@ impl Document {
             bottom: margins.bottom.clamp(0.0, cap),
             left: margins.left.clamp(0.0, cap),
         };
+        self.touch();
     }
 
     pub fn set_header_text(&mut self, text: &str) {
         self.header_text = clean_text(text, false);
+        self.touch();
     }
 
     pub fn set_footer_text(&mut self, text: &str) {
         self.footer_text = clean_text(text, false);
+        self.touch();
     }
 
     pub fn add_field(&mut self, kind: FieldKind, rect: RectPt) -> FieldId {
@@ -452,6 +477,7 @@ impl Document {
             }
         }
         self.fields[index].rect = rect;
+        self.touch();
     }
 
     /// Place a line from `start` to `end`. A click with no drag uses `add_field`.
@@ -539,7 +565,11 @@ impl Document {
     pub fn remove(&mut self, id: FieldId) -> bool {
         let before = self.fields.len();
         self.fields.retain(|field| field.id != id);
-        self.fields.len() != before
+        let removed = self.fields.len() != before;
+        if removed {
+            self.touch();
+        }
+        removed
     }
 
     pub fn set_name(&mut self, id: FieldId, name: &str) -> Result<(), NameError> {
@@ -551,6 +581,7 @@ impl Document {
             return Err(NameError::Duplicate);
         }
         let kind = self.fields[index].kind;
+        self.touch();
         let old_name = self.fields[index].name.clone();
         if kind == FieldKind::Radio {
             for field in &mut self.fields {
@@ -580,13 +611,16 @@ impl Document {
         } else {
             None
         };
-        let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
-            return Err(NameError::Missing);
-        };
-        field.caption = caption.to_string();
-        if let Some(on_state) = on_state {
-            field.on_state = on_state;
+        {
+            let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+                return Err(NameError::Missing);
+            };
+            field.caption = caption.to_string();
+            if let Some(on_state) = on_state {
+                field.on_state = on_state;
+            }
         }
+        self.touch();
         Ok(())
     }
 
@@ -606,45 +640,51 @@ impl Document {
         {
             return Err(NameError::Control);
         }
-        let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
-            return Err(NameError::Missing);
-        };
-        if field.kind != FieldKind::Dropdown {
-            return Err(NameError::Missing);
+        {
+            let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+                return Err(NameError::Missing);
+            };
+            if field.kind != FieldKind::Dropdown {
+                return Err(NameError::Missing);
+            }
+            field.options = cleaned;
         }
-        field.options = cleaned;
+        self.touch();
         Ok(())
     }
 
     pub fn update_style(&mut self, id: FieldId, edit: impl FnOnce(&mut FieldStyle)) {
-        let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
-            return;
-        };
-        edit(&mut field.style);
-        field.style.font_size = field.style.font_size.clamp(4.0, 96.0);
-        field.style.border_width = field.style.border_width.clamp(0.0, 24.0);
-        field.style.stroke_width = field.style.stroke_width.clamp(0.0, 24.0);
-        field.style.text_color = Rgb::new(
-            field.style.text_color.r,
-            field.style.text_color.g,
-            field.style.text_color.b,
-        );
-        field.style.border_color = Rgb::new(
-            field.style.border_color.r,
-            field.style.border_color.g,
-            field.style.border_color.b,
-        );
-        field.style.stroke_color = Rgb::new(
-            field.style.stroke_color.r,
-            field.style.stroke_color.g,
-            field.style.stroke_color.b,
-        );
-        if let Some(fill) = field.style.fill {
-            field.style.fill = Some(Rgb::new(fill.r, fill.g, fill.b));
+        {
+            let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+                return;
+            };
+            edit(&mut field.style);
+            field.style.font_size = field.style.font_size.clamp(4.0, 96.0);
+            field.style.border_width = field.style.border_width.clamp(0.0, 24.0);
+            field.style.stroke_width = field.style.stroke_width.clamp(0.0, 24.0);
+            field.style.text_color = Rgb::new(
+                field.style.text_color.r,
+                field.style.text_color.g,
+                field.style.text_color.b,
+            );
+            field.style.border_color = Rgb::new(
+                field.style.border_color.r,
+                field.style.border_color.g,
+                field.style.border_color.b,
+            );
+            field.style.stroke_color = Rgb::new(
+                field.style.stroke_color.r,
+                field.style.stroke_color.g,
+                field.style.stroke_color.b,
+            );
+            if let Some(fill) = field.style.fill {
+                field.style.fill = Some(Rgb::new(fill.r, fill.g, fill.b));
+            }
+            if let Some(max) = field.style.max_chars {
+                field.style.max_chars = Some(max.clamp(1, 5000));
+            }
         }
-        if let Some(max) = field.style.max_chars {
-            field.style.max_chars = Some(max.clamp(1, 5000));
-        }
+        self.touch();
     }
 
     pub fn set_tooltip(&mut self, id: FieldId, tooltip: &str) {
@@ -688,6 +728,7 @@ impl Document {
                     member.style.default_value.clear();
                 }
             }
+            self.touch();
             return;
         }
         self.update_style(id, |style| {
@@ -732,6 +773,7 @@ impl Document {
                 edit(&mut member.style);
             }
         }
+        self.touch();
     }
 
     fn map_selection(&mut self, ids: &[FieldId], min: usize, edit: impl FnOnce(&mut [RectPt])) {
@@ -792,16 +834,20 @@ impl Document {
             line,
             style: FieldStyle::for_kind(kind),
         });
+        self.touch();
         id
     }
 
     fn set_line_ends(&mut self, id: FieldId, start: PdfPoint, end: PdfPoint) {
         let page = self.page;
-        let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
-            return;
-        };
-        field.line = Some((start, end));
-        field.rect = line_bounds(start, end, &page);
+        {
+            let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+                return;
+            };
+            field.line = Some((start, end));
+            field.rect = line_bounds(start, end, &page);
+        }
+        self.touch();
     }
 
     fn name_conflicts(&self, id: FieldId, new_name: &str) -> bool {

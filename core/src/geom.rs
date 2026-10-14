@@ -50,14 +50,14 @@ pub fn inset_rect(page: &Page, top: f32, right: f32, bottom: f32, left: f32) -> 
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PdfPoint {
     pub x: f32,
     pub y: f32,
 }
 
 /// Axis-aligned rectangle. `x` and `y` are the bottom-left corner in PDF points.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RectPt {
     pub x: f32,
     pub y: f32,

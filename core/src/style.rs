@@ -8,7 +8,7 @@ use crate::document::DATE_HINT;
 use crate::FieldKind;
 
 /// RGB in 0–1, the same range PDF color operators use.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Rgb {
     pub r: f32,
     pub g: f32,
@@ -41,7 +41,7 @@ impl Rgb {
 }
 
 /// `/Q` quadding for variable text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum TextAlign {
     #[default]
     Left,
@@ -62,7 +62,7 @@ impl TextAlign {
 }
 
 /// Standard fonts that a PDF can name without embedding a file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum FontFamily {
     #[default]
     Helvetica,
@@ -112,7 +112,7 @@ impl FontFamily {
 }
 
 /// `/BS /S` border style.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BorderStyleKind {
     #[default]
     Solid,
@@ -143,7 +143,7 @@ impl BorderStyleKind {
 }
 
 /// Checkbox mark. Exported as `/MK /CA` (ZapfDingbats) and drawn in `/AP`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CheckboxStyle {
     #[default]
     Check,
@@ -189,7 +189,7 @@ impl CheckboxStyle {
 }
 
 /// Paper sizes the properties panel can apply. Portrait point sizes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PageSize {
     #[default]
     Letter,
@@ -218,7 +218,7 @@ impl PageSize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Orientation {
     #[default]
     Portrait,
@@ -235,7 +235,7 @@ impl Orientation {
 }
 
 /// Canvas print-safe inset. Not written into the PDF.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Margins {
     pub top: f32,
     pub right: f32,
@@ -255,7 +255,7 @@ impl Default for Margins {
 }
 
 /// Values the properties panel edits on one item.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FieldStyle {
     pub tooltip: String,
     pub required: bool,

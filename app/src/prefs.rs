@@ -5,6 +5,22 @@
 
 pub const OPEN_KEY: &str = "pageform-properties-open";
 pub const PIN_KEY: &str = "pageform-properties-pinned";
+pub const RECENT_KEY: &str = "pageform-recent";
+
+pub fn parse_recent(stored: Option<&str>) -> Vec<String> {
+    stored
+        .unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(8)
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn format_recent(paths: &[String]) -> String {
+    paths.iter().take(8).cloned().collect::<Vec<_>>().join("\n")
+}
 
 pub fn is_open(stored: Option<&str>) -> bool {
     matches!(stored, Some("open"))

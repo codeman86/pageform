@@ -135,8 +135,37 @@ enum Drag {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnsavedChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+enum NativePick {
+    Path(std::path::PathBuf),
+    Cancel,
+    Fallback,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    ExportPdf,
+    SaveProject,
+    OpenProject,
+}
+
 #[derive(Clone)]
-struct ExportPrompt {
+enum PendingFileAction {
+    NewBlank,
+    Open,
+    OpenPath(String),
+    Exit,
+}
+
+#[derive(Clone)]
+struct FilePrompt {
+    kind: PromptKind,
     directory: String,
     file_name: String,
     /// The chosen path already exists. The next Save replaces it.
@@ -170,6 +199,14 @@ struct PageFormApp {
     name_for: Option<FieldId>,
     name_error: Option<String>,
     export_path: String,
+    project_path: Option<String>,
+    recent: Vec<String>,
+    unsaved: Option<PendingFileAction>,
+    after_save: Option<PendingFileAction>,
+    allow_close: bool,
+    last_title: String,
+    /// A project save just succeeded. Continue New, Open, or Exit afterwards.
+    saved_follow_up: bool,
     status: String,
     /// Status text last observed, so a change restarts the fade timer.
     status_seen: String,
@@ -188,7 +225,7 @@ struct PageFormApp {
     show_preferences: bool,
     show_about: bool,
     show_help: bool,
-    export_prompt: Option<ExportPrompt>,
+    file_prompt: Option<FilePrompt>,
 }
 
 impl PageFormApp {
@@ -202,6 +239,11 @@ impl PageFormApp {
         let stored = storage.and_then(|storage| storage.get_string(crate::theme::STORAGE_KEY));
         let open = storage.and_then(|storage| storage.get_string(crate::prefs::OPEN_KEY));
         let pinned = storage.and_then(|storage| storage.get_string(crate::prefs::PIN_KEY));
+        let recent = crate::prefs::parse_recent(
+            storage
+                .and_then(|storage| storage.get_string(crate::prefs::RECENT_KEY))
+                .as_deref(),
+        );
         Self {
             view: ViewTransform::new(page.height),
             doc,
@@ -228,6 +270,13 @@ impl PageFormApp {
             name_for: None,
             name_error: None,
             export_path: "sample-form.pdf".to_string(),
+            project_path: None,
+            recent,
+            unsaved: None,
+            after_save: None,
+            allow_close: false,
+            last_title: String::new(),
+            saved_follow_up: false,
             status: if demo {
                 "Sample page with full_name and agree".to_string()
             } else {
@@ -252,7 +301,7 @@ impl PageFormApp {
             show_preferences: false,
             show_about: false,
             show_help: false,
-            export_prompt: None,
+            file_prompt: None,
         }
     }
 
@@ -377,52 +426,146 @@ impl PageFormApp {
         }
     }
 
-    fn export_current(&mut self) {
-        if !native_save_dialog_available() {
-            self.open_builtin_export();
-            return;
+    fn window_title(&self) -> String {
+        let name = self
+            .project_path
+            .as_ref()
+            .and_then(|path| std::path::Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("Untitled");
+        if self.doc.is_dirty() {
+            format!("{name} * - PageForm")
+        } else {
+            format!("{name} - PageForm")
         }
-        let started = std::time::Instant::now();
-        let chosen = rfd::FileDialog::new()
-            .set_title("Export PDF")
-            .add_filter("PDF", &["pdf"])
-            .set_file_name(export_file_name(&self.export_path))
-            .save_file();
-        let Some(mut path) = chosen else {
-            // A missing portal returns immediately. A person cancelling the
-            // dialog takes longer than that.
-            if started.elapsed() < std::time::Duration::from_millis(500) {
-                self.open_builtin_export();
-            } else {
-                self.status = "Export cancelled".to_string();
-            }
-            return;
-        };
-        if path.extension().is_none() {
-            path.set_extension("pdf");
-        }
-        self.export_path = path.display().to_string();
-        self.write_export();
     }
 
-    fn open_builtin_export(&mut self) {
-        let name = export_file_name(&self.export_path);
-        let directory = std::path::Path::new(&self.export_path)
-            .parent()
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map(|dir| dir.display().to_string())
-            .filter(|dir| !dir.is_empty())
-            .unwrap_or_else(default_export_dir);
-        self.export_prompt = Some(ExportPrompt {
+    fn request_new_blank(&mut self) {
+        self.ask_or_run(PendingFileAction::NewBlank);
+    }
+
+    fn new_blank(&mut self) {
+        self.doc = Document::letter();
+        self.project_path = None;
+        self.selection.clear();
+        self.clipboard.clear();
+        self.paste_steps = 0;
+        self.inline = None;
+        self.drag = None;
+        self.fitted = false;
+        self.navigated = false;
+        self.view.page_height = self.doc.page().height;
+        self.status = "Blank US Letter page".to_string();
+    }
+
+    fn ask_or_run(&mut self, action: PendingFileAction) {
+        if self.doc.is_dirty() {
+            self.unsaved = Some(action);
+        } else {
+            self.run_file_action(action);
+        }
+    }
+
+    fn run_file_action(&mut self, action: PendingFileAction) {
+        match action {
+            PendingFileAction::NewBlank => self.new_blank(),
+            PendingFileAction::Open => self.begin_open(),
+            PendingFileAction::OpenPath(path) => {
+                self.read_project_file(std::path::Path::new(&path))
+            }
+            PendingFileAction::Exit => self.allow_close = true,
+        }
+    }
+
+    fn export_current(&mut self) {
+        match pick_native(
+            true,
+            "Export PDF",
+            "PDF",
+            "pdf",
+            &export_file_name(&self.export_path),
+        ) {
+            NativePick::Path(mut path) => {
+                if path.extension().is_none() {
+                    path.set_extension("pdf");
+                }
+                self.export_path = path.display().to_string();
+                self.write_export();
+            }
+            NativePick::Cancel => self.status = "Export cancelled".to_string(),
+            NativePick::Fallback => self.open_builtin_prompt(PromptKind::ExportPdf),
+        }
+    }
+
+    fn begin_open(&mut self) {
+        match pick_native(false, "Open PageForm", "PageForm", "pageform", "") {
+            NativePick::Path(path) => self.read_project_file(&path),
+            NativePick::Cancel => self.status = "Open cancelled".to_string(),
+            NativePick::Fallback => self.open_builtin_prompt(PromptKind::OpenProject),
+        }
+    }
+
+    fn save_project(&mut self) {
+        if let Some(path) = self.project_path.clone() {
+            self.write_project_file(std::path::Path::new(&path));
+        } else {
+            self.save_project_as();
+        }
+    }
+
+    fn save_project_as(&mut self) {
+        let name = self
+            .project_path
+            .as_deref()
+            .map(export_file_name)
+            .unwrap_or_else(|| "Untitled.pageform".to_string());
+        match pick_native(true, "Save PageForm", "PageForm", "pageform", &name) {
+            NativePick::Path(path) => self.write_project_file(&ensure_extension(path, "pageform")),
+            NativePick::Cancel => {
+                self.after_save = None;
+                self.status = "Save cancelled".to_string();
+            }
+            NativePick::Fallback => self.open_builtin_prompt(PromptKind::SaveProject),
+        }
+    }
+
+    fn open_builtin_prompt(&mut self, kind: PromptKind) {
+        let (directory, file_name, status) = match kind {
+            PromptKind::ExportPdf => (
+                parent_dir(&self.export_path),
+                export_file_name(&self.export_path),
+                "Choose where to save the PDF.",
+            ),
+            PromptKind::SaveProject => {
+                let name = self
+                    .project_path
+                    .as_deref()
+                    .map(export_file_name)
+                    .unwrap_or_else(|| "Untitled.pageform".to_string());
+                let directory = self
+                    .project_path
+                    .as_deref()
+                    .map(parent_dir)
+                    .unwrap_or_else(default_export_dir);
+                (directory, name, "Choose where to save the project.")
+            }
+            PromptKind::OpenProject => (
+                default_export_dir(),
+                String::new(),
+                "Enter the path of a .pageform file.",
+            ),
+        };
+        self.file_prompt = Some(FilePrompt {
+            kind,
             directory,
-            file_name: name,
+            file_name,
             replace: false,
         });
-        self.status = "Choose where to save the PDF.".to_string();
+        self.status = status.to_string();
     }
 
     fn export_dialog(&mut self, ctx: &egui::Context) {
-        let Some(prompt) = self.export_prompt.clone() else {
+        let Some(prompt) = self.file_prompt.clone() else {
             return;
         };
         let mut prompt = prompt;
@@ -430,28 +573,69 @@ impl PageFormApp {
         let original_name = prompt.file_name.clone();
         let mut close = false;
         let mut save = false;
-        let response = egui::Modal::new(egui::Id::new("pageform_export")).show(ctx, |ui| {
-            ui.set_min_width(460.0);
-            ui.heading("Export PDF");
+        let mut open_recent: Option<String> = None;
+        let kind = prompt.kind;
+        let recent = self.recent.clone();
+        let response = egui::Modal::new(egui::Id::new("pageform_file")).show(ctx, |ui| {
+            ui.set_min_width(480.0);
+            ui.heading(match kind {
+                PromptKind::ExportPdf => "Export PDF",
+                PromptKind::SaveProject => "Save PageForm",
+                PromptKind::OpenProject => "Open PageForm",
+            });
             ui.add_space(8.0);
-            ui.label("Folder");
-            ui.add(egui::TextEdit::singleline(&mut prompt.directory).desired_width(f32::INFINITY));
-            ui.add_space(6.0);
-            ui.label("File name");
-            ui.add(egui::TextEdit::singleline(&mut prompt.file_name).desired_width(f32::INFINITY));
-            let path = export_file_path(&prompt.directory, &prompt.file_name);
-            ui.add_space(6.0);
-            ui.label(path.display().to_string());
-            if prompt.replace {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 160, 80),
-                    "That file already exists. Save again to replace it.",
+            if kind == PromptKind::OpenProject {
+                ui.label("Path");
+                ui.add(
+                    egui::TextEdit::singleline(&mut prompt.file_name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("/path/to/form.pageform"),
                 );
+                if !recent.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label("Recent");
+                    for path in &recent {
+                        if ui.button(path).clicked() {
+                            open_recent = Some(path.clone());
+                        }
+                    }
+                }
+            } else {
+                ui.label("Folder");
+                ui.add(
+                    egui::TextEdit::singleline(&mut prompt.directory).desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+                ui.label("File name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut prompt.file_name).desired_width(f32::INFINITY),
+                );
+                let ext = if kind == PromptKind::ExportPdf {
+                    "pdf"
+                } else {
+                    "pageform"
+                };
+                let path = export_file_path(&prompt.directory, &prompt.file_name);
+                let path = ensure_extension(path, ext);
+                ui.add_space(6.0);
+                ui.label(path.display().to_string());
+                if prompt.replace {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 160, 80),
+                        "That file already exists. Save again to replace it.",
+                    );
+                }
             }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let label = if prompt.replace { "Replace" } else { "Save" };
+                let label = if kind == PromptKind::OpenProject {
+                    "Open"
+                } else if prompt.replace {
+                    "Replace"
+                } else {
+                    "Save"
+                };
                 if ui.button(label).clicked() {
                     save = true;
                 }
@@ -463,24 +647,174 @@ impl PageFormApp {
         if prompt.directory != original_dir || prompt.file_name != original_name {
             prompt.replace = false;
         }
+        if let Some(path) = open_recent {
+            self.file_prompt = None;
+            self.read_project_file(std::path::Path::new(&path));
+            return;
+        }
         if close || response.should_close() {
-            self.export_prompt = None;
-            self.status = "Export cancelled".to_string();
+            self.file_prompt = None;
+            self.after_save = None;
+            self.status = match kind {
+                PromptKind::OpenProject => "Open cancelled".to_string(),
+                PromptKind::SaveProject => "Save cancelled".to_string(),
+                PromptKind::ExportPdf => "Export cancelled".to_string(),
+            };
             return;
         }
         if save {
-            let path = export_file_path(&prompt.directory, &prompt.file_name);
-            if path.exists() && !prompt.replace {
-                prompt.replace = true;
-                self.export_prompt = Some(prompt);
+            if kind == PromptKind::OpenProject {
+                let path = prompt.file_name.trim().to_string();
+                self.file_prompt = None;
+                if path.is_empty() {
+                    self.status = "Enter a file path to open".to_string();
+                } else {
+                    self.read_project_file(std::path::Path::new(&path));
+                }
                 return;
             }
-            self.export_prompt = None;
-            self.export_path = path.display().to_string();
-            self.write_export();
+            let ext = if kind == PromptKind::ExportPdf {
+                "pdf"
+            } else {
+                "pageform"
+            };
+            let path =
+                ensure_extension(export_file_path(&prompt.directory, &prompt.file_name), ext);
+            if path.exists() && !prompt.replace {
+                prompt.replace = true;
+                self.file_prompt = Some(prompt);
+                return;
+            }
+            self.file_prompt = None;
+            match kind {
+                PromptKind::ExportPdf => {
+                    self.export_path = path.display().to_string();
+                    self.write_export();
+                }
+                PromptKind::SaveProject => self.write_project_file(&path),
+                PromptKind::OpenProject => {}
+            }
             return;
         }
-        self.export_prompt = Some(prompt);
+        self.file_prompt = Some(prompt);
+    }
+
+    fn write_project_file(&mut self, path: &std::path::Path) {
+        match self.doc.to_project_ron() {
+            Ok(text) => match std::fs::write(path, text) {
+                Ok(()) => {
+                    self.project_path = Some(path.display().to_string());
+                    self.doc.mark_clean();
+                    self.remember_recent(path);
+                    self.status = format!("Saved {}", path.display());
+                    self.saved_follow_up = true;
+                }
+                Err(err) => {
+                    self.after_save = None;
+                    self.status = format!("Could not write {}: {err}", path.display());
+                }
+            },
+            Err(err) => {
+                self.after_save = None;
+                self.status = format!("Could not save: {err}");
+            }
+        }
+    }
+
+    fn read_project_file(&mut self, path: &std::path::Path) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.status = format!("Could not open {}: {err}", path.display());
+                return;
+            }
+        };
+        match Document::from_project_ron(&text) {
+            Ok(doc) => {
+                self.doc = doc;
+                self.project_path = Some(path.display().to_string());
+                self.selection.clear();
+                self.inline = None;
+                self.drag = None;
+                self.fitted = false;
+                self.navigated = false;
+                self.view.page_height = self.doc.page().height;
+                self.remember_recent(path);
+                self.status = format!("Opened {}", path.display());
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
+    fn remember_recent(&mut self, path: &std::path::Path) {
+        let text = path.display().to_string();
+        self.recent.retain(|item| item != &text);
+        self.recent.insert(0, text);
+        self.recent.truncate(8);
+        self.persist_panel = true;
+    }
+
+    fn print_current(&mut self) {
+        let bytes = match export_pdf(&self.doc) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.status = format!("Print failed: {err}");
+                return;
+            }
+        };
+        let path = std::env::temp_dir().join(format!("pageform-print-{}.pdf", std::process::id()));
+        if let Err(err) = std::fs::write(&path, bytes) {
+            self.status = format!("Could not write a temporary PDF: {err}");
+            return;
+        }
+        self.status = send_to_printer(&path);
+    }
+
+    fn unsaved_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.unsaved.clone() else {
+            return;
+        };
+        let name = self
+            .project_path
+            .as_deref()
+            .map(export_file_name)
+            .unwrap_or_else(|| "Untitled".to_string());
+        let mut choice: Option<UnsavedChoice> = None;
+        let response = egui::Modal::new(egui::Id::new("pageform_unsaved")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.heading("Unsaved changes");
+            ui.add_space(8.0);
+            ui.label(format!("Save changes to {name} before continuing?"));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(UnsavedChoice::Save);
+                }
+                if ui.button("Don't Save").clicked() {
+                    choice = Some(UnsavedChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(UnsavedChoice::Cancel);
+                }
+            });
+        });
+        if response.should_close() {
+            choice = Some(UnsavedChoice::Cancel);
+        }
+        match choice {
+            Some(UnsavedChoice::Save) => {
+                self.unsaved = None;
+                self.after_save = Some(action);
+                self.save_project();
+            }
+            Some(UnsavedChoice::Discard) => {
+                self.unsaved = None;
+                self.doc.mark_clean();
+                self.run_file_action(action);
+            }
+            Some(UnsavedChoice::Cancel) => self.unsaved = None,
+            None => {}
+        }
     }
 
     fn write_export(&mut self) {
@@ -709,7 +1043,44 @@ impl PageFormApp {
                 continue;
             }
             match *label {
-                "Open" | "Save" | "Save As" | "Print" => coming_soon_item(ui, label),
+                "Open" => {
+                    if ui.button("Open").clicked() {
+                        self.ask_or_run(PendingFileAction::Open);
+                        ui.close();
+                    }
+                    if !self.recent.is_empty() {
+                        ui.menu_button("Open Recent", |ui| {
+                            ui.set_min_width(280.0);
+                            for path in self.recent.clone() {
+                                if ui.button(&path).clicked() {
+                                    self.ask_or_run(PendingFileAction::OpenPath(path));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                }
+                "Save" => {
+                    let shortcut = command_shortcut(ui, egui::Key::S);
+                    if menu_command(ui, "Save", Some(&shortcut), false) {
+                        self.save_project();
+                    }
+                }
+                "Save As" => {
+                    let shortcut = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        egui::Key::S,
+                    ));
+                    if menu_command(ui, "Save As", Some(&shortcut), false) {
+                        self.save_project_as();
+                    }
+                }
+                "Print" => {
+                    let shortcut = command_shortcut(ui, egui::Key::P);
+                    if menu_command(ui, "Print", Some(&shortcut), false) {
+                        self.print_current();
+                    }
+                }
                 "Export PDF" => {
                     let tip = format!(
                         "Write a fillable PDF to {}. Guides and margins stay on the canvas.",
@@ -723,19 +1094,12 @@ impl PageFormApp {
                 }
                 "Exit" => {
                     if ui.button(*label).clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.ask_or_run(PendingFileAction::Exit);
+                        ui.close();
                     }
                 }
                 "New" => {
-                    ui.menu_button("New", |ui| {
-                        ui.set_min_width(180.0);
-                        for item in NEW_MENU {
-                            if ui.button(*item).clicked() {
-                                self.mark_not_implemented(item);
-                                ui.close_kind(egui::UiKind::Menu);
-                            }
-                        }
-                    });
+                    ui.menu_button("New", |ui| self.new_menu(ui));
                 }
                 other => self.stub_item(ui, other),
             }
@@ -897,6 +1261,25 @@ impl PageFormApp {
                 }
             }
         }
+    }
+
+    fn new_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(180.0);
+        for item in NEW_MENU {
+            if ui.button(*item).clicked() {
+                if *item == "New Blank Document" {
+                    self.request_new_blank();
+                } else {
+                    self.mark_not_implemented(item);
+                }
+                ui.close();
+            }
+        }
+    }
+
+    fn toolbar_new(&mut self, ui: &mut egui::Ui) {
+        let response = icons::icon_menu(ui, icons::Icon::New, false, "New");
+        egui::Popup::menu(&response).show(|ui| self.new_menu(ui));
     }
 
     fn stub_item(&mut self, ui: &mut egui::Ui, label: &str) {
@@ -1215,10 +1598,30 @@ impl PageFormApp {
     fn toolbar_documents(&mut self, ui: &mut egui::Ui) {
         for label in icons::DOC_COMMANDS {
             match *label {
-                "New" => self.icon_choices(ui, icons::Icon::New, false, "New", NEW_MENU),
-                "Open" => coming_soon_icon(ui, icons::Icon::Open),
-                "Save" => coming_soon_icon(ui, icons::Icon::Save),
-                "Print" => coming_soon_icon(ui, icons::Icon::Print),
+                "New" => self.toolbar_new(ui),
+                "Open"
+                    if icons::icon_button(
+                        ui,
+                        icons::Icon::Open,
+                        false,
+                        "Open a .pageform file",
+                    )
+                    .clicked() =>
+                {
+                    self.ask_or_run(PendingFileAction::Open);
+                }
+                "Save"
+                    if icons::icon_button(ui, icons::Icon::Save, false, "Save the project")
+                        .clicked() =>
+                {
+                    self.save_project();
+                }
+                "Print"
+                    if icons::icon_button(ui, icons::Icon::Print, false, "Print the page")
+                        .clicked() =>
+                {
+                    self.print_current();
+                }
                 _ => {}
             }
         }
@@ -1395,26 +1798,6 @@ impl PageFormApp {
         };
     }
 
-    fn icon_choices(
-        &mut self,
-        ui: &mut egui::Ui,
-        icon: icons::Icon,
-        selected: bool,
-        tip: &str,
-        items: &[&str],
-    ) {
-        let response = icons::icon_menu(ui, icon, selected, tip);
-        egui::Popup::menu(&response).show(|ui| {
-            ui.set_min_width(180.0);
-            for label in items {
-                if ui.button(*label).clicked() {
-                    self.mark_not_implemented(label);
-                    ui.close();
-                }
-            }
-        });
-    }
-
     fn fit(&mut self, rect: Rect) {
         let margin = 28.0;
         let page = self.doc.page();
@@ -1477,7 +1860,14 @@ impl PageFormApp {
                 self.drag = None;
                 self.tool = Tool::Select;
             }
-            if command && ctx.input(|input| input.key_pressed(Key::A)) {
+            let shift = ctx.input(|input| input.modifiers.shift);
+            if command && shift && ctx.input(|input| input.key_pressed(Key::S)) {
+                self.save_project_as();
+            } else if command && ctx.input(|input| input.key_pressed(Key::S)) {
+                self.save_project();
+            } else if command && ctx.input(|input| input.key_pressed(Key::P)) {
+                self.print_current();
+            } else if command && ctx.input(|input| input.key_pressed(Key::A)) {
                 self.select_all();
             } else if command && ctx.input(|input| input.key_pressed(Key::C)) {
                 self.copy_selection();
@@ -2395,6 +2785,20 @@ impl eframe::App for PageFormApp {
         if let Some(remaining) = self.fade_status(now) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
         }
+        let title = self.window_title();
+        if title != self.last_title {
+            self.last_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.allow_close
+            && self.doc.is_dirty()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.unsaved.is_none() {
+                self.unsaved = Some(PendingFileAction::Exit);
+            }
+        }
         crate::theme::apply(ctx, self.dark);
         if self.persist_theme || self.persist_panel {
             if let Some(storage) = frame.storage_mut() {
@@ -2437,6 +2841,16 @@ impl eframe::App for PageFormApp {
         self.about_dialog(ctx);
         self.help_window(ctx);
         self.export_dialog(ctx);
+        self.unsaved_dialog(ctx);
+        if self.saved_follow_up {
+            self.saved_follow_up = false;
+            if let Some(action) = self.after_save.take() {
+                self.run_file_action(action);
+            }
+        }
+        if self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 }
 
@@ -2452,6 +2866,10 @@ fn write_preferences(app: &PageFormApp, storage: &mut dyn eframe::Storage) {
     storage.set_string(
         crate::prefs::PIN_KEY,
         crate::prefs::pin_value(app.properties_pinned).to_owned(),
+    );
+    storage.set_string(
+        crate::prefs::RECENT_KEY,
+        crate::prefs::format_recent(&app.recent),
     );
 }
 
@@ -2592,7 +3010,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File > New lists New Blank Document and New from Template. Those are not implemented yet. Open, Save, Save As, and Print are coming soon and stay disabled. File > Export PDF asks where to save a PDF. If the computer has no system file dialog, PageForm asks for the folder and file name in its own window. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
+        "File > New Blank Document starts a blank page and asks before discarding unsaved work. New from Template is not implemented yet. Open, Save, Save As, and Print work. Save uses Ctrl or Cmd+S, Save As uses Ctrl or Cmd+Shift+S, and Print uses Ctrl or Cmd+P. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent lists the last files. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print writes a temporary PDF and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
     ),
     (
         "Is there a list box?",
@@ -2641,20 +3059,142 @@ fn placeholder_icon(ui: &mut egui::Ui) {
     );
 }
 
+fn parent_dir(path: &str) -> String {
+    std::path::Path::new(path)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.display().to_string())
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(default_export_dir)
+}
+
+fn ensure_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathBuf {
+    if path.extension().is_none() {
+        path.set_extension(ext);
+    }
+    path
+}
+
+fn pick_native(
+    save: bool,
+    title: &str,
+    filter_name: &str,
+    extension: &str,
+    file_name: &str,
+) -> NativePick {
+    if !native_save_dialog_available() {
+        return NativePick::Fallback;
+    }
+    let started = std::time::Instant::now();
+    let dialog = rfd::FileDialog::new()
+        .set_title(title)
+        .add_filter(filter_name, &[extension]);
+    let dialog = if file_name.is_empty() {
+        dialog
+    } else {
+        dialog.set_file_name(file_name)
+    };
+    let chosen = if save {
+        dialog.save_file()
+    } else {
+        dialog.pick_file()
+    };
+    match chosen {
+        Some(path) => NativePick::Path(path),
+        None if started.elapsed() < std::time::Duration::from_millis(500) => NativePick::Fallback,
+        None => NativePick::Cancel,
+    }
+}
+
+fn send_to_printer(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        return send_to_printer_windows(path);
+    }
+    #[cfg(not(windows))]
+    {
+        send_to_printer_unix(path)
+    }
+}
+
+#[cfg(windows)]
+fn send_to_printer_windows(path: &std::path::Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    let operation: Vec<u16> = std::ffi::OsStr::new("print")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let code = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if (code as isize) <= 32 {
+        format!(
+            "Windows could not print {} (ShellExecute returned {}). Export a PDF and print it from a viewer.",
+            path.display(),
+            code as isize
+        )
+    } else {
+        format!("Sent {} to the printer.", path.display())
+    }
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+    ) -> *mut std::ffi::c_void;
+}
+
+#[cfg(not(windows))]
+fn send_to_printer_unix(path: &std::path::Path) -> String {
+    if unix_command("lp") {
+        match std::process::Command::new("lp").arg(path).status() {
+            Ok(status) if status.success() => format!("Sent {} to the printer.", path.display()),
+            Ok(status) => format!(
+                "lp could not print {} ({status}). Export a PDF and print it from a viewer.",
+                path.display()
+            ),
+            Err(err) => format!("Could not run lp: {err}"),
+        }
+    } else if unix_command("xdg-open") {
+        match std::process::Command::new("xdg-open").arg(path).spawn() {
+            Ok(_) => format!("Opened {} so you can print it.", path.display()),
+            Err(err) => format!("Could not open the PDF: {err}"),
+        }
+    } else {
+        format!(
+            "No print command found. Install lp or xdg-open, or export {} and print it from a viewer.",
+            path.display()
+        )
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_command(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
 fn command_shortcut(ui: &egui::Ui, key: egui::Key) -> String {
     ui.ctx()
         .format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key))
-}
-
-fn coming_soon_item(ui: &mut egui::Ui, label: &str) {
-    ui.add_enabled(false, egui::Button::new(label))
-        .on_disabled_hover_text("Coming soon");
-}
-
-fn coming_soon_icon(ui: &mut egui::Ui, icon: icons::Icon) {
-    ui.add_enabled_ui(false, |ui| {
-        icons::icon_button(ui, icon, false, "Coming soon").on_disabled_hover_text("Coming soon");
-    });
 }
 
 fn marquee_rect(start: PdfPoint, current: PdfPoint) -> RectPt {
@@ -3465,10 +4005,37 @@ mod tests {
         assert_eq!(export_file_name("sample-form.pdf"), "sample-form.pdf");
         assert_eq!(export_file_name(""), "form.pdf");
         let mut app = PageFormApp::new(false, None);
-        app.open_builtin_export();
-        let prompt = app.export_prompt.expect("builtin dialog");
+        app.open_builtin_prompt(PromptKind::ExportPdf);
+        let prompt = app.file_prompt.expect("builtin dialog");
         assert_eq!(prompt.file_name, "sample-form.pdf");
         assert!(!prompt.replace);
+    }
+
+    #[test]
+    fn save_then_open_restores_the_project_and_clears_the_dirty_flag() {
+        let path = std::env::temp_dir().join(format!(
+            "pageform-roundtrip-{}.pageform",
+            std::process::id()
+        ));
+        let mut app = PageFormApp::new(false, None);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.doc.set_default_value(id, "Ada");
+        assert!(app.doc.is_dirty());
+        assert!(app.window_title().contains('*'));
+        app.write_project_file(&path);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.project_path.as_deref(), Some(path.to_str().unwrap()));
+        app.doc.set_header_text("Changed");
+        assert!(app.doc.is_dirty());
+        app.read_project_file(&path);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.doc.header_text(), "Header");
+        assert_eq!(app.doc.fields().len(), 1);
+        assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -3845,11 +4412,6 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = PageFormApp::new(false, None);
 
-        let before = app.status.clone();
-        click_menu(&ctx, &mut app, "Open", |app, ui| app.file_menu(ui));
-        click_menu(&ctx, &mut app, "Save As", |app, ui| app.file_menu(ui));
-        click_menu(&ctx, &mut app, "Print", |app, ui| app.file_menu(ui));
-        assert_eq!(app.status, before, "Open, Save As, and Print stay disabled");
         click_menu(&ctx, &mut app, "Select All", |app, ui| app.edit_menu(ui));
         assert_eq!(app.status, "Selected 0 items");
         click_menu(&ctx, &mut app, "Paste", |app, ui| app.edit_menu(ui));
