@@ -88,8 +88,9 @@ pub fn canvas_colors(dark: bool) -> CanvasColors {
             check_stroke: Color32::from_rgb(32, 32, 36),
             field_fill: Color32::WHITE,
             field_text: Color32::from_rgb(50, 58, 72),
-            label_text: Color32::from_rgb(232, 236, 242),
-            shape_stroke: Color32::from_rgb(214, 220, 228),
+            // Brighter and warmer than the gray grid dots so lines, squares, and labels stay readable.
+            label_text: Color32::from_rgb(255, 248, 230),
+            shape_stroke: Color32::from_rgb(255, 196, 120),
             handle_fill: Color32::WHITE,
             margin: Color32::from_rgb(220, 146, 146),
         }
@@ -109,8 +110,8 @@ pub fn canvas_colors(dark: bool) -> CanvasColors {
             check_stroke: Color32::from_rgb(32, 32, 36),
             field_fill: Color32::WHITE,
             field_text: Color32::from_rgb(50, 58, 72),
-            label_text: Color32::from_rgb(50, 58, 72),
-            shape_stroke: Color32::from_rgb(36, 48, 72),
+            label_text: Color32::from_rgb(28, 32, 40),
+            shape_stroke: Color32::from_rgb(20, 24, 32),
             handle_fill: Color32::WHITE,
             margin: Color32::from_rgb(186, 112, 112),
         }

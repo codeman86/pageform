@@ -164,6 +164,10 @@ struct PageFormApp {
     persist_panel: bool,
     context_field: Option<FieldId>,
     inline: Option<InlineEdit>,
+    status_before_inline: Option<String>,
+    /// False until the user pans or zooms, so the page stays centered as the canvas resizes.
+    navigated: bool,
+    canvas_size: Option<Vec2>,
     show_preferences: bool,
     show_about: bool,
     show_help: bool,
@@ -216,6 +220,9 @@ impl PageFormApp {
             persist_panel: false,
             context_field: None,
             inline: None,
+            status_before_inline: None,
+            navigated: false,
+            canvas_size: None,
             show_preferences: false,
             show_about: false,
             show_help: false,
@@ -246,13 +253,9 @@ impl PageFormApp {
     }
 
     fn place_rect(&self, start: PdfPoint, current: PdfPoint, kind: FieldKind) -> RectPt {
-        let (x0, y0) = self.view.pdf_to_screen(start);
-        let (x1, y1) = self.view.pdf_to_screen(current);
-        let dx = x0 - x1;
-        let dy = y0 - y1;
         let page = self.doc.page();
         let square = self.tool == Tool::Square && kind == FieldKind::Rectangle;
-        if dx * dx + dy * dy < 16.0 {
+        if is_click(&self.view, start, current) {
             let (mut w, mut h) = default_size(kind, self.grid_size);
             if square {
                 let side = w.min(h);
@@ -268,6 +271,33 @@ impl PageFormApp {
     }
 
     fn export_current(&mut self) {
+        let fallback = if self.export_path.trim().is_empty() {
+            "form.pdf"
+        } else {
+            &self.export_path
+        };
+        let name = std::path::Path::new(fallback)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("form.pdf");
+        let Some(mut path) = rfd::FileDialog::new()
+            .set_title("Export PDF")
+            .add_filter("PDF", &["pdf"])
+            .set_file_name(name)
+            .save_file()
+        else {
+            self.status = "Export cancelled".to_string();
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("pdf");
+        }
+        self.export_path = path.display().to_string();
+        self.write_export();
+    }
+
+    fn write_export(&mut self) {
         if self.export_path.trim().is_empty() {
             self.status = "Enter a file path to export".to_string();
             return;
@@ -365,6 +395,9 @@ impl PageFormApp {
         });
         self.name_for = None;
         self.sync_field_buffers();
+        if self.status_before_inline.is_none() {
+            self.status_before_inline = Some(self.status.clone());
+        }
         self.status = if multiline {
             "Editing text. Enter finishes, Shift+Enter adds a line, Esc cancels.".to_string()
         } else {
@@ -414,11 +447,21 @@ impl PageFormApp {
                 InlineTarget::DefaultValue => self.value_buf = edit.original,
             }
         }
+        self.clear_inline_status();
     }
 
     fn finish_inline(&mut self) {
         self.apply_inline();
         self.inline = None;
+        self.clear_inline_status();
+    }
+
+    fn clear_inline_status(&mut self) {
+        if let Some(previous) = self.status_before_inline.take() {
+            self.status = previous;
+        } else if self.status.starts_with("Editing text.") {
+            self.status.clear();
+        }
     }
 
     /// Sidebar edits land in the canvas editor when both show the same item.
@@ -923,13 +966,13 @@ impl PageFormApp {
             ui,
             icons::Icon::Shapes,
             self.tool == Tool::Square || self.tool == Tool::Rectangle,
-            "Shapes",
+            "Click to place a default shape, or drag to size it.",
         );
         egui::Popup::menu(&response).show(|ui| {
             ui.set_min_width(160.0);
             if ui
                 .selectable_label(self.tool == Tool::Square, "Square")
-                .on_hover_text("Draw a square. The sides stay equal.")
+                .on_hover_text("Click to place a default square, or drag to size it. The sides stay equal.")
                 .clicked()
             {
                 self.tool = Tool::Square;
@@ -937,7 +980,9 @@ impl PageFormApp {
             }
             if ui
                 .selectable_label(self.tool == Tool::Rectangle, "Rectangle")
-                .on_hover_text("Draw a rectangle. Width and height are independent.")
+                .on_hover_text(
+                    "Click to place a default rectangle, or drag to size it. Width and height are independent.",
+                )
                 .clicked()
             {
                 self.tool = Tool::Rectangle;
@@ -982,7 +1027,7 @@ impl PageFormApp {
             icons::Icon::Sun
         };
         let theme_tip = format!(
-            "{} — {}",
+            "{} - {}",
             crate::theme::toggle_label(self.dark),
             crate::theme::toggle_tip(self.dark)
         );
@@ -1073,12 +1118,25 @@ impl PageFormApp {
         self.fitted = true;
     }
 
+    /// Keep a fresh page centered in the canvas, including after the sidebar opens.
+    fn keep_page_centered(&mut self, rect: Rect) {
+        let size = rect.size();
+        let size_changed = self.canvas_size.is_none_or(|previous| {
+            (previous.x - size.x).abs() > 0.5 || (previous.y - size.y).abs() > 0.5
+        });
+        if rect.width() > 32.0
+            && rect.height() > 32.0
+            && (!self.fitted || (!self.navigated && size_changed))
+        {
+            self.fit(rect);
+        }
+        self.canvas_size = Some(size);
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         self.canvas_rect = Some(response.rect);
-        if !self.fitted {
-            self.fit(response.rect);
-        }
+        self.keep_page_centered(response.rect);
         self.handle_input(&response, ui.ctx());
         self.paint(&painter, response.rect);
         self.hover_cursor(&response, ui.ctx());
@@ -1094,6 +1152,7 @@ impl PageFormApp {
                     let factor = if scroll_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
                     let zoom = (self.view.zoom * factor).clamp(0.2, 8.0);
                     self.view.zoom_at(pos.x, pos.y, zoom);
+                    self.navigated = true;
                 }
             }
         }
@@ -1156,6 +1215,9 @@ impl PageFormApp {
             });
             if panning {
                 let delta = ctx.input(|input| input.pointer.delta());
+                if delta != Vec2::ZERO {
+                    self.navigated = true;
+                }
                 self.view.origin_x += delta.x;
                 self.view.origin_y += delta.y;
             } else {
@@ -1248,17 +1310,11 @@ impl PageFormApp {
     }
 
     fn finish_place(&mut self, start: PdfPoint, current: PdfPoint, kind: FieldKind) -> FieldId {
-        if kind == FieldKind::Line {
-            let (x0, y0) = self.view.pdf_to_screen(start);
-            let (x1, y1) = self.view.pdf_to_screen(current);
-            let dx = x0 - x1;
-            let dy = y0 - y1;
-            if dx * dx + dy * dy >= 16.0 {
-                let grid = self.snap_grid();
-                return self
-                    .doc
-                    .add_line(snap_point(start, grid), snap_point(current, grid));
-            }
+        if kind == FieldKind::Line && !is_click(&self.view, start, current) {
+            let grid = self.snap_grid();
+            return self
+                .doc
+                .add_line(snap_point(start, grid), snap_point(current, grid));
         }
         let rect = self.place_rect(start, current, kind);
         self.place_kind(kind, rect)
@@ -1339,20 +1395,46 @@ impl PageFormApp {
         };
         let kind = field.kind();
         let style = field.style().clone();
-        let rect = inline_screen_rect(&self.view, field.rect(), kind);
+        let multiline = self.inline.as_ref().is_some_and(|edit| edit.multiline);
+        let rect = inline_screen_rect(&self.view, field.rect(), kind, style.font_size, multiline);
         let font = canvas_font(&style, self.view.zoom);
+        let colors = crate::theme::canvas_colors(self.dark);
         let light_fill = style
             .fill
             .is_some_and(|fill| fill.r + fill.g + fill.b > 1.5);
         let color = canvas_text_color(
             style.text_color,
             light_fill && !matches!(kind, FieldKind::Radio | FieldKind::Checkbox),
-            &crate::theme::canvas_colors(self.dark),
+            &colors,
         );
-        let multiline = self.inline.as_ref().is_some_and(|edit| edit.multiline);
+        let cover = if let Some(fill) = style.fill {
+            if matches!(kind, FieldKind::Radio | FieldKind::Checkbox) {
+                colors.page
+            } else {
+                canvas_fill(fill, &colors)
+            }
+        } else {
+            colors.page
+        };
+        ui.painter().rect_filled(rect, 0.0, cover);
         let request_focus = self.inline.as_ref().is_some_and(|edit| edit.request_focus);
         let edit_id = egui::Id::new(("canvas-inline", id.0));
         let hint = inline_hint(kind, &style, field.name());
+        let horizontal = match style.align {
+            TextAlign::Left => egui::Align::LEFT,
+            TextAlign::Center => egui::Align::Center,
+            TextAlign::Right => egui::Align::RIGHT,
+        };
+        let label_beside = matches!(kind, FieldKind::Radio | FieldKind::Checkbox);
+        // paint_label insets single-line text by 4 px and centers it. Multiline
+        // starts 4 px from the top. Radio and checkbox captions start at the rect.
+        let margin = if label_beside {
+            egui::Margin::ZERO
+        } else if multiline {
+            egui::Margin::symmetric(4, 4)
+        } else {
+            egui::Margin::symmetric(4, 0)
+        };
 
         let response = {
             let edit = self.inline.as_mut().unwrap();
@@ -1371,6 +1453,14 @@ impl PageFormApp {
                 .font(font)
                 .text_color(color)
                 .frame(false)
+                .margin(margin)
+                .min_size(rect.size())
+                .horizontal_align(horizontal)
+                .vertical_align(if multiline {
+                    egui::Align::Min
+                } else {
+                    egui::Align::Center
+                })
                 .desired_width(rect.width());
             if !hint.is_empty() {
                 widget = widget.hint_text(hint);
@@ -1523,7 +1613,7 @@ impl PageFormApp {
             let (x0, y0) = self.view.pdf_to_screen(start);
             let (x1, y1) = self.view.pdf_to_screen(end);
             let color = canvas_stroke_color(style.stroke_color, false, colors, false);
-            let width = (style.stroke_width * zoom).clamp(0.8, 14.0);
+            let width = shape_stroke_px(style.stroke_width, zoom, style.stroke_color.is_black());
             let stroke = Stroke::new(width, color);
             if style.border_style == BorderStyleKind::Dashed {
                 dash_line(painter, Pos2::new(x0, y0), Pos2::new(x1, y1), stroke);
@@ -1595,10 +1685,17 @@ impl PageFormApp {
             )
         };
         if outline_pt > 0.05 {
+            let stand_in = match kind {
+                FieldKind::StaticText => style.border_color.is_black() && style.fill.is_none(),
+                FieldKind::Rectangle | FieldKind::Image | FieldKind::Table => {
+                    style.stroke_color.is_black() && !light_fill
+                }
+                _ => false,
+            };
             paint_outline(
                 painter,
                 screen,
-                (outline_pt * zoom).clamp(0.6, 12.0),
+                shape_stroke_px(outline_pt, zoom, stand_in),
                 outline_color,
                 style.border_style,
             );
@@ -2106,19 +2203,19 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "How do I place something?",
-        "The Insert menu drops a default-sized item at the center of the visible page. A toolbar icon arms that tool so you can drag on the page. Square/Rectangle is the Shapes icon.",
+        "The Insert menu drops a default-sized item at the center of the visible page. A toolbar icon arms that tool: click the page for the default size, or drag to size it. Square/Rectangle is the Shapes icon.",
     ),
     (
         "How do I select, move, and delete?",
-        "Edit → Select, or the Select tool. Drag a selected item to move it, and drag a handle to resize it. Edit → Delete, or the Delete key, removes the selection.",
+        "Edit > Select, or the Select tool. Drag a selected item to move it, and drag a handle to resize it. Edit > Delete, or the Delete key, removes the selection.",
     ),
     (
         "Where are theme and radio labels?",
-        "Edit → Preferences. Dark is the default, and the choice is saved. Radio labels shows or hides the text beside each radio button. The toolbar theme button switches Dark and Light as well. Preferences also stores whether the properties panel opens and whether it is pinned.",
+        "Edit > Preferences. Dark is the default, and the choice is saved. Radio labels shows or hides the text beside each radio button. The toolbar theme button switches Dark and Light as well. Preferences also stores whether the properties panel opens and whether it is pinned.",
     ),
     (
         "How do I open properties?",
-        "The properties panel starts hidden. Open it from View → Properties, the toolbar properties icon, or a right-click Properties command. The header has a close button and a pin. Pinned panels stay open. Unpinned panels close when you click empty canvas. Shift-click or Ctrl-click selects more than one item.",
+        "The properties panel starts hidden. Open it from View > Properties, the toolbar properties icon, or a right-click Properties command. The header has a close button and a pin. Pinned panels stay open. Unpinned panels close when you click empty canvas. Shift-click or Ctrl-click selects more than one item.",
     ),
     (
         "How do I edit text on the page?",
@@ -2126,7 +2223,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File → New lists New Blank Document and New from Template. Those, plus Open, Save, Save As, and Print, are not implemented yet. File → Export PDF writes sample-form.pdf. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
+        "File > New lists New Blank Document and New from Template. Those, plus Open, Save, Save As, and Print, are not implemented yet. File > Export PDF asks where to save a PDF. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
     ),
     (
         "Is there a list box?",
@@ -2249,8 +2346,12 @@ fn insert_tip(kind: FieldKind) -> &'static str {
         }
         FieldKind::Date => "Drop a date field (YYYY-MM-DD text).",
         FieldKind::Dropdown => "Drop a combo drop-down. This is not a list box.",
-        FieldKind::Line => "Drop a horizontal line. Drag with the toolbar tool to set the angle.",
-        FieldKind::Rectangle => "Drop a rectangle. Drag with the toolbar tool to size it.",
+        FieldKind::Line => {
+            "Drop a horizontal line. The toolbar tool places that line on a click, or sets the angle when you drag."
+        }
+        FieldKind::Rectangle => {
+            "Drop a rectangle. The toolbar tool places the default size on a click, or sizes it when you drag."
+        }
         FieldKind::TextBox => "Drop a static text box. It is not a fillable field.",
         FieldKind::Image => "Drop an image placeholder. Choosing a file is not available yet.",
     }
@@ -2281,22 +2382,24 @@ fn kind_for_toolbar_label(label: &str) -> Option<FieldKind> {
 
 fn toolbar_tip(kind: FieldKind) -> &'static str {
     match kind {
-        FieldKind::Text => "Arm the text field tool, then drag on the page.",
+        FieldKind::Text => "Click to place a default text field, or drag to size it.",
         FieldKind::StaticText => {
-            "Arm the static text tool, then drag on the page. Not a fillable field."
+            "Click to place a default text label, or drag to size it. Not a fillable field."
         }
-        FieldKind::Checkbox => "Arm the checkbox tool, then drag on the page.",
+        FieldKind::Checkbox => "Click to place a default checkbox, or drag to size it.",
         FieldKind::Radio => {
-            "Arm the radio tool, then drag on the page. A selected radio joins that group."
+            "Click to place a default radio button, or drag to size it. A selected radio joins that group."
         }
-        FieldKind::Table => "Arm the table tool. Placeholder grid; cells are not editable yet.",
-        FieldKind::Signature => "Arm the signature tool. No ink capture in the app yet.",
-        FieldKind::Date => "Arm the date tool, then drag on the page.",
-        FieldKind::Dropdown => "Arm the drop-down tool. Combo box, not a list box.",
-        FieldKind::Line => "Arm the line tool, then drag from one point to another.",
-        FieldKind::Rectangle => "Arm the rectangle tool, then drag on the page.",
-        FieldKind::TextBox => "Arm the text box tool. Static text, not a fillable field.",
-        FieldKind::Image => "Arm the image tool. Placeholder box until a file can be chosen.",
+        FieldKind::Table => {
+            "Click to place a default table, or drag to size it. Cells are not editable yet."
+        }
+        FieldKind::Signature => "Click to place a default signature field, or drag to size it. No ink capture yet.",
+        FieldKind::Date => "Click to place a default date field, or drag to size it.",
+        FieldKind::Dropdown => "Click to place a default drop-down, or drag to size it. Not a list box.",
+        FieldKind::Line => "Click to place a default line, or drag to set its length and angle.",
+        FieldKind::Rectangle => "Click to place a default rectangle, or drag to size it.",
+        FieldKind::TextBox => "Click to place a default text box, or drag to size it. Not a fillable field.",
+        FieldKind::Image => "Click to place a default image box, or drag to size it. Choosing a file is not available yet.",
     }
 }
 
@@ -2306,7 +2409,7 @@ fn kind_note(kind: FieldKind) -> &'static str {
         FieldKind::StaticText => "Static label. Not a fillable field.",
         FieldKind::Checkbox => "Fillable checkbox.",
         FieldKind::Radio => "One button in a radio group. The first two labels are Yes and No.",
-        FieldKind::Table => "Table placeholder. A 3×2 grid. Cells are not editable yet.",
+        FieldKind::Table => "Table placeholder. A 3x2 grid. Cells are not editable yet.",
         FieldKind::Signature => {
             "Unsigned signature field. Drawing a signature is not available yet."
         }
@@ -2340,14 +2443,24 @@ fn adjacent_label_rect(rect: RectPt) -> RectPt {
     }
 }
 
-fn inline_screen_rect(view: &ViewTransform, rect: RectPt, kind: FieldKind) -> Rect {
-    let screen = to_egui(view.pdf_rect_to_screen(rect));
+fn inline_screen_rect(
+    view: &ViewTransform,
+    rect: RectPt,
+    kind: FieldKind,
+    _font_size: f32,
+    _multiline: bool,
+) -> Rect {
     if matches!(kind, FieldKind::Radio | FieldKind::Checkbox) {
-        let label = adjacent_label_rect(rect);
-        to_egui(view.pdf_rect_to_screen(label))
-    } else {
-        screen
+        // Same origin as the caption painted at the control's right center + 6 px.
+        let control = to_egui(view.pdf_rect_to_screen(rect));
+        return Rect::from_min_size(
+            Pos2::new(control.right() + 6.0, control.top()),
+            Vec2::new((140.0 * view.zoom).max(80.0), control.height().max(12.0)),
+        );
     }
+    // The whole item, so the editor covers the painted text. Vertical alignment
+    // inside the widget matches paint_label.
+    to_egui(view.pdf_rect_to_screen(rect))
 }
 
 fn inline_hint(kind: FieldKind, style: &pageform_core::FieldStyle, name: &str) -> String {
@@ -2380,6 +2493,23 @@ fn rgb32(color: Rgb) -> egui::Color32 {
         (color.g * 255.0).round().clamp(0.0, 255.0) as u8,
         (color.b * 255.0).round().clamp(0.0, 255.0) as u8,
     )
+}
+
+fn shape_stroke_px(width_pt: f32, zoom: f32, stand_in: bool) -> f32 {
+    let px = (width_pt * zoom).clamp(0.8, 14.0);
+    if stand_in {
+        px.max(2.0)
+    } else {
+        px
+    }
+}
+
+fn is_click(view: &ViewTransform, start: PdfPoint, current: PdfPoint) -> bool {
+    let (x0, y0) = view.pdf_to_screen(start);
+    let (x1, y1) = view.pdf_to_screen(current);
+    let dx = x0 - x1;
+    let dy = y0 - y1;
+    dx * dx + dy * dy < 12.0 * 12.0
 }
 
 fn canvas_font(style: &pageform_core::FieldStyle, zoom: f32) -> FontId {
@@ -2632,6 +2762,16 @@ mod tests {
         );
         assert!(!app_version().is_empty());
         assert!(HELP_FAQ.len() >= 5);
+        for (question, answer) in HELP_FAQ {
+            assert!(!question.contains('→'), "{question}");
+            assert!(!answer.contains('→'), "{answer}");
+            assert!(!answer.contains('×'), "{answer}");
+        }
+        for kind in FieldKind::INSERT {
+            let tip = toolbar_tip(kind);
+            assert!(tip.contains("Click"), "{tip}");
+            assert!(tip.contains("drag"), "{tip}");
+        }
     }
 
     #[test]
@@ -2697,6 +2837,31 @@ mod tests {
                 "{banned} showed up on the toolbar: {joined}"
             );
         }
+    }
+
+    #[test]
+    fn a_short_move_places_the_default_size_and_a_drag_does_not() {
+        let view = ViewTransform::new(792.0);
+        let start = PdfPoint { x: 100.0, y: 400.0 };
+        assert!(is_click(&view, start, PdfPoint { x: 104.0, y: 400.0 }));
+        assert!(!is_click(&view, start, PdfPoint { x: 120.0, y: 400.0 }));
+
+        let mut app = PageFormApp::new(false, None);
+        app.view.zoom = 1.0;
+        app.tool = Tool::Text;
+        let clicked = app.place_rect(start, PdfPoint { x: 104.0, y: 402.0 }, FieldKind::Text);
+        let (w, h) = default_size(FieldKind::Text, GridSize::Medium);
+        assert!((clicked.w - w).abs() < 0.1);
+        assert!((clicked.h - h).abs() < 0.1);
+
+        app.tool = Tool::Checkbox;
+        let check = app.place_rect(start, PdfPoint { x: 104.0, y: 402.0 }, FieldKind::Checkbox);
+        let (check_w, check_h) = default_size(FieldKind::Checkbox, GridSize::Medium);
+        assert!((check.w - check_w).abs() < 0.1);
+        assert!((check.h - check_h).abs() < 0.1);
+
+        let dragged = app.place_rect(start, PdfPoint { x: 180.0, y: 340.0 }, FieldKind::Text);
+        assert!((dragged.w - w).abs() > 1.0 || (dragged.h - h).abs() > 1.0);
     }
 
     #[test]
@@ -2778,6 +2943,7 @@ mod tests {
         app.insert_at_view(FieldKind::StaticText);
         let id = app.primary().unwrap();
         assert!(app.begin_inline(id));
+        assert!(app.status.starts_with("Editing text."));
         assert!(!app.properties_open);
         assert_eq!(app.inline.as_ref().map(|edit| edit.multiline), Some(false));
         app.inline.as_mut().unwrap().buffer = "Full name".to_string();
@@ -2786,6 +2952,8 @@ mod tests {
         assert_eq!(app.caption_buf, "Full name");
         app.cancel_inline();
         assert!(app.inline.is_none());
+        assert_eq!(app.status, "Placed Text");
+        assert!(!app.status.starts_with("Editing text."));
         assert_eq!(app.doc.field(id).unwrap().caption(), "Label");
         assert_eq!(app.caption_buf, "Label");
 
@@ -2812,6 +2980,13 @@ mod tests {
         let shape = app.primary().unwrap();
         assert!(!app.begin_inline(shape));
         assert_eq!(app.inline.as_ref().map(|edit| edit.id), Some(text));
+        app.finish_inline();
+        assert!(app.inline.is_none());
+        assert!(
+            !app.status.starts_with("Editing text."),
+            "status was {}",
+            app.status
+        );
     }
 
     #[test]

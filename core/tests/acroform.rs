@@ -763,6 +763,62 @@ fn inline_text_edits_export_as_page_content_or_field_value() {
     assert!(String::from_utf8_lossy(&appearance).contains("Ada"));
 }
 
+#[test]
+fn text1_exports_an_empty_value_and_a_normal_appearance() {
+    let mut doc = Form::letter();
+    let id = doc.add_field(
+        FieldKind::Text,
+        RectPt {
+            x: 72.0,
+            y: 700.0,
+            w: 144.0,
+            h: 18.0,
+        },
+    );
+    assert_eq!(doc.field(id).unwrap().name(), "Text1");
+
+    let bytes = export_pdf(&doc).unwrap();
+    assert!(!bytes
+        .windows(b"NeedAppearances".len())
+        .any(|window| window == b"NeedAppearances"));
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let root = catalog(&pdf);
+    let acro = deref(&pdf, root.get(b"AcroForm").unwrap())
+        .as_dict()
+        .unwrap();
+    assert!(acro.get(b"NeedAppearances").is_err());
+    let fields = deref(&pdf, acro.get(b"Fields").unwrap())
+        .as_array()
+        .unwrap();
+    let text = find_field(&pdf, fields, "Text1");
+    assert_name(deref(&pdf, text.get(b"FT").unwrap()), b"Tx");
+    assert_eq!(string_bytes(deref(&pdf, text.get(b"V").unwrap())), b"");
+    let appearance = stream_plain(&pdf, appearance_n(&pdf, text));
+    assert!(
+        appearance.len() > 16,
+        "empty Text1 still needs a normal appearance, got {} bytes",
+        appearance.len()
+    );
+
+    doc.set_default_value(id, "Hello");
+    let bytes = export_pdf(&doc).unwrap();
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let root = catalog(&pdf);
+    let acro = deref(&pdf, root.get(b"AcroForm").unwrap())
+        .as_dict()
+        .unwrap();
+    let fields = deref(&pdf, acro.get(b"Fields").unwrap())
+        .as_array()
+        .unwrap();
+    let text = find_field(&pdf, fields, "Text1");
+    assert_eq!(string_bytes(deref(&pdf, text.get(b"V").unwrap())), b"Hello");
+    let appearance = stream_plain(&pdf, appearance_n(&pdf, text));
+    assert!(
+        String::from_utf8_lossy(&appearance).contains("Hello"),
+        "appearance missing the value"
+    );
+}
+
 fn field_names(doc: &Document, fields: &[Object]) -> Vec<String> {
     fields
         .iter()

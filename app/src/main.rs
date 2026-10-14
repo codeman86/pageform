@@ -72,7 +72,65 @@ fn dispatch() -> Result<(), String> {
         return Ok(());
     }
 
+    #[cfg(target_os = "linux")]
+    ensure_keyboard_libraries()?;
+
     ui::run_gui(demo).map_err(|err| err.to_string())
+}
+
+/// winit loads these with dlopen, and a missing one panics inside the window
+/// startup. The AppImage bundles both. A raw binary should say which library
+/// is missing instead of aborting.
+#[cfg(target_os = "linux")]
+fn ensure_keyboard_libraries() -> Result<(), String> {
+    let needed = [
+        ("libxkbcommon-x11.so.0", "libxkbcommon-x11-0"),
+        ("libxcb-xkb.so.1", "libxcb-xkb1"),
+    ];
+    let missing: Vec<(&str, &str)> = needed
+        .into_iter()
+        .filter(|(soname, _)| !shared_library_loads(soname))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let libraries = missing
+        .iter()
+        .map(|(soname, _)| *soname)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let packages = missing
+        .iter()
+        .map(|(_, package)| *package)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    Err(format!(
+        "missing {libraries} for keyboard input. The PageForm AppImage includes them. Install {packages}, or run the AppImage."
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn shared_library_loads(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // RTLD_NOW so a missing dependency (libxcb-xkb under libxkbcommon-x11) fails here.
+    const RTLD_NOW: i32 = 2;
+    unsafe {
+        let handle = dlopen(name.as_ptr(), RTLD_NOW);
+        if handle.is_null() {
+            false
+        } else {
+            dlclose(handle);
+            true
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+    fn dlclose(handle: *mut std::ffi::c_void) -> i32;
 }
 
 fn required_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
@@ -108,10 +166,12 @@ Ctrl-click selects several items for align, distribute, and match size.
 Calculations are a placeholder. Margins, header, and footer stay on the canvas.
 File: New opens New Blank Document and New from Template. Those, plus Open, Save,
 Save As, and Print, are not implemented yet.
-Export PDF writes sample-form.pdf. Exit closes the window.
+Export PDF asks where to save the PDF. Exit closes the window.
 Edit: Select and Delete work. Select All, Copy, Cut, and Paste are not
 implemented yet. Preferences is a dialog for the theme and radio labels.
-Insert drops a default item in the view, listed alphabetically: Checkbox,
+Insert drops a default item in the view, listed alphabetically. A toolbar
+insert tool places that default size on a click and sizes the item when you
+drag. The items are: Checkbox,
 Date, Drop-down, Image, Line, Radio, Signature, Square/Rectangle, Table,
 Text (static label), Text Box, and Text Field. Toolbar icons use that same
 order, with Square and Rectangle as separate tools under one Shapes icon. Insert Page is not

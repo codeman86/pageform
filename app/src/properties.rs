@@ -13,6 +13,7 @@ use super::{kind_note, PageFormApp};
 
 impl PageFormApp {
     pub(super) fn properties_panel(&mut self, ui: &mut egui::Ui) {
+        bump_sidebar_fonts(ui);
         self.properties_header(ui);
         ui.separator();
         let pinned = self.properties_pinned;
@@ -45,7 +46,7 @@ impl PageFormApp {
             ui.strong("Properties");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .button("×")
+                    .button("X")
                     .on_hover_text("Close the properties panel")
                     .clicked()
                 {
@@ -82,7 +83,7 @@ impl PageFormApp {
             self.refit_page();
         }
         let page = self.doc.page();
-        ui.label(format!("{:.0} × {:.0} pt", page.width, page.height));
+        ui.label(format!("{:.0} x {:.0} pt", page.width, page.height));
         ui.label("Orientation");
         ui.horizontal(|ui| {
             let portrait = self.doc.orientation() == Orientation::Portrait;
@@ -339,7 +340,7 @@ impl PageFormApp {
                 section(ui, "Radio");
                 self.caption_edit(ui, id, "Label");
                 if !self.doc.radio_labels() {
-                    ui.label("Hidden until Radio labels is on in Edit → Preferences.");
+                    ui.label("Hidden until Radio labels is on in Edit > Preferences.");
                 }
                 let checked = self
                     .doc
@@ -741,13 +742,8 @@ fn drag_pt_impl(
         .inner;
     let mut changed = response.changed();
     if wheel && response.hovered() {
-        let delta = wheel_delta_from_events(&ui.input(|input| input.events.clone()));
-        // Eat the notch and the smoothed tail so the sidebar and the canvas do not move.
-        // Shift+wheel is a horizontal delta on some platforms; the events above still carry it.
-        ui.ctx().input_mut(|input| {
-            input.raw_scroll_delta = egui::Vec2::ZERO;
-            input.smooth_scroll_delta = egui::Vec2::ZERO;
-        });
+        // One step per frame. A notch often arrives as both a line event and a pixel event.
+        let delta = take_wheel_delta(ui);
         if delta != 0.0 {
             let next = (value + delta).clamp(*range.start(), *range.end());
             if (next - value).abs() > f32::EPSILON {
@@ -759,12 +755,57 @@ fn drag_pt_impl(
     changed.then_some(value)
 }
 
-/// Points to add for the wheel events in this frame.
+/// One wheel step for this frame, then forget the scroll so nothing else moves.
+///
+/// A second call in the same frame returns 0. Linux often delivers one notch as a
+/// line event and a pixel event; those are one step, not two.
+fn take_wheel_delta(ui: &mut egui::Ui) -> f32 {
+    let (time, delta, from_line) = ui.input(|input| {
+        let (delta, from_line) = wheel_delta_from_events(&input.events);
+        (input.time, delta, from_line)
+    });
+    ui.ctx().input_mut(|input| {
+        input.raw_scroll_delta = egui::Vec2::ZERO;
+        input.smooth_scroll_delta = egui::Vec2::ZERO;
+    });
+    if delta == 0.0 {
+        return 0.0;
+    }
+    // A line event and its pixel twin sometimes land in adjacent frames.
+    let line_id = egui::Id::new("pageform-wheel-line-time");
+    if !from_line {
+        let recent = ui.data(|data| data.get_temp::<f64>(line_id));
+        if recent.is_some_and(|last| (time - last).abs() < 0.08) {
+            return 0.0;
+        }
+    }
+    // The properties UI can run twice in one frame. Count the notch once.
+    let stamp = (time.to_bits(), delta.to_bits());
+    let id = egui::Id::new("pageform-wheel-once");
+    if ui.data(|data| data.get_temp::<(u64, u32)>(id)) == Some(stamp) {
+        return 0.0;
+    }
+    ui.data_mut(|data| {
+        data.insert_temp(id, stamp);
+        if from_line {
+            data.insert_temp(line_id, time);
+        }
+    });
+    delta
+}
+
+/// Points to add for the wheel events in this frame, and whether a line event
+/// supplied them.
 ///
 /// A vertical notch and a Shift+wheel notch that egui (or the OS) turned into a
-/// horizontal delta both count. Shift selects the 0.5 pt step.
-fn wheel_delta_from_events(events: &[egui::Event]) -> f32 {
-    let mut total = 0.0;
+/// horizontal delta both count. Shift selects the 0.5 pt step. Pixel events that
+/// accompany a line event are the same notch and are ignored. Several pixel
+/// events in one frame are still one notch.
+fn wheel_delta_from_events(events: &[egui::Event]) -> (f32, bool) {
+    let mut line = 0.0_f32;
+    let mut saw_line = false;
+    let mut point_sign = 0.0_f32;
+    let mut point_shift = false;
     for event in events {
         let egui::Event::MouseWheel {
             unit,
@@ -782,14 +823,41 @@ fn wheel_delta_from_events(events: &[egui::Event]) -> f32 {
         if amount == 0.0 {
             continue;
         }
-        let notches = match unit {
-            egui::MouseWheelUnit::Point => (amount.abs() / 40.0).round().max(1.0),
-            egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => amount.abs().max(1.0),
-        };
-        let step = if modifiers.shift { 0.5 } else { 1.0 };
-        total += amount.signum() * step * notches;
+        match unit {
+            egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
+                let notches = amount.abs().max(1.0);
+                let step = if modifiers.shift { 0.5 } else { 1.0 };
+                line += amount.signum() * step * notches;
+                saw_line = true;
+            }
+            egui::MouseWheelUnit::Point => {
+                point_sign = amount.signum();
+                point_shift = modifiers.shift;
+            }
+        }
     }
-    total
+    if saw_line {
+        (line, true)
+    } else if point_sign != 0.0 {
+        let step = if point_shift { 0.5 } else { 1.0 };
+        (point_sign * step, false)
+    } else {
+        (0.0, false)
+    }
+}
+
+fn bump_sidebar_fonts(ui: &mut egui::Ui) {
+    let styles = &mut ui.style_mut().text_styles;
+    for (kind, size) in [
+        (egui::TextStyle::Body, 15.5),
+        (egui::TextStyle::Button, 15.5),
+        (egui::TextStyle::Small, 13.5),
+        (egui::TextStyle::Monospace, 15.0),
+    ] {
+        if let Some(font) = styles.get_mut(&kind) {
+            font.size = size;
+        }
+    }
 }
 
 fn color_row(ui: &mut egui::Ui, label: &str, color: Rgb) -> Option<Rgb> {
@@ -832,20 +900,20 @@ mod tests {
     #[test]
     fn wheel_steps_are_one_point_and_shift_is_half_on_either_axis() {
         assert_eq!(
-            wheel_delta_from_events(&[wheel(egui::vec2(0.0, 1.0), false)]),
+            wheel_delta_from_events(&[wheel(egui::vec2(0.0, 1.0), false)]).0,
             1.0
         );
         assert_eq!(
-            wheel_delta_from_events(&[wheel(egui::vec2(0.0, -1.0), false)]),
+            wheel_delta_from_events(&[wheel(egui::vec2(0.0, -1.0), false)]).0,
             -1.0
         );
         // egui and some OSes turn Shift+wheel into a horizontal delta.
         assert_eq!(
-            wheel_delta_from_events(&[wheel(egui::vec2(1.0, 0.0), true)]),
+            wheel_delta_from_events(&[wheel(egui::vec2(1.0, 0.0), true)]).0,
             0.5
         );
         assert_eq!(
-            wheel_delta_from_events(&[wheel(egui::vec2(0.0, -2.0), true)]),
+            wheel_delta_from_events(&[wheel(egui::vec2(0.0, -2.0), true)]).0,
             -1.0
         );
         assert_eq!(
@@ -853,9 +921,36 @@ mod tests {
                 unit: egui::MouseWheelUnit::Point,
                 delta: egui::vec2(0.0, 14.0),
                 modifiers: egui::Modifiers::default(),
-            }]),
+            }])
+            .0,
             1.0
         );
+        // One physical notch is often both a line event and a pixel event.
+        let doubled = [
+            wheel(egui::vec2(0.0, 1.0), false),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 15.0),
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let (delta, from_line) = wheel_delta_from_events(&doubled);
+        assert_eq!(delta, 1.0);
+        assert!(from_line);
+        // Two pixel events in the same frame are still one notch.
+        let pixels = [
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 15.0),
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 15.0),
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        assert_eq!(wheel_delta_from_events(&pixels).0, 1.0);
     }
 
     #[test]
@@ -898,6 +993,25 @@ mod tests {
             |ctx| show(ctx, &mut value),
         );
         assert_eq!(value, 13.0, "wheel up adds 1 pt");
+        time += 0.02;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, 15.0),
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            ),
+            |ctx| show(ctx, &mut value),
+        );
+        assert_eq!(
+            value, 13.0,
+            "a pixel event just after a line event is the same notch"
+        );
         assert_eq!(
             ctx.input(|input| input.raw_scroll_delta),
             egui::Vec2::ZERO,
