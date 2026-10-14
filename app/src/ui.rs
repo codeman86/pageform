@@ -4059,7 +4059,11 @@ mod tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
-        assert_eq!(app.doc.fields().len(), count + 1, "Ctrl+V pastes without a Paste event");
+        assert_eq!(
+            app.doc.fields().len(),
+            count + 1,
+            "Ctrl+V pastes without a Paste event"
+        );
 
         let count = app.doc.fields().len();
         let mut input = screen_input();
