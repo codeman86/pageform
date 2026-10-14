@@ -3106,15 +3106,14 @@ fn pick_native(
     }
 }
 
+#[cfg(windows)]
 fn send_to_printer(path: &std::path::Path) -> String {
-    #[cfg(windows)]
-    {
-        return send_to_printer_windows(path);
-    }
-    #[cfg(not(windows))]
-    {
-        send_to_printer_unix(path)
-    }
+    send_to_printer_windows(path)
+}
+
+#[cfg(not(windows))]
+fn send_to_printer(path: &std::path::Path) -> String {
+    send_to_printer_unix(path)
 }
 
 #[cfg(windows)]
