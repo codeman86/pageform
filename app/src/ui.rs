@@ -191,6 +191,9 @@ struct PageFormApp {
     drag: Option<Drag>,
     clipboard: Vec<Field>,
     paste_steps: i32,
+    /// The Insert menu click is also over the canvas. Ignore that pointer
+    /// press so it does not clear the selection just made.
+    suppress_place_click: bool,
     name_buf: String,
     caption_buf: String,
     tooltip_buf: String,
@@ -262,6 +265,7 @@ impl PageFormApp {
             drag: None,
             clipboard: Vec::new(),
             paste_steps: 0,
+            suppress_place_click: false,
             name_buf: String::new(),
             caption_buf: String::new(),
             tooltip_buf: String::new(),
@@ -1311,6 +1315,7 @@ impl PageFormApp {
         let id = self.place_kind(kind, rect);
         self.selection = vec![id];
         self.drag = None;
+        self.suppress_place_click = true;
         self.status = format!("Placed {}", kind.label());
     }
 
@@ -1841,6 +1846,57 @@ impl PageFormApp {
         self.inline_editor(ui);
     }
 
+    /// Shortcuts are read before widgets so the first Ctrl/Cmd chord is not lost.
+    /// Copy, cut, and paste arrive as events, not as key presses.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let mut copy = false;
+        let mut cut = false;
+        let mut paste = false;
+        ctx.input_mut(|input| {
+            input.events.retain(|event| match event {
+                egui::Event::Copy => {
+                    copy = true;
+                    false
+                }
+                egui::Event::Cut => {
+                    cut = true;
+                    false
+                }
+                egui::Event::Paste(_) => {
+                    paste = true;
+                    false
+                }
+                _ => true,
+            });
+        });
+        if cut {
+            self.cut_selection();
+        } else if copy {
+            self.copy_selection();
+        } else if paste {
+            self.paste_clipboard();
+        }
+        let save_as = egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::S,
+        );
+        let save = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+        let print = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P);
+        let select_all = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A);
+        if ctx.input_mut(|input| input.consume_shortcut(&save_as)) {
+            self.save_project_as();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&save)) {
+            self.save_project();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&print)) {
+            self.print_current();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&select_all)) {
+            self.select_all();
+        }
+    }
+
     fn handle_input(&mut self, response: &egui::Response, ctx: &egui::Context) {
         if response.hovered() {
             let scroll_y = ctx.input(|input| input.raw_scroll_delta.y);
@@ -1854,32 +1910,15 @@ impl PageFormApp {
             }
         }
 
-        if !ctx.wants_keyboard_input() {
-            let command = ctx.input(|input| input.modifiers.command || input.modifiers.ctrl);
-            if ctx.input(|input| input.key_pressed(Key::Escape)) {
-                self.drag = None;
-                self.tool = Tool::Select;
-            }
-            let shift = ctx.input(|input| input.modifiers.shift);
-            if command && shift && ctx.input(|input| input.key_pressed(Key::S)) {
-                self.save_project_as();
-            } else if command && ctx.input(|input| input.key_pressed(Key::S)) {
-                self.save_project();
-            } else if command && ctx.input(|input| input.key_pressed(Key::P)) {
-                self.print_current();
-            } else if command && ctx.input(|input| input.key_pressed(Key::A)) {
-                self.select_all();
-            } else if command && ctx.input(|input| input.key_pressed(Key::C)) {
-                self.copy_selection();
-            } else if command && ctx.input(|input| input.key_pressed(Key::X)) {
-                self.cut_selection();
-            } else if command && ctx.input(|input| input.key_pressed(Key::V)) {
-                self.paste_clipboard();
-            } else if ctx
+        if !ctx.wants_keyboard_input()
+            && ctx
                 .input(|input| input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace))
-            {
-                self.delete_selection();
-            }
+        {
+            self.delete_selection();
+        }
+        if !ctx.wants_keyboard_input() && ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.drag = None;
+            self.tool = Tool::Select;
         }
 
         let primary_pressed = ctx.input(|input| input.pointer.primary_pressed());
@@ -1911,9 +1950,15 @@ impl PageFormApp {
             }
         }
 
+        let (ignore_primary, still_suppress) = ignore_place_click(
+            self.suppress_place_click,
+            ctx.input(|input| input.pointer.primary_down()),
+        );
+        self.suppress_place_click = still_suppress;
+
         if middle_pressed && response.hovered() {
             self.drag = Some(Drag::Pan);
-        } else if primary_pressed && response.hovered() {
+        } else if primary_pressed && response.hovered() && !ignore_primary {
             if space {
                 self.drag = Some(Drag::Pan);
             } else {
@@ -1938,11 +1983,11 @@ impl PageFormApp {
             }
         }
 
-        if primary_down {
+        if primary_down && !ignore_primary {
             self.update_drag(ctx);
         }
 
-        if primary_released {
+        if primary_released && !ignore_primary {
             if let Some(Drag::Place { start, kind }) = self.drag.clone() {
                 if let Some(current) = self.pointer_pdf(ctx) {
                     let id = self.finish_place(start, current, kind);
@@ -2781,6 +2826,7 @@ impl eframe::App for PageFormApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ctx);
         let now = ctx.input(|input| input.time);
         if let Some(remaining) = self.fade_status(now) {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
@@ -3189,6 +3235,15 @@ fn send_to_printer_unix(path: &std::path::Path) -> String {
 fn unix_command(name: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
+/// `(ignore this primary click, keep suppressing while the button is held)`.
+fn ignore_place_click(suppress: bool, primary_down: bool) -> (bool, bool) {
+    if suppress {
+        (true, primary_down)
+    } else {
+        (false, false)
+    }
 }
 
 fn command_shortcut(ui: &egui::Ui, key: egui::Key) -> String {
@@ -3930,6 +3985,56 @@ mod tests {
         assert_eq!(app.fade_status(0.0), None);
         assert_eq!(app.fade_status(9.0), None);
         assert!(app.status.starts_with("Editing text."));
+    }
+
+    #[test]
+    fn clipboard_events_and_select_all_run_on_the_first_pass() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let placed = app.selection.clone();
+        assert!(app.suppress_place_click);
+        assert_eq!(ignore_place_click(true, false), (true, false));
+        assert_eq!(ignore_place_click(true, true), (true, true));
+
+        let mut input = screen_input();
+        input.events.push(egui::Event::Copy);
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(app.clipboard.len(), 1);
+
+        let mut input = screen_input();
+        input.events.push(egui::Event::Cut);
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert!(app.doc.fields().is_empty());
+
+        let mut input = screen_input();
+        input
+            .events
+            .push(egui::Event::Paste("not item data".into()));
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(app.doc.fields().len(), 1);
+        assert_ne!(app.selection, placed);
+
+        app.doc.add_field(
+            FieldKind::Checkbox,
+            RectPt {
+                x: 72.0,
+                y: 600.0,
+                w: 18.0,
+                h: 18.0,
+            },
+        );
+        app.selection.clear();
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(app.selection.len(), 2);
     }
 
     #[test]

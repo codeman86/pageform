@@ -776,6 +776,8 @@ impl Document {
         self.touch();
     }
 
+    /// Uses each item's bounding rectangle. A diagonal line therefore lines up
+    /// by that box, not by its endpoints. That is the intended behavior.
     fn map_selection(&mut self, ids: &[FieldId], min: usize, edit: impl FnOnce(&mut [RectPt])) {
         let items: Vec<(FieldId, RectPt)> = ids
             .iter()
