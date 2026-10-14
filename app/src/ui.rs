@@ -10,9 +10,9 @@ use eframe::egui::{
 };
 use pageform_core::{
     default_size, export_pdf, hit_handle, move_rect, place_default, rect_from_drag, resize_rect,
-    snap_point, BorderStyleKind, CheckboxStyle, Document, FieldId, FieldKind, FontFamily, GridSize,
-    Handle, Page, PdfPoint, RectPt, Rgb, ScreenRect, TextAlign, ViewTransform, TABLE_COLUMNS,
-    TABLE_ROWS,
+    snap_point, AlignEdge, BorderStyleKind, CheckboxStyle, Document, FieldId, FieldKind,
+    FontFamily, GridSize, Handle, Page, PdfPoint, RectPt, Rgb, ScreenRect, TextAlign,
+    ViewTransform, TABLE_COLUMNS, TABLE_ROWS,
 };
 
 pub fn run_gui(demo: bool) -> eframe::Result<()> {
@@ -129,6 +129,18 @@ enum Drag {
         id: FieldId,
         index: usize,
     },
+    Marquee {
+        start: PdfPoint,
+        extend: bool,
+    },
+}
+
+#[derive(Clone)]
+struct ExportPrompt {
+    directory: String,
+    file_name: String,
+    /// The chosen path already exists. The next Save replaces it.
+    replace: bool,
 }
 
 struct PageFormApp {
@@ -157,6 +169,9 @@ struct PageFormApp {
     name_error: Option<String>,
     export_path: String,
     status: String,
+    /// Status text last observed, so a change restarts the fade timer.
+    status_seen: String,
+    status_at: f64,
     dark: bool,
     persist_theme: bool,
     properties_open: bool,
@@ -171,6 +186,7 @@ struct PageFormApp {
     show_preferences: bool,
     show_about: bool,
     show_help: bool,
+    export_prompt: Option<ExportPrompt>,
 }
 
 impl PageFormApp {
@@ -213,6 +229,12 @@ impl PageFormApp {
             } else {
                 "Blank US Letter page".to_string()
             },
+            status_seen: if demo {
+                "Sample page with full_name and agree".to_string()
+            } else {
+                "Blank US Letter page".to_string()
+            },
+            status_at: 0.0,
             dark: crate::theme::is_dark(stored.as_deref()),
             persist_theme: false,
             properties_open: crate::prefs::is_open(open.as_deref()),
@@ -226,6 +248,23 @@ impl PageFormApp {
             show_preferences: false,
             show_about: false,
             show_help: false,
+            export_prompt: None,
+        }
+    }
+
+    /// Clear a status message a few seconds after it was set. The edit prompt
+    /// stays until the edit finishes.
+    fn fade_status(&mut self, time: f64) {
+        if self.status != self.status_seen {
+            self.status_seen.clone_from(&self.status);
+            self.status_at = time;
+        }
+        if self.inline.is_some() || self.status.is_empty() {
+            return;
+        }
+        if time - self.status_at >= 4.0 {
+            self.status.clear();
+            self.status_seen.clear();
         }
     }
 
@@ -271,23 +310,24 @@ impl PageFormApp {
     }
 
     fn export_current(&mut self) {
-        let fallback = if self.export_path.trim().is_empty() {
-            "form.pdf"
-        } else {
-            &self.export_path
-        };
-        let name = std::path::Path::new(fallback)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("form.pdf");
-        let Some(mut path) = rfd::FileDialog::new()
+        if !native_save_dialog_available() {
+            self.open_builtin_export();
+            return;
+        }
+        let started = std::time::Instant::now();
+        let chosen = rfd::FileDialog::new()
             .set_title("Export PDF")
             .add_filter("PDF", &["pdf"])
-            .set_file_name(name)
-            .save_file()
-        else {
-            self.status = "Export cancelled".to_string();
+            .set_file_name(export_file_name(&self.export_path))
+            .save_file();
+        let Some(mut path) = chosen else {
+            // A missing portal returns immediately. A person cancelling the
+            // dialog takes longer than that.
+            if started.elapsed() < std::time::Duration::from_millis(500) {
+                self.open_builtin_export();
+            } else {
+                self.status = "Export cancelled".to_string();
+            }
             return;
         };
         if path.extension().is_none() {
@@ -295,6 +335,84 @@ impl PageFormApp {
         }
         self.export_path = path.display().to_string();
         self.write_export();
+    }
+
+    fn open_builtin_export(&mut self) {
+        let name = export_file_name(&self.export_path);
+        let directory = std::path::Path::new(&self.export_path)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.display().to_string())
+            .filter(|dir| !dir.is_empty())
+            .unwrap_or_else(default_export_dir);
+        self.export_prompt = Some(ExportPrompt {
+            directory,
+            file_name: name,
+            replace: false,
+        });
+        self.status = "Choose where to save the PDF.".to_string();
+    }
+
+    fn export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.export_prompt.clone() else {
+            return;
+        };
+        let mut prompt = prompt;
+        let original_dir = prompt.directory.clone();
+        let original_name = prompt.file_name.clone();
+        let mut close = false;
+        let mut save = false;
+        let response = egui::Modal::new(egui::Id::new("pageform_export")).show(ctx, |ui| {
+            ui.set_min_width(460.0);
+            ui.heading("Export PDF");
+            ui.add_space(8.0);
+            ui.label("Folder");
+            ui.add(egui::TextEdit::singleline(&mut prompt.directory).desired_width(f32::INFINITY));
+            ui.add_space(6.0);
+            ui.label("File name");
+            ui.add(egui::TextEdit::singleline(&mut prompt.file_name).desired_width(f32::INFINITY));
+            let path = export_file_path(&prompt.directory, &prompt.file_name);
+            ui.add_space(6.0);
+            ui.label(path.display().to_string());
+            if prompt.replace {
+                ui.add_space(6.0);
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 80),
+                    "That file already exists. Save again to replace it.",
+                );
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let label = if prompt.replace { "Replace" } else { "Save" };
+                if ui.button(label).clicked() {
+                    save = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if prompt.directory != original_dir || prompt.file_name != original_name {
+            prompt.replace = false;
+        }
+        if close || response.should_close() {
+            self.export_prompt = None;
+            self.status = "Export cancelled".to_string();
+            return;
+        }
+        if save {
+            let path = export_file_path(&prompt.directory, &prompt.file_name);
+            if path.exists() && !prompt.replace {
+                prompt.replace = true;
+                self.export_prompt = Some(prompt);
+                return;
+            }
+            self.export_prompt = None;
+            self.export_path = path.display().to_string();
+            self.write_export();
+            return;
+        }
+        self.export_prompt = Some(prompt);
     }
 
     fn write_export(&mut self) {
@@ -523,6 +641,7 @@ impl PageFormApp {
                 continue;
             }
             match *label {
+                "Open" | "Save" | "Save As" | "Print" => coming_soon_item(ui, label),
                 "Export PDF" => {
                     let tip = format!(
                         "Write a fillable PDF to {}. Guides and margins stay on the canvas.",
@@ -578,6 +697,9 @@ impl PageFormApp {
                         ui.close();
                     }
                 }
+                "Align" => {
+                    ui.menu_button("Align", |ui| self.align_menu(ui));
+                }
                 "Preferences" => {
                     if ui.button(*label).clicked() {
                         self.show_preferences = true;
@@ -606,6 +728,69 @@ impl PageFormApp {
                     }
                 }
                 other => self.stub_item(ui, other),
+            }
+        }
+    }
+
+    fn align_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(220.0);
+        self.align_commands(ui, true);
+    }
+
+    /// Align, distribute, and match size. `close_menu` closes the menu after a command.
+    fn align_commands(&mut self, ui: &mut egui::Ui, close_menu: bool) {
+        let count = self.selection.len();
+        let align_ok = count >= 2;
+        let distribute_ok = count >= 3;
+        let need = if align_ok {
+            "Apply to the selection."
+        } else {
+            "Select two or more items."
+        };
+        for (label, edge) in ALIGN_EDGES {
+            let response = ui
+                .add_enabled(align_ok, egui::Button::new(*label))
+                .on_hover_text(need)
+                .on_disabled_hover_text("Select two or more items.");
+            if response.clicked() {
+                let ids = self.selection.clone();
+                self.doc.align_fields(&ids, *edge);
+                self.status = format!("Aligned {label}");
+                if close_menu {
+                    ui.close();
+                }
+            }
+        }
+        ui.separator();
+        for (label, horizontal) in [
+            ("Distribute horizontally", true),
+            ("Distribute vertically", false),
+        ] {
+            let response = ui
+                .add_enabled(distribute_ok, egui::Button::new(label))
+                .on_disabled_hover_text("Select three or more items.");
+            if response.clicked() {
+                let ids = self.selection.clone();
+                self.doc.distribute_fields(&ids, horizontal);
+                self.status = label.to_string();
+                if close_menu {
+                    ui.close();
+                }
+            }
+        }
+        for (label, width, height) in [("Match width", true, false), ("Match height", false, true)]
+        {
+            let response = ui
+                .add_enabled(align_ok, egui::Button::new(label))
+                .on_disabled_hover_text("Select two or more items.");
+            if response.clicked() {
+                let ids = self.selection.clone();
+                let reference = ids.len() - 1;
+                self.doc.match_field_size(&ids, reference, width, height);
+                self.status = label.to_string();
+                if close_menu {
+                    ui.close();
+                }
             }
         }
     }
@@ -887,7 +1072,7 @@ impl PageFormApp {
                 }
                 crate::theme::apply(ctx, dark);
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    help_faq(ui);
+                    help_faq(ui, dark);
                 });
                 let close = ctx.input(|input| input.viewport().close_requested());
                 HelpHost::Native { close }
@@ -901,7 +1086,7 @@ impl PageFormApp {
                     .default_size([520.0, 640.0])
                     .open(&mut self.show_help)
                     .show(ctx, |ui| {
-                        help_faq(ui);
+                        help_faq(ui, self.dark);
                     });
             }
             HelpHost::Native { close } => {
@@ -927,11 +1112,9 @@ impl PageFormApp {
         for label in icons::DOC_COMMANDS {
             match *label {
                 "New" => self.icon_choices(ui, icons::Icon::New, false, "New", NEW_MENU),
-                "Open" => self.stub_icon(ui, icons::Icon::Open, "Open"),
-                "Save" => {
-                    self.icon_choices(ui, icons::Icon::Save, false, "Save", &["Save", "Save As"])
-                }
-                "Print" => self.stub_icon(ui, icons::Icon::Print, "Print"),
+                "Open" => coming_soon_icon(ui, icons::Icon::Open),
+                "Save" => coming_soon_icon(ui, icons::Icon::Save),
+                "Print" => coming_soon_icon(ui, icons::Icon::Print),
                 _ => {}
             }
         }
@@ -1075,10 +1258,37 @@ impl PageFormApp {
         }
     }
 
-    fn stub_icon(&mut self, ui: &mut egui::Ui, icon: icons::Icon, label: &str) {
-        if icons::icon_button(ui, icon, false, label).clicked() {
-            self.mark_not_implemented(label);
+    fn finish_marquee(&mut self, start: PdfPoint, current: PdfPoint, extend: bool) {
+        if is_click(&self.view, start, current) {
+            if !extend {
+                self.selection.clear();
+                self.dismiss_unpinned();
+            }
+            return;
         }
+        let band = marquee_rect(start, current);
+        let hits: Vec<FieldId> = self
+            .doc
+            .fields()
+            .iter()
+            .filter(|field| rects_hit(field.rect(), band))
+            .map(|field| field.id())
+            .collect();
+        if extend {
+            for id in hits {
+                if !self.selection.contains(&id) {
+                    self.selection.push(id);
+                }
+            }
+        } else {
+            self.selection = hits;
+        }
+        let count = self.selection.len();
+        self.status = if count == 1 {
+            "Selected 1 item".to_string()
+        } else {
+            format!("Selected {count} items")
+        };
     }
 
     fn icon_choices(
@@ -1238,6 +1448,11 @@ impl PageFormApp {
                     self.status = format!("Placed {}", kind.label());
                 }
             }
+            if let Some(Drag::Marquee { start, extend }) = self.drag.clone() {
+                if let Some(current) = self.pointer_pdf(ctx) {
+                    self.finish_marquee(start, current, extend);
+                }
+            }
             if !ctx.input(|input| input.pointer.button_down(PointerButton::Middle)) {
                 self.drag = None;
             }
@@ -1293,9 +1508,10 @@ impl PageFormApp {
                         self.drag = None;
                     }
                 } else {
-                    self.selection.clear();
-                    self.drag = None;
-                    self.dismiss_unpinned();
+                    let extend = ctx.input(|input| {
+                        input.modifiers.shift || input.modifiers.command || input.modifiers.ctrl
+                    });
+                    self.drag = Some(Drag::Marquee { start: pdf, extend });
                 }
             }
             _ => {
@@ -1498,10 +1714,14 @@ impl PageFormApp {
         let open = egui::Popup::is_id_open(&response.ctx, popup_id);
         if self.context_field.is_some() && (response.secondary_clicked() || open) {
             egui::Popup::context_menu(response).show(|ui| {
-                ui.set_min_width(160.0);
+                ui.set_min_width(200.0);
                 if ui.button("Properties").clicked() {
                     self.open_properties();
                     ui.close();
+                }
+                if self.selection.len() >= 2 {
+                    ui.separator();
+                    self.align_commands(ui, true);
                 }
             });
         }
@@ -1530,6 +1750,26 @@ impl PageFormApp {
 
         for field in self.doc.fields() {
             self.paint_field(painter, field, &colors);
+        }
+
+        if let Some(Drag::Marquee { start, .. }) = &self.drag {
+            let start = *start;
+            if let Some(current) = self.pointer_pdf_from_painter(painter) {
+                if !is_click(&self.view, start, current) {
+                    let band = to_egui(self.view.pdf_rect_to_screen(marquee_rect(start, current)));
+                    painter.rect_filled(
+                        band,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            colors.selection.r(),
+                            colors.selection.g(),
+                            colors.selection.b(),
+                            40,
+                        ),
+                    );
+                    stroke_rect(painter, band, Stroke::new(1.0_f32, colors.selection));
+                }
+            }
         }
 
         if let Some(Drag::Place { start, kind }) = &self.drag {
@@ -2038,6 +2278,8 @@ impl eframe::App for PageFormApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let now = ctx.input(|input| input.time);
+        self.fade_status(now);
         crate::theme::apply(ctx, self.dark);
         if self.persist_theme || self.persist_panel {
             if let Some(storage) = frame.storage_mut() {
@@ -2079,6 +2321,7 @@ impl eframe::App for PageFormApp {
         self.preferences_dialog(ctx);
         self.about_dialog(ctx);
         self.help_window(ctx);
+        self.export_dialog(ctx);
     }
 }
 
@@ -2189,7 +2432,18 @@ const EDIT_MENU: &[&str] = &[
     "Paste",
     "Delete",
     "",
+    "Align",
+    "",
     "Preferences",
+];
+
+const ALIGN_EDGES: &[(&str, AlignEdge)] = &[
+    ("Align left", AlignEdge::Left),
+    ("Align center", AlignEdge::Center),
+    ("Align right", AlignEdge::Right),
+    ("Align top", AlignEdge::Top),
+    ("Align middle", AlignEdge::Middle),
+    ("Align bottom", AlignEdge::Bottom),
 ];
 
 const HELP_MENU: &[&str] = &["Help", "About"];
@@ -2207,7 +2461,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "How do I select, move, and delete?",
-        "Edit > Select, or the Select tool. Drag a selected item to move it, and drag a handle to resize it. Edit > Delete, or the Delete key, removes the selection.",
+        "Edit > Select, or the Select tool. Drag on empty canvas to draw a box around the items you want. Drag a selected item to move it, and drag a handle to resize it. Edit > Delete, or the Delete key, removes the selection. Edit > Align, or a right-click, lines up two or more selected items.",
     ),
     (
         "Where are theme and radio labels?",
@@ -2223,7 +2477,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File > New lists New Blank Document and New from Template. Those, plus Open, Save, Save As, and Print, are not implemented yet. File > Export PDF asks where to save a PDF. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
+        "File > New lists New Blank Document and New from Template. Those are not implemented yet. Open, Save, Save As, and Print are coming soon and stay disabled. File > Export PDF asks where to save a PDF. If the computer has no system file dialog, PageForm asks for the folder and file name in its own window. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
     ),
     (
         "Is there a list box?",
@@ -2272,15 +2526,118 @@ fn placeholder_icon(ui: &mut egui::Ui) {
     );
 }
 
-fn help_faq(ui: &mut egui::Ui) {
+fn coming_soon_item(ui: &mut egui::Ui, label: &str) {
+    ui.add_enabled(false, egui::Button::new(label))
+        .on_disabled_hover_text("Coming soon");
+}
+
+fn coming_soon_icon(ui: &mut egui::Ui, icon: icons::Icon) {
+    ui.add_enabled_ui(false, |ui| {
+        icons::icon_button(ui, icon, false, "Coming soon").on_disabled_hover_text("Coming soon");
+    });
+}
+
+fn marquee_rect(start: PdfPoint, current: PdfPoint) -> RectPt {
+    let left = start.x.min(current.x);
+    let right = start.x.max(current.x);
+    let bottom = start.y.min(current.y);
+    let top = start.y.max(current.y);
+    RectPt {
+        x: left,
+        y: bottom,
+        w: (right - left).max(0.0),
+        h: (top - bottom).max(0.0),
+    }
+}
+
+fn rects_hit(a: RectPt, b: RectPt) -> bool {
+    a.x < b.right() && b.x < a.right() && a.y < b.top() && b.y < a.top()
+}
+
+fn export_file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("form.pdf")
+        .to_string()
+}
+
+fn default_export_dir() -> String {
+    std::env::current_dir()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|_| ".".to_string())
+}
+
+fn export_file_path(directory: &str, file_name: &str) -> std::path::PathBuf {
+    let mut name = file_name.trim().to_string();
+    if name.is_empty() {
+        name = "form.pdf".to_string();
+    }
+    let mut path = std::path::PathBuf::from(directory.trim());
+    if path.as_os_str().is_empty() {
+        path = std::path::PathBuf::from(default_export_dir());
+    }
+    path.push(name);
+    if path.extension().is_none() {
+        path.set_extension("pdf");
+    }
+    path
+}
+
+#[cfg(target_os = "linux")]
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+}
+
+/// rfd's Linux backend needs a desktop portal, zenity, or kdialog. Windows and
+/// macOS use the system dialog.
+fn native_save_dialog_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if command_on_path("zenity") || command_on_path("kdialog") {
+            return true;
+        }
+        let portal = [
+            "/usr/libexec/xdg-desktop-portal",
+            "/usr/lib/xdg-desktop-portal",
+            "/usr/bin/xdg-desktop-portal",
+        ]
+        .iter()
+        .any(|path| std::path::Path::new(path).is_file())
+            || command_on_path("xdg-desktop-portal");
+        portal && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+fn help_faq(ui: &mut egui::Ui, dark: bool) {
+    let text = if dark {
+        egui::Color32::from_rgb(248, 248, 246)
+    } else {
+        egui::Color32::from_rgb(16, 18, 22)
+    };
+    ui.style_mut().visuals.override_text_color = Some(text);
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Heading, FontId::proportional(26.0));
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Body, FontId::proportional(18.0));
     ui.heading("PageForm Help");
-    ui.label("Frequently asked questions");
+    ui.label(egui::RichText::new("Frequently asked questions").size(18.0));
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
         for (question, answer) in HELP_FAQ {
-            ui.strong(*question);
-            ui.label(*answer);
-            ui.add_space(10.0);
+            ui.label(egui::RichText::new(*question).size(20.0).strong());
+            ui.label(egui::RichText::new(*answer).size(18.0));
+            ui.add_space(12.0);
         }
     });
 }
@@ -2723,6 +3080,24 @@ fn paint_check_mark(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::Storage;
+
+    #[derive(Default)]
+    struct MemStorage {
+        values: std::collections::HashMap<String, String>,
+    }
+
+    impl eframe::Storage for MemStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.values.insert(key.to_string(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
 
     #[test]
     fn menu_bar_order_is_file_edit_insert_view_help() {
@@ -2751,6 +3126,7 @@ mod tests {
                 "Cut",
                 "Paste",
                 "Delete",
+                "Align",
                 "Preferences"
             ]
         );
@@ -2840,6 +3216,77 @@ mod tests {
     }
 
     #[test]
+    fn marquee_selects_items_in_the_drag_box_and_a_click_clears() {
+        let mut app = PageFormApp::new(false, None);
+        app.view.zoom = 1.0;
+        let text = app.doc.add_field(
+            FieldKind::Text,
+            RectPt {
+                x: 72.0,
+                y: 700.0,
+                w: 40.0,
+                h: 18.0,
+            },
+        );
+        let check = app.doc.add_field(
+            FieldKind::Checkbox,
+            RectPt {
+                x: 200.0,
+                y: 700.0,
+                w: 18.0,
+                h: 18.0,
+            },
+        );
+        app.finish_marquee(
+            PdfPoint { x: 60.0, y: 730.0 },
+            PdfPoint { x: 230.0, y: 690.0 },
+            false,
+        );
+        assert!(app.selection.contains(&text));
+        assert!(app.selection.contains(&check));
+        app.finish_marquee(
+            PdfPoint { x: 10.0, y: 10.0 },
+            PdfPoint { x: 12.0, y: 11.0 },
+            false,
+        );
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn status_fades_after_four_seconds_and_stays_while_editing() {
+        let mut app = PageFormApp::new(false, None);
+        app.status = "Placed Text".to_string();
+        app.fade_status(0.0);
+        assert_eq!(app.status, "Placed Text");
+        app.fade_status(3.9);
+        assert_eq!(app.status, "Placed Text");
+        app.fade_status(4.0);
+        assert!(app.status.is_empty());
+
+        app.insert_at_view(FieldKind::StaticText);
+        let id = app.primary().unwrap();
+        assert!(app.begin_inline(id));
+        app.fade_status(0.0);
+        app.fade_status(9.0);
+        assert!(app.status.starts_with("Editing text."));
+    }
+
+    #[test]
+    fn builtin_export_path_adds_pdf_and_starts_from_the_fallback_name() {
+        let path = export_file_path("/tmp/forms", "card");
+        assert_eq!(path, std::path::PathBuf::from("/tmp/forms/card.pdf"));
+        let kept = export_file_path("/tmp/forms", "card.PDF");
+        assert_eq!(kept.extension().and_then(|ext| ext.to_str()), Some("PDF"));
+        assert_eq!(export_file_name("sample-form.pdf"), "sample-form.pdf");
+        assert_eq!(export_file_name(""), "form.pdf");
+        let mut app = PageFormApp::new(false, None);
+        app.open_builtin_export();
+        let prompt = app.export_prompt.expect("builtin dialog");
+        assert_eq!(prompt.file_name, "sample-form.pdf");
+        assert!(!prompt.replace);
+    }
+
+    #[test]
     fn a_short_move_places_the_default_size_and_a_drag_does_not() {
         let view = ViewTransform::new(792.0);
         let start = PdfPoint { x: 100.0, y: 400.0 };
@@ -2908,6 +3355,16 @@ mod tests {
         let mut app = PageFormApp::new(false, None);
         assert!(!app.properties_open);
         assert!(!app.properties_pinned);
+        let mut storage = MemStorage::default();
+        write_preferences(&app, &mut storage);
+        let restored = PageFormApp::new(false, Some(&storage));
+        assert!(!restored.properties_open);
+        assert!(!restored.properties_pinned);
+        storage.set_string(crate::prefs::OPEN_KEY, "open".to_string());
+        storage.set_string(crate::prefs::PIN_KEY, "pinned".to_string());
+        let remembered = PageFormApp::new(false, Some(&storage));
+        assert!(remembered.properties_open);
+        assert!(remembered.properties_pinned);
         app.open_properties();
         assert!(app.properties_open);
         assert!(app.persist_panel);
@@ -3207,12 +3664,11 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = PageFormApp::new(false, None);
 
+        let before = app.status.clone();
         click_menu(&ctx, &mut app, "Open", |app, ui| app.file_menu(ui));
-        assert_eq!(app.status, "Open is not implemented yet");
         click_menu(&ctx, &mut app, "Save As", |app, ui| app.file_menu(ui));
-        assert_eq!(app.status, "Save As is not implemented yet");
         click_menu(&ctx, &mut app, "Print", |app, ui| app.file_menu(ui));
-        assert_eq!(app.status, "Print is not implemented yet");
+        assert_eq!(app.status, before, "Open, Save As, and Print stay disabled");
         click_menu(&ctx, &mut app, "Select All", |app, ui| app.edit_menu(ui));
         assert_eq!(app.status, "Select All is not implemented yet");
         click_menu(&ctx, &mut app, "Paste", |app, ui| app.edit_menu(ui));

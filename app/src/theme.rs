@@ -79,8 +79,9 @@ pub fn canvas_colors(dark: bool) -> CanvasColors {
             page: Color32::from_rgb(36, 40, 46),
             shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 110),
             page_edge: Color32::from_rgb(168, 176, 188),
-            minor_dot: Color32::from_rgb(164, 172, 184),
-            major_dot: Color32::from_rgb(226, 230, 236),
+            // Dimmer than the page edge so the dots sit behind lines and text.
+            minor_dot: Color32::from_rgb(118, 126, 138),
+            major_dot: Color32::from_rgb(168, 176, 188),
             minor_guide: Color32::from_rgb(86, 116, 140),
             major_guide: Color32::from_rgb(156, 190, 214),
             selection: Color32::from_rgb(120, 176, 255),

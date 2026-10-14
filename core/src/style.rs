@@ -312,7 +312,11 @@ impl FieldStyle {
                 style.border_width = 0.0;
                 style.fill = None;
             }
-            FieldKind::Line | FieldKind::Rectangle => style.fill = None,
+            FieldKind::Line => {
+                style.fill = None;
+                style.stroke_width = 1.5;
+            }
+            FieldKind::Rectangle => style.fill = None,
             FieldKind::Text
             | FieldKind::Checkbox
             | FieldKind::Radio
@@ -364,8 +368,12 @@ mod tests {
         let label = FieldStyle::for_kind(FieldKind::StaticText);
         assert!(label.fill.is_none());
         assert!(label.border_width < 0.01);
-        assert!(FieldStyle::for_kind(FieldKind::Line).fill.is_none());
-        assert!(FieldStyle::for_kind(FieldKind::Rectangle).fill.is_none());
+        let line = FieldStyle::for_kind(FieldKind::Line);
+        assert!(line.fill.is_none());
+        assert!((line.stroke_width - 1.5).abs() < 0.01);
+        let shape = FieldStyle::for_kind(FieldKind::Rectangle);
+        assert!(shape.fill.is_none());
+        assert!((shape.stroke_width - 1.0).abs() < 0.01);
         assert!(FieldStyle::for_kind(FieldKind::TextBox).multiline);
     }
 

@@ -343,6 +343,8 @@ pub enum AlignEdge {
     Center,
     Right,
     Top,
+    /// Vertical center of the selection bounds.
+    Middle,
     Bottom,
 }
 
@@ -359,6 +361,7 @@ pub fn align_rects(rects: &mut [RectPt], edge: AlignEdge) {
     let min_y = rects.iter().map(|rect| rect.y).fold(f32::MAX, f32::min);
     let max_top = rects.iter().map(|rect| rect.top()).fold(f32::MIN, f32::max);
     let mid_x = (min_x + max_right) * 0.5;
+    let mid_y = (min_y + max_top) * 0.5;
     for rect in rects.iter_mut() {
         match edge {
             AlignEdge::Left => rect.x = min_x,
@@ -366,6 +369,7 @@ pub fn align_rects(rects: &mut [RectPt], edge: AlignEdge) {
             AlignEdge::Right => rect.x = max_right - rect.w,
             AlignEdge::Bottom => rect.y = min_y,
             AlignEdge::Top => rect.y = max_top - rect.h,
+            AlignEdge::Middle => rect.y = mid_y - rect.h * 0.5,
         }
     }
 }
@@ -608,6 +612,11 @@ mod tests {
         close(rects[0].top(), 120.0);
         close(rects[1].top(), 120.0);
         close(rects[2].top(), 120.0);
+
+        align_rects(&mut rects, AlignEdge::Middle);
+        close(rects[0].y + rects[0].h * 0.5, 100.0);
+        close(rects[1].y + rects[1].h * 0.5, 100.0);
+        close(rects[2].y + rects[2].h * 0.5, 100.0);
 
         let mut row = [
             RectPt {

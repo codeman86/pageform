@@ -542,6 +542,7 @@ impl PageFormApp {
                 ("Center", AlignEdge::Center),
                 ("Right", AlignEdge::Right),
                 ("Top", AlignEdge::Top),
+                ("Middle", AlignEdge::Middle),
                 ("Bottom", AlignEdge::Bottom),
             ] {
                 if ui.button(label).clicked() {
@@ -755,14 +756,18 @@ fn drag_pt_impl(
     changed.then_some(value)
 }
 
+/// How long a press/release pair (or a line event and its pixel twin) counts
+/// as the same notch. A second physical notch is slower than this.
+const NOTCH_LOCK_SECS: f64 = 0.05;
+
 /// One wheel step for this frame, then forget the scroll so nothing else moves.
 ///
-/// A second call in the same frame returns 0. Linux often delivers one notch as a
-/// line event and a pixel event; those are one step, not two.
+/// A second call in the same frame returns 0. X11 delivers one notch as a
+/// button press and a button release, sometimes with a pixel event as well.
 fn take_wheel_delta(ui: &mut egui::Ui) -> f32 {
-    let (time, delta, from_line) = ui.input(|input| {
-        let (delta, from_line) = wheel_delta_from_events(&input.events);
-        (input.time, delta, from_line)
+    let (time, delta) = ui.input(|input| {
+        let (delta, _) = wheel_delta_from_events(&input.events);
+        (input.time, delta)
     });
     ui.ctx().input_mut(|input| {
         input.raw_scroll_delta = egui::Vec2::ZERO;
@@ -771,13 +776,10 @@ fn take_wheel_delta(ui: &mut egui::Ui) -> f32 {
     if delta == 0.0 {
         return 0.0;
     }
-    // A line event and its pixel twin sometimes land in adjacent frames.
-    let line_id = egui::Id::new("pageform-wheel-line-time");
-    if !from_line {
-        let recent = ui.data(|data| data.get_temp::<f64>(line_id));
-        if recent.is_some_and(|last| (time - last).abs() < 0.08) {
-            return 0.0;
-        }
+    let last_id = egui::Id::new("pageform-wheel-last");
+    let last = ui.data(|data| data.get_temp::<(f64, f32)>(last_id));
+    if !notch_is_new(time, delta, last) {
+        return 0.0;
     }
     // The properties UI can run twice in one frame. Count the notch once.
     let stamp = (time.to_bits(), delta.to_bits());
@@ -787,9 +789,7 @@ fn take_wheel_delta(ui: &mut egui::Ui) -> f32 {
     }
     ui.data_mut(|data| {
         data.insert_temp(id, stamp);
-        if from_line {
-            data.insert_temp(line_id, time);
-        }
+        data.insert_temp(last_id, (time, delta));
     });
     delta
 }
@@ -798,11 +798,16 @@ fn take_wheel_delta(ui: &mut egui::Ui) -> f32 {
 /// supplied them.
 ///
 /// A vertical notch and a Shift+wheel notch that egui (or the OS) turned into a
-/// horizontal delta both count. Shift selects the 0.5 pt step. Pixel events that
-/// accompany a line event are the same notch and are ignored. Several pixel
-/// events in one frame are still one notch.
+/// horizontal delta both count. Shift selects the 0.5 pt step.
+///
+/// On X11, winit turns buttons 4 and 5 into a line event on both press and
+/// release, so one xdotool notch is two identical `Line` events. Those are one
+/// step. A single event whose magnitude is greater than 1 is that many notches.
+/// Pixel events that accompany a line event are the same notch.
 fn wheel_delta_from_events(events: &[egui::Event]) -> (f32, bool) {
-    let mut line = 0.0_f32;
+    let mut line_sign = 0.0_f32;
+    let mut line_notches = 0.0_f32;
+    let mut line_shift = false;
     let mut saw_line = false;
     let mut point_sign = 0.0_f32;
     let mut point_shift = false;
@@ -825,10 +830,20 @@ fn wheel_delta_from_events(events: &[egui::Event]) -> (f32, bool) {
         }
         match unit {
             egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
-                let notches = amount.abs().max(1.0);
-                let step = if modifiers.shift { 0.5 } else { 1.0 };
-                line += amount.signum() * step * notches;
-                saw_line = true;
+                let sign = amount.signum();
+                let mag = amount.abs();
+                if !saw_line {
+                    line_sign = sign;
+                    line_shift = modifiers.shift;
+                    // A unit line is one notch. A larger value in one event is
+                    // several notches (a flick reported as a single delta).
+                    line_notches = if mag <= 1.0 { 1.0 } else { mag };
+                    saw_line = true;
+                } else if (sign - line_sign).abs() < 0.01 && mag <= 1.0 {
+                    // Press plus release, or a second copy of the same notch.
+                } else {
+                    line_notches += mag.max(1.0);
+                }
             }
             egui::MouseWheelUnit::Point => {
                 point_sign = amount.signum();
@@ -837,13 +852,28 @@ fn wheel_delta_from_events(events: &[egui::Event]) -> (f32, bool) {
         }
     }
     if saw_line {
-        (line, true)
+        let step = if line_shift { 0.5 } else { 1.0 };
+        (line_sign * step * line_notches, true)
     } else if point_sign != 0.0 {
         let step = if point_shift { 0.5 } else { 1.0 };
         (point_sign * step, false)
     } else {
         (0.0, false)
     }
+}
+
+/// False when `delta` is the rest of a notch already accepted at `last`.
+fn notch_is_new(now: f64, delta: f32, last: Option<(f64, f32)>) -> bool {
+    if delta == 0.0 {
+        return false;
+    }
+    let Some((then, previous)) = last else {
+        return true;
+    };
+    if previous.signum() == delta.signum() && (now - then).abs() < NOTCH_LOCK_SECS {
+        return false;
+    }
+    true
 }
 
 fn bump_sidebar_fonts(ui: &mut egui::Ui) {
@@ -951,6 +981,32 @@ mod tests {
             },
         ];
         assert_eq!(wheel_delta_from_events(&pixels).0, 1.0);
+        // X11 / xdotool: button 4 press and release are two line events.
+        let x11_press_release = [
+            wheel(egui::vec2(0.0, 1.0), false),
+            wheel(egui::vec2(0.0, 1.0), false),
+        ];
+        assert_eq!(wheel_delta_from_events(&x11_press_release).0, 1.0);
+        let x11_shift = [
+            wheel(egui::vec2(0.0, 1.0), true),
+            wheel(egui::vec2(0.0, 1.0), true),
+        ];
+        assert_eq!(wheel_delta_from_events(&x11_shift).0, 0.5);
+        let x11_down = [
+            wheel(egui::vec2(0.0, -1.0), false),
+            wheel(egui::vec2(0.0, -1.0), false),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -15.0),
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        assert_eq!(wheel_delta_from_events(&x11_down).0, -1.0);
+        // The release can land in the next frame.
+        assert!(notch_is_new(1.0, 1.0, None));
+        assert!(!notch_is_new(1.016, 1.0, Some((1.0, 1.0))));
+        assert!(notch_is_new(1.016, -0.5, Some((1.0, 1.0))));
+        assert!(notch_is_new(1.08, 1.0, Some((1.0, 1.0))));
     }
 
     #[test]
@@ -993,6 +1049,31 @@ mod tests {
             |ctx| show(ctx, &mut value),
         );
         assert_eq!(value, 13.0, "wheel up adds 1 pt");
+        time += 0.016;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    wheel(egui::vec2(0.0, 1.0), false),
+                ],
+            ),
+            |ctx| show(ctx, &mut value),
+        );
+        assert_eq!(value, 13.0, "the button release is not a second notch");
+        time += 1.0;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(at),
+                    wheel(egui::vec2(0.0, 1.0), false),
+                    wheel(egui::vec2(0.0, 1.0), false),
+                ],
+            ),
+            |ctx| show(ctx, &mut value),
+        );
+        assert_eq!(value, 14.0, "press and release in one frame add 1 pt");
         time += 0.02;
         let _ = ctx.run(
             input(
@@ -1009,7 +1090,7 @@ mod tests {
             |ctx| show(ctx, &mut value),
         );
         assert_eq!(
-            value, 13.0,
+            value, 14.0,
             "a pixel event just after a line event is the same notch"
         );
         assert_eq!(
@@ -1034,7 +1115,7 @@ mod tests {
             ),
             |ctx| show(ctx, &mut value),
         );
-        assert_eq!(value, 12.5, "Shift+horizontal wheel subtracts 0.5 pt");
+        assert_eq!(value, 13.5, "Shift+horizontal wheel subtracts 0.5 pt");
 
         value = 96.0;
         time += 1.0;

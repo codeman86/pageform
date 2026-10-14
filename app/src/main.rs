@@ -161,12 +161,15 @@ page. Enter finishes, Esc cancels, and Shift+Enter adds a line in a text box
 or multiline field. Pin keeps the panel open.
 Unpinned, it closes when you click empty canvas with Select, or when the
 selection is deleted. Preferences stores that open and pinned choice.
-Nothing selected edits the page. One item edits that item. Shift-click or
-Ctrl-click selects several items for align, distribute, and match size.
+Nothing selected edits the page. One item edits that item. Drag on empty
+canvas to draw a selection box. Shift-click or Ctrl-click selects several
+items. Edit > Align, the properties panel, and the right-click menu align,
+distribute, and match size.
 Calculations are a placeholder. Margins, header, and footer stay on the canvas.
-File: New opens New Blank Document and New from Template. Those, plus Open, Save,
-Save As, and Print, are not implemented yet.
-Export PDF asks where to save the PDF. Exit closes the window.
+File: New opens New Blank Document and New from Template. Those are not
+implemented yet. Open, Save, Save As, and Print are disabled and say Coming soon.
+Export PDF asks where to save the PDF. If there is no system file dialog,
+PageForm asks for the folder and file name. Exit closes the window.
 Edit: Select and Delete work. Select All, Copy, Cut, and Paste are not
 implemented yet. Preferences is a dialog for the theme and radio labels.
 Insert drops a default item in the view, listed alphabetically. A toolbar
