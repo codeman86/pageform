@@ -176,8 +176,9 @@ file, so Save asks for a new .pgd and cannot overwrite the template. Ctrl or
 Cmd+Shift+S is Save As. A .pgt is written only when Template is chosen, and
 an existing template asks before it is replaced. Saving a template does not
 link that file. Ctrl or Cmd+P prints. The window title shows the file name
-and a * when there are unsaved changes. Exit asks before closing a changed
-file. Open Recent and the Open window show the file name, with
+and a * when there are unsaved changes. Exit uses Ctrl or Cmd+Q and asks
+before closing a changed file. The window close button and Alt+F4 ask the
+same question, once. Open Recent and the Open window show the file name, with
 (template) on a .pgt file, and the full path as the tooltip. Copy places
 the selected items' text on the clipboard, one item per line. Ctrl or Cmd+V
 on the canvas pastes those items while that text is still on the clipboard.

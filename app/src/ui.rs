@@ -923,6 +923,22 @@ impl PageFormApp {
         self.persist_panel = true;
     }
 
+    /// Alt+F4 and the window close button arrive as `close_requested`.
+    /// Cancel that close while the document is dirty or a prompt is open, and
+    /// show the Exit prompt once.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.allow_close || !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if !self.doc.is_dirty() && self.unsaved.is_none() {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.doc.is_dirty() && self.unsaved.is_none() {
+            self.unsaved = Some(PendingFileAction::Exit);
+        }
+    }
+
     fn print_current(&mut self) {
         let bytes = match export_pdf(&self.doc) {
             Ok(bytes) => bytes,
@@ -1265,9 +1281,9 @@ impl PageFormApp {
                     }
                 }
                 "Exit" => {
-                    if ui.button(*label).clicked() {
+                    let shortcut = command_shortcut(ui, egui::Key::Q);
+                    if menu_command(ui, "Exit", Some(&shortcut), false) {
                         self.ask_or_run(PendingFileAction::Exit);
-                        ui.close();
                     }
                 }
                 "New" => {
@@ -2079,6 +2095,7 @@ impl PageFormApp {
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
         let new_blank = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
         let print = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P);
+        let exit = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
         let select_all = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A);
         if ctx.input_mut(|input| input.consume_shortcut(&save_as)) {
             self.save_project_as();
@@ -2090,6 +2107,8 @@ impl PageFormApp {
             self.request_new_blank();
         } else if ctx.input_mut(|input| input.consume_shortcut(&print)) {
             self.print_current();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&exit)) {
+            self.ask_or_run(PendingFileAction::Exit);
         } else if ctx.input_mut(|input| input.consume_shortcut(&select_all)) {
             self.select_all();
         }
@@ -3034,15 +3053,7 @@ impl eframe::App for PageFormApp {
             self.last_title = title.clone();
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
         }
-        if ctx.input(|input| input.viewport().close_requested())
-            && !self.allow_close
-            && self.doc.is_dirty()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if self.unsaved.is_none() {
-                self.unsaved = Some(PendingFileAction::Exit);
-            }
-        }
+        self.handle_close_request(ctx);
         crate::theme::apply(ctx, self.dark);
         if self.persist_theme || self.persist_panel {
             if let Some(storage) = frame.storage_mut() {
@@ -3254,7 +3265,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File > New Blank Document starts a blank page and asks before discarding unsaved work. Ctrl or Cmd+N does that, and the New menu shows that shortcut. New from Template opens a .pgt template as a new untitled document and does not change the template. The new document stays clean until you edit it. Open reads .pgd documents, .pgt templates, and older .pageform files. Ctrl or Cmd+O opens. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, has no linked file, so Save asks for a new .pgd name and cannot overwrite the template. Save As uses Ctrl or Cmd+Shift+S. A template file is written only when Template (.pgt) is chosen, and an existing template asks before it is replaced. Saving a template does not link that file, so the next Save still asks for a .pgd. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent and the Open window list the file name. A template is labeled template, and the full path is the tooltip. Copy places the selected items' text on the system clipboard, one item per line. Ctrl or Cmd+V on the canvas pastes the items when that text is still on the clipboard. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
+        "File > New Blank Document starts a blank page and asks before discarding unsaved work. Ctrl or Cmd+N does that, and the New menu shows that shortcut. New from Template opens a .pgt template as a new untitled document and does not change the template. The new document stays clean until you edit it. Open reads .pgd documents, .pgt templates, and older .pageform files. Ctrl or Cmd+O opens. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, has no linked file, so Save asks for a new .pgd name and cannot overwrite the template. Save As uses Ctrl or Cmd+Shift+S. A template file is written only when Template (.pgt) is chosen, and an existing template asks before it is replaced. Saving a template does not link that file, so the next Save still asks for a .pgd. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent and the Open window list the file name. A template is labeled template, and the full path is the tooltip. Copy places the selected items' text on the system clipboard, one item per line. Ctrl or Cmd+V on the canvas pastes the items when that text is still on the clipboard. The window title shows the file name and a * when there are unsaved changes. Exit uses Ctrl or Cmd+Q and asks before closing a changed file. The window close button and Alt+F4 use that same question, once. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
     ),
     (
         "Is there a list box?",
@@ -4436,12 +4447,66 @@ mod tests {
     }
 
     #[test]
+    fn window_close_uses_the_exit_prompt_once() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+
+        let output = ctx.run(close_input(), |ctx| app.handle_close_request(ctx));
+        assert!(matches!(app.unsaved, Some(PendingFileAction::Exit)));
+        assert!(viewport_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+
+        let output = ctx.run(close_input(), |ctx| app.handle_close_request(ctx));
+        assert!(matches!(app.unsaved, Some(PendingFileAction::Exit)));
+        assert!(viewport_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+
+        app.unsaved = Some(PendingFileAction::Open);
+        let output = ctx.run(close_input(), |ctx| app.handle_close_request(ctx));
+        assert!(
+            matches!(app.unsaved, Some(PendingFileAction::Open)),
+            "a second close does not open another prompt"
+        );
+        assert!(viewport_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+
+        let mut clean = PageFormApp::new(false, None);
+        let output = ctx.run(close_input(), |ctx| clean.handle_close_request(ctx));
+        assert!(clean.unsaved.is_none());
+        assert!(!viewport_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+    }
+
+    fn close_input() -> egui::RawInput {
+        let mut input = screen_input();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .events
+            .push(egui::ViewportEvent::Close);
+        input
+    }
+
+    fn viewport_commands(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
     fn file_shortcuts_are_labeled_and_dispatch_without_a_native_dialog() {
         let ctx = egui::Context::default();
         let mut app = PageFormApp::new(false, None);
         let file = panel(&ctx, &mut app, |app, ui| app.file_menu(ui));
         let texts = galley_texts(&file);
-        for shortcut in ["Ctrl+N", "Ctrl+O", "Ctrl+S", "Ctrl+Shift+S", "Ctrl+P"] {
+        for shortcut in [
+            "Ctrl+N",
+            "Ctrl+O",
+            "Ctrl+S",
+            "Ctrl+Shift+S",
+            "Ctrl+P",
+            "Ctrl+Q",
+        ] {
             assert!(
                 texts.iter().any(|text| text == shortcut),
                 "{shortcut} missing from {texts:?}"
@@ -4452,6 +4517,17 @@ mod tests {
         assert!(texts.iter().any(|text| text == "Ctrl+N"), "{texts:?}");
         assert_eq!(recent_menu_label("/tmp/t6.pgt"), "t6.pgt (template)");
         assert_eq!(recent_menu_label("/tmp/t6.pgd"), "t6.pgd");
+
+        app.insert_at_view(FieldKind::Text);
+        press_command(&ctx, &mut app, egui::Key::Q, false);
+        assert!(matches!(app.unsaved, Some(PendingFileAction::Exit)));
+        assert!(!app.allow_close);
+        app.unsaved = None;
+        app.doc.mark_clean();
+        press_command(&ctx, &mut app, egui::Key::Q, false);
+        assert!(app.unsaved.is_none());
+        assert!(app.allow_close);
+        app.allow_close = false;
 
         app.insert_at_view(FieldKind::Text);
         press_command(&ctx, &mut app, egui::Key::O, false);
