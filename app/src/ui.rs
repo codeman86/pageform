@@ -522,15 +522,18 @@ impl PageFormApp {
     }
 
     fn save_project(&mut self) {
-        if let Some(path) = self.bound_project_path() {
+        // No linked document: Save As, defaulting to a new `.pgd`. A `.pgt` is
+        // never the target of plain Save.
+        if let Some(path) = self.linked_document_path() {
             self.write_project_file(std::path::Path::new(&path));
         } else {
             self.save_project_as();
         }
     }
 
-    /// A saved `.pgd` or legacy `.pageform`. A template is never the bound file.
-    fn bound_project_path(&self) -> Option<String> {
+    /// The `.pgd` or legacy `.pageform` this document would overwrite.
+    /// `None` for a new document and for anything opened from a template.
+    fn linked_document_path(&self) -> Option<String> {
         self.project_path
             .clone()
             .filter(|path| !is_template_path(std::path::Path::new(path)))
@@ -539,13 +542,44 @@ impl PageFormApp {
     fn save_project_as(&mut self) {
         let name = suggested_project_name(self.project_path.as_deref(), false);
         match pick_native(true, "Save PageForm", SAVE_FILTERS, &name) {
-            NativePick::Path(path) => self.write_project_file(&native_project_save_path(path)),
+            NativePick::Path(path) => self.save_chosen_project(native_project_save_path(path)),
             NativePick::Cancel => {
                 self.after_save = None;
                 self.status = "Save cancelled".to_string();
             }
             NativePick::Fallback => self.open_builtin_prompt(PromptKind::SaveProject),
         }
+    }
+
+    /// A `.pgt` is stored only when Save As already resolved to that extension,
+    /// which is the Template type. An existing template asks before replacement.
+    fn save_chosen_project(&mut self, path: std::path::PathBuf) {
+        if is_template_path(&path) && path.exists() {
+            self.confirm_template_replace(path);
+            return;
+        }
+        self.write_project_file(&path);
+    }
+
+    fn confirm_template_replace(&mut self, path: std::path::PathBuf) {
+        let directory = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(default_export_dir);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Untitled.pgt")
+            .to_string();
+        self.file_prompt = Some(FilePrompt {
+            kind: PromptKind::SaveProject,
+            directory,
+            file_name,
+            replace: true,
+            save_as_template: true,
+        });
+        self.status = "That template already exists. Save again to replace it.".to_string();
     }
 
     fn open_builtin_prompt(&mut self, kind: PromptKind) {
@@ -3182,7 +3216,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File > New Blank Document starts a blank page and asks before discarding unsaved work. New from Template opens a .pgt template as a new untitled document and does not change the template. Open reads .pgd documents, .pgt templates, and older .pageform files. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, asks for a .pgd name. Save As uses Ctrl or Cmd+Shift+S and can store a Document (.pgd) or a Template (.pgt). Saving a template does not make that file the open document, so a later Save cannot overwrite it. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent lists the last .pgd and .pgt files. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
+        "File > New Blank Document starts a blank page and asks before discarding unsaved work. New from Template opens a .pgt template as a new untitled document and does not change the template. Open reads .pgd documents, .pgt templates, and older .pageform files. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, has no linked file, so Save asks for a new .pgd name and cannot overwrite the template. Save As uses Ctrl or Cmd+Shift+S. A template file is written only when Template (.pgt) is chosen, and an existing template asks before it is replaced. Saving a template does not link that file, so the next Save still asks for a .pgd. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent lists the last .pgd and .pgt files. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
     ),
     (
         "Is there a list box?",
@@ -4409,7 +4443,7 @@ mod tests {
         assert!(app.doc.is_dirty());
         assert_eq!(app.window_title(), "Untitled * - PageForm");
         assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
-        assert!(app.bound_project_path().is_none());
+        assert!(app.linked_document_path().is_none());
         assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
         assert_eq!(app.recent[0], template.display().to_string());
 
@@ -4477,6 +4511,143 @@ mod tests {
         let _ = std::fs::remove_file(&template);
         let _ = std::fs::remove_file(&document);
         let _ = std::fs::remove_file(&legacy);
+    }
+
+    #[test]
+    fn opening_a_template_leaves_no_linked_path() {
+        let template =
+            std::env::temp_dir().join(format!("pageform-unlinked-{}.pgt", std::process::id()));
+        let mut source = PageFormApp::new(false, None);
+        source.insert_at_view(FieldKind::Text);
+        let id = source.primary().unwrap();
+        source.doc.set_default_value(id, "Ada");
+        let text = source
+            .doc
+            .to_project_ron(pageform_core::ProjectKind::Template)
+            .unwrap();
+        std::fs::write(&template, &text).unwrap();
+        let original = std::fs::read(&template).unwrap();
+
+        let mut app = PageFormApp::new(false, None);
+        app.read_project_file(&template);
+        assert!(
+            app.project_path.is_none(),
+            "opening a template must not link a path"
+        );
+        assert!(app.linked_document_path().is_none());
+        assert_eq!(app.window_title(), "Untitled * - PageForm");
+        assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
+        assert_eq!(
+            suggested_project_name(app.project_path.as_deref(), false),
+            "Untitled.pgd"
+        );
+        app.doc.set_header_text("Edited");
+        app.open_builtin_prompt(PromptKind::SaveProject);
+        let prompt = app.file_prompt.clone().expect("plain save asks for a name");
+        assert_eq!(prompt.kind, PromptKind::SaveProject);
+        assert!(!prompt.save_as_template);
+        assert_eq!(prompt.file_name, "Untitled.pgd");
+        let document_path = project_save_path(
+            &prompt.directory,
+            template.file_name().unwrap().to_str().unwrap(),
+            false,
+        );
+        assert_eq!(
+            document_path.extension().and_then(|ext| ext.to_str()),
+            Some("pgd")
+        );
+        assert_ne!(document_path, template);
+        assert_eq!(std::fs::read(&template).unwrap(), original);
+
+        let _ = std::fs::remove_file(&template);
+    }
+
+    #[test]
+    fn replacing_an_existing_template_asks_before_writing() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir();
+        let template = dir.join(format!("pageform-replace-{}.pgt", std::process::id()));
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.doc.set_default_value(id, "Ada");
+        let original = app
+            .doc
+            .to_project_ron(pageform_core::ProjectKind::Template)
+            .unwrap();
+        std::fs::write(&template, &original).unwrap();
+        app.doc.set_default_value(id, "Changed");
+
+        app.open_builtin_prompt(PromptKind::SaveProject);
+        {
+            let prompt = app.file_prompt.as_mut().expect("save dialog");
+            prompt.directory = dir.display().to_string();
+            prompt.file_name = template
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace(".pgt", ".pgd");
+        }
+        let _ = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let at = text_center(
+            &show_settled(&ctx, &mut app, |app, ctx| {
+                egui::CentralPanel::default().show(ctx, |_| {});
+                app.export_dialog(ctx);
+            }),
+            "Template (.pgt)",
+        )
+        .expect("template type");
+        click_at(&ctx, &mut app, at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let prompt = app.file_prompt.clone().expect("dialog stays open");
+        assert!(prompt.save_as_template);
+        assert!(prompt.file_name.ends_with(".pgt"), "{}", prompt.file_name);
+
+        let save_at = text_center(
+            &show_settled(&ctx, &mut app, |app, ctx| {
+                egui::CentralPanel::default().show(ctx, |_| {});
+                app.export_dialog(ctx);
+            }),
+            "Save",
+        )
+        .expect("save");
+        click_at(&ctx, &mut app, save_at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        assert_eq!(std::fs::read_to_string(&template).unwrap(), original);
+        assert!(app.project_path.is_none());
+        let confirm = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&confirm);
+        assert!(
+            texts.iter().any(|text| text.contains("already exists")),
+            "{texts:?}"
+        );
+        let replace_at = text_center(&confirm, "Replace").expect("replace");
+        click_at(&ctx, &mut app, replace_at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let saved = std::fs::read_to_string(&template).unwrap();
+        assert_ne!(saved, original);
+        assert!(saved.contains("kind: Template"), "{saved}");
+        assert!(saved.contains("Changed"), "{saved}");
+        assert!(
+            app.project_path.is_none(),
+            "saving a template must not link it"
+        );
+        assert!(app.linked_document_path().is_none());
+
+        let _ = std::fs::remove_file(&template);
     }
 
     #[test]

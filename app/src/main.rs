@@ -169,10 +169,11 @@ Calculations are a placeholder. Margins, header, and footer stay on the canvas.
 File: New Blank Document starts a blank page and asks before discarding
 unsaved work. New from Template opens a .pgt template as a new untitled
 document and does not change the template. Open reads .pgd documents, .pgt
-templates, and older .pageform files. Ctrl or Cmd+S saves the current .pgd,
-or asks for a .pgd name the first time and after a template. Ctrl or
-Cmd+Shift+S is Save As, which can store a Document (.pgd) or a Template
-(.pgt). Saving a template does not make that file the open document. Ctrl or
+templates, and older .pageform files. Ctrl or Cmd+S saves the current .pgd.
+A document opened from a template has no linked file, so Save asks for a new
+.pgd and cannot overwrite the template. Ctrl or Cmd+Shift+S is Save As. A
+.pgt is written only when Template is chosen, and an existing template asks
+before it is replaced. Saving a template does not link that file. Ctrl or
 Cmd+P prints. The window title shows the file name and a * when there are
 unsaved changes. Exit asks before closing a changed file.
 Export PDF asks where to save the PDF. If there is no system file dialog,
