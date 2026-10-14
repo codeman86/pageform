@@ -21,7 +21,7 @@ Insert menu, alphabetical:
 | Text Box | Static text block with basic wrapping. Not a form field. |
 | Text Field | One-line fillable AcroForm text field. |
 
-Toolbar insert icons, alphabetical: Checkbox, Date, Drop-down, Image, Line, Radio, Shapes (Square or Rectangle), Signature, Table, Text, Text Box, Text Field. Edit has Select All, Copy, Cut, Paste, and Delete, with Ctrl or Cmd+A, C, X, and V. New Blank Document starts a blank page (Ctrl or Cmd+N). New from Template opens a .pgt file as a new untitled document with no linked path, and that document stays clean until it is edited. Open (Ctrl or Cmd+O), Save, Save As, and Print work. Open Recent labels a template, for example t6.pgt (template). Save As chooses Document (.pgd) or Template (.pgt), and an existing template asks before it is replaced. Insert Page is not implemented yet.
+Toolbar insert icons, alphabetical: Checkbox, Date, Drop-down, Image, Line, Radio, Shapes (Square or Rectangle), Signature, Table, Text, Text Box, Text Field. Edit has Select All, Copy, Cut, Paste, and Delete, with Ctrl or Cmd+A, C, X, and V. New Blank Document starts a blank page (Ctrl or Cmd+N). New from Template opens a .pgt file as a new untitled document with no linked path, and that document stays clean until it is edited. Open (Ctrl or Cmd+O), Save, Save As, and Print work. File > New shows Ctrl or Cmd+N. Open Recent and the Open window show the file name, with (template) on a .pgt file and the full path as the tooltip. Copy puts the selected items' text on the clipboard. Save As chooses Document (.pgd) or Template (.pgt), and an existing template asks before it is replaced. Insert Page is not implemented yet.
 
 ![PageForm toolbar](docs/toolbar.png)
 

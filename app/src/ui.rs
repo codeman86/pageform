@@ -194,6 +194,9 @@ struct PageFormApp {
     canvas_rect: Option<Rect>,
     drag: Option<Drag>,
     clipboard: Vec<Field>,
+    /// Exact text last written to the OS clipboard for those items.
+    /// A canvas paste of this string pastes the items. Any other text is not.
+    item_paste_text: Option<String>,
     paste_steps: i32,
     /// The Insert menu click is also over the canvas. Ignore that pointer
     /// press so it does not clear the selection just made.
@@ -268,6 +271,7 @@ impl PageFormApp {
             canvas_rect: None,
             drag: None,
             clipboard: Vec::new(),
+            item_paste_text: None,
             paste_steps: 0,
             suppress_place_click: false,
             name_buf: String::new(),
@@ -351,6 +355,11 @@ impl PageFormApp {
             .filter_map(|id| self.doc.field(*id).cloned())
             .collect();
         self.paste_steps = 0;
+        self.item_paste_text = if self.clipboard.is_empty() {
+            None
+        } else {
+            Some(items_clipboard_text(&self.clipboard))
+        };
         let count = self.clipboard.len();
         self.status = if count == 1 {
             "Copied 1 item".to_string()
@@ -371,6 +380,13 @@ impl PageFormApp {
         } else {
             format!("Cut {count} items")
         };
+    }
+
+    fn publish_item_clipboard(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.item_paste_text.clone() else {
+            return;
+        };
+        ctx.copy_text(text);
     }
 
     fn paste_clipboard(&mut self) {
@@ -457,6 +473,7 @@ impl PageFormApp {
         self.project_path = None;
         self.selection.clear();
         self.clipboard.clear();
+        self.item_paste_text = None;
         self.paste_steps = 0;
         self.inline = None;
         self.drag = None;
@@ -671,7 +688,7 @@ impl PageFormApp {
                     ui.add_space(8.0);
                     ui.label("Recent");
                     for path in &shown {
-                        if ui.button(recent_menu_label(path)).clicked() {
+                        if recent_entry(ui, path).clicked() {
                             open_recent = Some(path.clone());
                         }
                     }
@@ -1207,7 +1224,7 @@ impl PageFormApp {
                         ui.menu_button("Open Recent", |ui| {
                             ui.set_min_width(280.0);
                             for path in self.recent.clone() {
-                                if ui.button(recent_menu_label(&path)).clicked() {
+                                if recent_entry(ui, &path).clicked() {
                                     self.ask_or_run(PendingFileAction::OpenPath(path));
                                     ui.close();
                                 }
@@ -1254,7 +1271,13 @@ impl PageFormApp {
                     }
                 }
                 "New" => {
-                    ui.menu_button("New", |ui| self.new_menu(ui));
+                    let shortcut = command_shortcut(ui, egui::Key::N);
+                    let mut atoms = egui::Atoms::new("New");
+                    atoms.push_right(egui::Atom::grow());
+                    atoms.push_right(egui::RichText::new(shortcut).weak());
+                    atoms.push_right(egui::containers::menu::SubMenuButton::RIGHT_ARROW);
+                    egui::containers::menu::SubMenuButton::from_button(egui::Button::new(atoms))
+                        .ui(ui, |ui| self.new_menu(ui));
                 }
                 other => self.stub_item(ui, other),
             }
@@ -1285,7 +1308,7 @@ impl PageFormApp {
                     if menu_command_enabled(ui, label, Some(&shortcut), !self.selection.is_empty())
                     {
                         self.copy_selection();
-                        ui.ctx().copy_text(ITEM_CLIPBOARD_MARKER.to_string());
+                        self.publish_item_clipboard(ui.ctx());
                     }
                 }
                 "Cut" => {
@@ -1293,7 +1316,7 @@ impl PageFormApp {
                     if menu_command_enabled(ui, label, Some(&shortcut), !self.selection.is_empty())
                     {
                         self.cut_selection();
-                        ui.ctx().copy_text(ITEM_CLIPBOARD_MARKER.to_string());
+                        self.publish_item_clipboard(ui.ctx());
                     }
                 }
                 "Paste" => {
@@ -2003,7 +2026,7 @@ impl PageFormApp {
         }
         let mut copy = false;
         let mut cut = false;
-        let mut paste = false;
+        let mut pasted: Option<String> = None;
         ctx.input_mut(|input| {
             input.events.retain(|event| match event {
                 egui::Event::Copy => {
@@ -2014,8 +2037,8 @@ impl PageFormApp {
                     cut = true;
                     false
                 }
-                egui::Event::Paste(_) => {
-                    paste = true;
+                egui::Event::Paste(text) => {
+                    pasted = Some(text.clone());
                     false
                 }
                 _ => true,
@@ -2023,6 +2046,8 @@ impl PageFormApp {
         });
         // egui emits Paste only when the OS clipboard already has text, and it
         // does not also emit Key::V. Accept either, but only paste once.
+        // A paste whose text is not the item text we wrote is someone else's
+        // clipboard, so the canvas leaves it alone.
         let paste_key = ctx.input_mut(|input| {
             input.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,
@@ -2030,13 +2055,21 @@ impl PageFormApp {
             ))
         });
         if cut {
+            let had_selection = !self.selection.is_empty();
             self.cut_selection();
-            ctx.copy_text(ITEM_CLIPBOARD_MARKER.to_string());
+            if had_selection {
+                self.publish_item_clipboard(ctx);
+            }
         } else if copy {
             self.copy_selection();
-            ctx.copy_text(ITEM_CLIPBOARD_MARKER.to_string());
-        } else if paste || paste_key {
-            self.paste_clipboard();
+            self.publish_item_clipboard(ctx);
+        } else {
+            let foreign = pasted
+                .as_ref()
+                .is_some_and(|text| self.item_paste_text.as_deref() != Some(text));
+            if !foreign && (pasted.is_some() || paste_key) {
+                self.paste_clipboard();
+            }
         }
         let save_as = egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
@@ -3152,9 +3185,6 @@ fn on_step(value: f32, step: f32) -> bool {
 
 const MENU_BAR: &[&str] = &["File", "Edit", "Insert", "View", "Help"];
 
-/// Text placed on the OS clipboard so the next Ctrl/Cmd+V emits `Event::Paste`.
-const ITEM_CLIPBOARD_MARKER: &str = "PageForm items";
-
 const FILE_MENU: &[&str] = &[
     "New",
     "Open",
@@ -3224,7 +3254,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File > New Blank Document starts a blank page and asks before discarding unsaved work. Ctrl or Cmd+N does that. New from Template opens a .pgt template as a new untitled document and does not change the template. The new document stays clean until you edit it. Open reads .pgd documents, .pgt templates, and older .pageform files. Ctrl or Cmd+O opens. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, has no linked file, so Save asks for a new .pgd name and cannot overwrite the template. Save As uses Ctrl or Cmd+Shift+S. A template file is written only when Template (.pgt) is chosen, and an existing template asks before it is replaced. Saving a template does not link that file, so the next Save still asks for a .pgd. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent lists the last .pgd and .pgt files, and a template is labeled template. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
+        "File > New Blank Document starts a blank page and asks before discarding unsaved work. Ctrl or Cmd+N does that, and the New menu shows that shortcut. New from Template opens a .pgt template as a new untitled document and does not change the template. The new document stays clean until you edit it. Open reads .pgd documents, .pgt templates, and older .pageform files. Ctrl or Cmd+O opens. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, has no linked file, so Save asks for a new .pgd name and cannot overwrite the template. Save As uses Ctrl or Cmd+Shift+S. A template file is written only when Template (.pgt) is chosen, and an existing template asks before it is replaced. Saving a template does not link that file, so the next Save still asks for a .pgd. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent and the Open window list the file name. A template is labeled template, and the full path is the tooltip. Copy places the selected items' text on the system clipboard, one item per line. Ctrl or Cmd+V on the canvas pastes the items when that text is still on the clipboard. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
     ),
     (
         "Is there a list box?",
@@ -3478,16 +3508,56 @@ fn ignore_place_click(suppress: bool, primary_down: bool) -> (bool, bool) {
     }
 }
 
+fn recent_file_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+}
+
 fn recent_menu_label(path: &str) -> String {
+    let name = recent_file_name(path);
     if is_template_path(std::path::Path::new(path)) {
-        let name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(path);
         format!("{name} (template)")
     } else {
-        path.to_string()
+        name.to_string()
     }
+}
+
+fn recent_entry(ui: &mut egui::Ui, path: &str) -> egui::Response {
+    let response = ui.button(recent_menu_label(path));
+    // Menus and the Open window are popups, and egui hides ordinary tooltips there.
+    if response.hovered() {
+        response.show_tooltip_ui(|ui| {
+            ui.label(path);
+        });
+    }
+    response
+}
+
+fn copied_item_text(field: &Field) -> String {
+    match field.kind() {
+        FieldKind::StaticText
+        | FieldKind::TextBox
+        | FieldKind::Radio
+        | FieldKind::Checkbox
+        | FieldKind::Signature => field.caption().to_string(),
+        FieldKind::Text | FieldKind::Date | FieldKind::Dropdown => {
+            field.style().default_value.clone()
+        }
+        FieldKind::Line | FieldKind::Rectangle | FieldKind::Image | FieldKind::Table => {
+            String::new()
+        }
+    }
+}
+
+fn items_clipboard_text(fields: &[Field]) -> String {
+    fields
+        .iter()
+        .map(copied_item_text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn command_shortcut(ui: &egui::Ui, key: egui::Key) -> String {
@@ -4253,6 +4323,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = PageFormApp::new(false, None);
         app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.doc.set_default_value(id, "Ada");
         let placed = app.selection.clone();
         assert!(app.suppress_place_click);
         assert_eq!(ignore_place_click(true, false), (true, false));
@@ -4262,19 +4334,37 @@ mod tests {
         input.events.push(egui::Event::Copy);
         let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
         assert_eq!(app.clipboard.len(), 1);
+        assert_eq!(app.item_paste_text.as_deref(), Some("Ada"));
 
         let mut input = screen_input();
         input.events.push(egui::Event::Cut);
         let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
         assert!(app.doc.fields().is_empty());
+        assert_eq!(app.item_paste_text.as_deref(), Some("Ada"));
 
         let mut input = screen_input();
         input
             .events
             .push(egui::Event::Paste("not item data".into()));
+        input.events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert!(
+            app.doc.fields().is_empty(),
+            "a foreign clipboard does not paste items"
+        );
+
+        let mut input = screen_input();
+        input.events.push(egui::Event::Paste("Ada".into()));
         let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
         assert_eq!(app.doc.fields().len(), 1);
         assert_ne!(app.selection, placed);
+        assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
 
         let count = app.doc.fields().len();
         let mut input = screen_input();
@@ -4301,9 +4391,7 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::COMMAND,
         });
-        input
-            .events
-            .push(egui::Event::Paste(ITEM_CLIPBOARD_MARKER.into()));
+        input.events.push(egui::Event::Paste("Ada".into()));
         let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
         assert_eq!(
             app.doc.fields().len(),
@@ -4332,6 +4420,19 @@ mod tests {
         });
         let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
         assert_eq!(app.selection.len(), expected);
+
+        let mut pair = PageFormApp::new(false, None);
+        pair.insert_at_view(FieldKind::Text);
+        let first = pair.primary().unwrap();
+        pair.doc.set_default_value(first, "Ada");
+        pair.insert_at_view(FieldKind::StaticText);
+        let second = pair.primary().unwrap();
+        pair.doc.set_caption(second, "Bob").unwrap();
+        pair.selection = vec![first, second];
+        let mut input = screen_input();
+        input.events.push(egui::Event::Copy);
+        let _ = ctx.run(input, |ctx| pair.handle_shortcuts(ctx));
+        assert_eq!(pair.item_paste_text.as_deref(), Some("Ada\nBob"));
     }
 
     #[test]
@@ -4340,7 +4441,7 @@ mod tests {
         let mut app = PageFormApp::new(false, None);
         let file = panel(&ctx, &mut app, |app, ui| app.file_menu(ui));
         let texts = galley_texts(&file);
-        for shortcut in ["Ctrl+O", "Ctrl+S", "Ctrl+Shift+S", "Ctrl+P"] {
+        for shortcut in ["Ctrl+N", "Ctrl+O", "Ctrl+S", "Ctrl+Shift+S", "Ctrl+P"] {
             assert!(
                 texts.iter().any(|text| text == shortcut),
                 "{shortcut} missing from {texts:?}"
@@ -4350,7 +4451,7 @@ mod tests {
         let texts = galley_texts(&new_menu);
         assert!(texts.iter().any(|text| text == "Ctrl+N"), "{texts:?}");
         assert_eq!(recent_menu_label("/tmp/t6.pgt"), "t6.pgt (template)");
-        assert_eq!(recent_menu_label("/tmp/t6.pgd"), "/tmp/t6.pgd");
+        assert_eq!(recent_menu_label("/tmp/t6.pgd"), "t6.pgd");
 
         app.insert_at_view(FieldKind::Text);
         press_command(&ctx, &mut app, egui::Key::O, false);
@@ -4804,12 +4905,28 @@ mod tests {
             app.export_dialog(ctx);
         });
         let texts = galley_texts(&output);
-        for path in ["/tmp/form.pgd", "form.pgt (template)", "/tmp/old.pageform"] {
+        for path in ["form.pgd", "form.pgt (template)", "old.pageform"] {
             assert!(
                 texts.iter().any(|text| text == path),
                 "{path} missing from {texts:?}"
             );
         }
+        let at = text_center(&output, "form.pgt (template)").expect("template recent");
+        let mut hover = screen_input();
+        hover.events.push(egui::Event::PointerMoved(at));
+        let _ = run_ui(&ctx, &mut app, hover, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let hovered = run_ui(&ctx, &mut app, screen_input(), |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&hovered);
+        assert!(
+            texts.iter().any(|text| text == "/tmp/form.pgt"),
+            "full path tooltip missing from {texts:?}"
+        );
         app.open_builtin_prompt(PromptKind::OpenTemplate);
         let output = show_settled(&ctx, &mut app, |app, ctx| {
             egui::CentralPanel::default().show(ctx, |_| {});
