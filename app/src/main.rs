@@ -167,15 +167,17 @@ items. Edit > Align, the properties panel, and the right-click menu align,
 distribute, and match size.
 Calculations are a placeholder. Margins, header, and footer stay on the canvas.
 File: New Blank Document starts a blank page and asks before discarding
-unsaved work. New from Template opens a .pgt template as a new untitled
-document and does not change the template. Open reads .pgd documents, .pgt
-templates, and older .pageform files. Ctrl or Cmd+S saves the current .pgd.
-A document opened from a template has no linked file, so Save asks for a new
-.pgd and cannot overwrite the template. Ctrl or Cmd+Shift+S is Save As. A
-.pgt is written only when Template is chosen, and an existing template asks
-before it is replaced. Saving a template does not link that file. Ctrl or
-Cmd+P prints. The window title shows the file name and a * when there are
-unsaved changes. Exit asks before closing a changed file.
+unsaved work. Ctrl or Cmd+N does that. New from Template opens a .pgt
+template as a new untitled document and does not change the template. That
+document stays clean until you edit it. Open reads .pgd documents, .pgt
+templates, and older .pageform files. Ctrl or Cmd+O opens. Ctrl or Cmd+S
+saves the current .pgd. A document opened from a template has no linked
+file, so Save asks for a new .pgd and cannot overwrite the template. Ctrl or
+Cmd+Shift+S is Save As. A .pgt is written only when Template is chosen, and
+an existing template asks before it is replaced. Saving a template does not
+link that file. Ctrl or Cmd+P prints. The window title shows the file name
+and a * when there are unsaved changes. Exit asks before closing a changed
+file. Open Recent labels a template file with (template).
 Export PDF asks where to save the PDF. If there is no system file dialog,
 PageForm asks for the folder and file name.
 Edit: Select, Select All, Copy, Cut, Paste, and Delete work. Ctrl or Cmd

@@ -671,7 +671,7 @@ impl PageFormApp {
                     ui.add_space(8.0);
                     ui.label("Recent");
                     for path in &shown {
-                        if ui.button(path).clicked() {
+                        if ui.button(recent_menu_label(path)).clicked() {
                             open_recent = Some(path.clone());
                         }
                     }
@@ -885,7 +885,6 @@ impl PageFormApp {
                 self.remember_recent(path);
                 if untitled {
                     self.project_path = None;
-                    self.doc.mark_dirty();
                     self.status = format!(
                         "Opened {} as a new document. Save stores a .pgd and does not change this file.",
                         path.display()
@@ -1197,9 +1196,9 @@ impl PageFormApp {
             }
             match *label {
                 "Open" => {
-                    if ui.button("Open").clicked() {
+                    let shortcut = command_shortcut(ui, egui::Key::O);
+                    if menu_command(ui, "Open", Some(&shortcut), false) {
                         self.ask_or_run(PendingFileAction::Open);
-                        ui.close();
                     }
                     if self.recent.is_empty() {
                         ui.add_enabled(false, egui::Button::new("Open Recent"))
@@ -1208,7 +1207,7 @@ impl PageFormApp {
                         ui.menu_button("Open Recent", |ui| {
                             ui.set_min_width(280.0);
                             for path in self.recent.clone() {
-                                if ui.button(&path).clicked() {
+                                if ui.button(recent_menu_label(&path)).clicked() {
                                     self.ask_or_run(PendingFileAction::OpenPath(path));
                                     ui.close();
                                 }
@@ -1415,10 +1414,13 @@ impl PageFormApp {
     fn new_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(180.0);
         for item in NEW_MENU {
-            if ui.button(*item).clicked() {
-                if *item == "New Blank Document" {
+            if *item == "New Blank Document" {
+                let shortcut = command_shortcut(ui, egui::Key::N);
+                if menu_command(ui, item, Some(&shortcut), false) {
                     self.request_new_blank();
-                } else if *item == "New from Template" {
+                }
+            } else if ui.button(*item).clicked() {
+                if *item == "New from Template" {
                     self.ask_or_run(PendingFileAction::NewFromTemplate);
                 } else {
                     self.mark_not_implemented(item);
@@ -2041,12 +2043,18 @@ impl PageFormApp {
             egui::Key::S,
         );
         let save = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+        let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+        let new_blank = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
         let print = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P);
         let select_all = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A);
         if ctx.input_mut(|input| input.consume_shortcut(&save_as)) {
             self.save_project_as();
         } else if ctx.input_mut(|input| input.consume_shortcut(&save)) {
             self.save_project();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&open)) {
+            self.ask_or_run(PendingFileAction::Open);
+        } else if ctx.input_mut(|input| input.consume_shortcut(&new_blank)) {
+            self.request_new_blank();
         } else if ctx.input_mut(|input| input.consume_shortcut(&print)) {
             self.print_current();
         } else if ctx.input_mut(|input| input.consume_shortcut(&select_all)) {
@@ -3216,7 +3224,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File > New Blank Document starts a blank page and asks before discarding unsaved work. New from Template opens a .pgt template as a new untitled document and does not change the template. Open reads .pgd documents, .pgt templates, and older .pageform files. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, has no linked file, so Save asks for a new .pgd name and cannot overwrite the template. Save As uses Ctrl or Cmd+Shift+S. A template file is written only when Template (.pgt) is chosen, and an existing template asks before it is replaced. Saving a template does not link that file, so the next Save still asks for a .pgd. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent lists the last .pgd and .pgt files. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
+        "File > New Blank Document starts a blank page and asks before discarding unsaved work. Ctrl or Cmd+N does that. New from Template opens a .pgt template as a new untitled document and does not change the template. The new document stays clean until you edit it. Open reads .pgd documents, .pgt templates, and older .pageform files. Ctrl or Cmd+O opens. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, has no linked file, so Save asks for a new .pgd name and cannot overwrite the template. Save As uses Ctrl or Cmd+Shift+S. A template file is written only when Template (.pgt) is chosen, and an existing template asks before it is replaced. Saving a template does not link that file, so the next Save still asks for a .pgd. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent lists the last .pgd and .pgt files, and a template is labeled template. The window title shows the file name and a * when there are unsaved changes. Exit asks before closing a changed file. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
     ),
     (
         "Is there a list box?",
@@ -3467,6 +3475,18 @@ fn ignore_place_click(suppress: bool, primary_down: bool) -> (bool, bool) {
         (true, primary_down)
     } else {
         (false, false)
+    }
+}
+
+fn recent_menu_label(path: &str) -> String {
+    if is_template_path(std::path::Path::new(path)) {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path);
+        format!("{name} (template)")
+    } else {
+        path.to_string()
     }
 }
 
@@ -4315,6 +4335,75 @@ mod tests {
     }
 
     #[test]
+    fn file_shortcuts_are_labeled_and_dispatch_without_a_native_dialog() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let file = panel(&ctx, &mut app, |app, ui| app.file_menu(ui));
+        let texts = galley_texts(&file);
+        for shortcut in ["Ctrl+O", "Ctrl+S", "Ctrl+Shift+S", "Ctrl+P"] {
+            assert!(
+                texts.iter().any(|text| text == shortcut),
+                "{shortcut} missing from {texts:?}"
+            );
+        }
+        let new_menu = panel(&ctx, &mut app, |app, ui| app.new_menu(ui));
+        let texts = galley_texts(&new_menu);
+        assert!(texts.iter().any(|text| text == "Ctrl+N"), "{texts:?}");
+        assert_eq!(recent_menu_label("/tmp/t6.pgt"), "t6.pgt (template)");
+        assert_eq!(recent_menu_label("/tmp/t6.pgd"), "/tmp/t6.pgd");
+
+        app.insert_at_view(FieldKind::Text);
+        press_command(&ctx, &mut app, egui::Key::O, false);
+        assert!(matches!(app.unsaved, Some(PendingFileAction::Open)));
+        app.unsaved = None;
+        press_command(&ctx, &mut app, egui::Key::N, false);
+        assert!(matches!(app.unsaved, Some(PendingFileAction::NewBlank)));
+
+        app.unsaved = None;
+        app.doc.mark_clean();
+        press_command(&ctx, &mut app, egui::Key::N, false);
+        assert!(app.unsaved.is_none());
+        assert!(!app.doc.is_dirty());
+        assert!(app.doc.fields().is_empty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
+
+        let path =
+            std::env::temp_dir().join(format!("pageform-shortcut-{}.pgd", std::process::id()));
+        app.insert_at_view(FieldKind::Text);
+        app.write_project_file(&path);
+        app.doc.set_header_text("Saved");
+        assert!(app.doc.is_dirty());
+        press_command(&ctx, &mut app, egui::Key::S, false);
+        assert!(!app.doc.is_dirty());
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("Saved"), "{saved}");
+        let _ = std::fs::remove_file(&path);
+
+        if !native_save_dialog_available() {
+            app.doc.set_header_text("Again");
+            press_command(&ctx, &mut app, egui::Key::S, true);
+            let prompt = app.file_prompt.clone().expect("save as dialog");
+            assert_eq!(prompt.kind, PromptKind::SaveProject);
+            assert!(!prompt.save_as_template);
+            assert!(prompt.file_name.ends_with(".pgd"), "{}", prompt.file_name);
+        }
+    }
+
+    fn press_command(ctx: &egui::Context, app: &mut PageFormApp, key: egui::Key, shift: bool) {
+        let mut modifiers = egui::Modifiers::COMMAND;
+        modifiers.shift = shift;
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+    }
+
+    #[test]
     fn select_all_copy_cut_and_paste_round_trip() {
         let mut app = PageFormApp::new(false, None);
         app.insert_at_view(FieldKind::Text);
@@ -4440,8 +4529,8 @@ mod tests {
         app.new_blank();
         app.read_project_file(&template);
         assert!(app.project_path.is_none());
-        assert!(app.doc.is_dirty());
-        assert_eq!(app.window_title(), "Untitled * - PageForm");
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
         assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
         assert!(app.linked_document_path().is_none());
         assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
@@ -4449,7 +4538,8 @@ mod tests {
 
         app.read_project_file_as_untitled(&template);
         assert!(app.project_path.is_none());
-        assert_eq!(app.window_title(), "Untitled * - PageForm");
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
         assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
 
         app.write_project_file(&document);
@@ -4548,13 +4638,17 @@ mod tests {
             "opening a template must not link a path"
         );
         assert!(app.linked_document_path().is_none());
-        assert_eq!(app.window_title(), "Untitled * - PageForm");
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
         assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
         assert_eq!(
             suggested_project_name(app.project_path.as_deref(), false),
             "Untitled.pgd"
         );
         app.doc.set_header_text("Edited");
+        assert!(app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled * - PageForm");
+        assert!(app.linked_document_path().is_none());
         app.open_builtin_prompt(PromptKind::SaveProject);
         let prompt = app.file_prompt.clone().expect("plain save asks for a name");
         assert_eq!(prompt.kind, PromptKind::SaveProject);
@@ -4710,7 +4804,7 @@ mod tests {
             app.export_dialog(ctx);
         });
         let texts = galley_texts(&output);
-        for path in ["/tmp/form.pgd", "/tmp/form.pgt", "/tmp/old.pageform"] {
+        for path in ["/tmp/form.pgd", "form.pgt (template)", "/tmp/old.pageform"] {
             assert!(
                 texts.iter().any(|text| text == path),
                 "{path} missing from {texts:?}"
@@ -4723,7 +4817,7 @@ mod tests {
         });
         let texts = galley_texts(&output);
         assert!(
-            texts.iter().any(|text| text == "/tmp/form.pgt"),
+            texts.iter().any(|text| text == "form.pgt (template)"),
             "{texts:?}"
         );
         assert!(
