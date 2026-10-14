@@ -581,6 +581,8 @@ impl PageFormApp {
         let kind = prompt.kind;
         let recent = self.recent.clone();
         let response = egui::Modal::new(egui::Id::new("pageform_file")).show(ctx, |ui| {
+            let submit = ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let cancel_key = ui.input(|input| input.key_pressed(egui::Key::Escape));
             ui.set_min_width(480.0);
             ui.heading(match kind {
                 PromptKind::ExportPdf => "Export PDF",
@@ -647,6 +649,12 @@ impl PageFormApp {
                     close = true;
                 }
             });
+            if submit {
+                save = true;
+            }
+            if cancel_key {
+                close = true;
+            }
         });
         if prompt.directory != original_dir || prompt.file_name != original_name {
             prompt.replace = false;
@@ -1052,7 +1060,10 @@ impl PageFormApp {
                         self.ask_or_run(PendingFileAction::Open);
                         ui.close();
                     }
-                    if !self.recent.is_empty() {
+                    if self.recent.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("Open Recent"))
+                            .on_disabled_hover_text("No recent files");
+                    } else {
                         ui.menu_button("Open Recent", |ui| {
                             ui.set_min_width(280.0);
                             for path in self.recent.clone() {
@@ -1131,32 +1142,25 @@ impl PageFormApp {
                 }
                 "Copy" => {
                     let shortcut = command_shortcut(ui, egui::Key::C);
-                    let copy = ui
-                        .add_enabled(!self.selection.is_empty(), egui::Button::new(*label))
-                        .on_hover_text(shortcut);
-                    if copy.clicked() {
+                    if menu_command_enabled(ui, label, Some(&shortcut), !self.selection.is_empty())
+                    {
                         self.copy_selection();
-                        ui.close();
+                        ui.ctx().copy_text(ITEM_CLIPBOARD_MARKER.to_string());
                     }
                 }
                 "Cut" => {
                     let shortcut = command_shortcut(ui, egui::Key::X);
-                    let cut = ui
-                        .add_enabled(!self.selection.is_empty(), egui::Button::new(*label))
-                        .on_hover_text(shortcut);
-                    if cut.clicked() {
+                    if menu_command_enabled(ui, label, Some(&shortcut), !self.selection.is_empty())
+                    {
                         self.cut_selection();
-                        ui.close();
+                        ui.ctx().copy_text(ITEM_CLIPBOARD_MARKER.to_string());
                     }
                 }
                 "Paste" => {
                     let shortcut = command_shortcut(ui, egui::Key::V);
-                    let paste = ui
-                        .add_enabled(!self.clipboard.is_empty(), egui::Button::new(*label))
-                        .on_hover_text(shortcut);
-                    if paste.clicked() {
+                    if menu_command_enabled(ui, label, Some(&shortcut), !self.clipboard.is_empty())
+                    {
                         self.paste_clipboard();
-                        ui.close();
                     }
                 }
                 "Delete" => {
@@ -1872,11 +1876,21 @@ impl PageFormApp {
                 _ => true,
             });
         });
+        // egui emits Paste only when the OS clipboard already has text, and it
+        // does not also emit Key::V. Accept either, but only paste once.
+        let paste_key = ctx.input_mut(|input| {
+            input.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::V,
+            ))
+        });
         if cut {
             self.cut_selection();
+            ctx.copy_text(ITEM_CLIPBOARD_MARKER.to_string());
         } else if copy {
             self.copy_selection();
-        } else if paste {
+            ctx.copy_text(ITEM_CLIPBOARD_MARKER.to_string());
+        } else if paste || paste_key {
             self.paste_clipboard();
         }
         let save_as = egui::KeyboardShortcut::new(
@@ -2987,6 +3001,9 @@ fn on_step(value: f32, step: f32) -> bool {
 
 const MENU_BAR: &[&str] = &["File", "Edit", "Insert", "View", "Help"];
 
+/// Text placed on the OS clipboard so the next Ctrl/Cmd+V emits `Event::Paste`.
+const ITEM_CLIPBOARD_MARKER: &str = "PageForm items";
+
 const FILE_MENU: &[&str] = &[
     "New",
     "Open",
@@ -3397,6 +3414,23 @@ fn menu_command(ui: &mut egui::Ui, label: &str, shortcut: Option<&str>, selected
         button = button.shortcut_text(shortcut);
     }
     let clicked = ui.add(button).clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+
+fn menu_command_enabled(
+    ui: &mut egui::Ui,
+    label: &str,
+    shortcut: Option<&str>,
+    enabled: bool,
+) -> bool {
+    let mut button = egui::Button::new(label);
+    if let Some(shortcut) = shortcut {
+        button = button.shortcut_text(shortcut);
+    }
+    let clicked = ui.add_enabled(enabled, button).clicked();
     if clicked {
         ui.close();
     }
@@ -4015,6 +4049,37 @@ mod tests {
         assert_eq!(app.doc.fields().len(), 1);
         assert_ne!(app.selection, placed);
 
+        let count = app.doc.fields().len();
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(app.doc.fields().len(), count + 1, "Ctrl+V pastes without a Paste event");
+
+        let count = app.doc.fields().len();
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        input
+            .events
+            .push(egui::Event::Paste(ITEM_CLIPBOARD_MARKER.into()));
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(
+            app.doc.fields().len(),
+            count + 1,
+            "a paste event and Ctrl+V in one frame paste once"
+        );
+
         app.doc.add_field(
             FieldKind::Checkbox,
             RectPt {
@@ -4024,6 +4089,7 @@ mod tests {
                 h: 18.0,
             },
         );
+        let expected = app.doc.fields().len();
         app.selection.clear();
         let mut input = screen_input();
         input.events.push(egui::Event::Key {
@@ -4034,7 +4100,7 @@ mod tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
-        assert_eq!(app.selection.len(), 2);
+        assert_eq!(app.selection.len(), expected);
     }
 
     #[test]
@@ -4465,6 +4531,10 @@ mod tests {
         assert_eq!(
             ordered_hits(&galley_texts(&file), &menu_entries(FILE_MENU)),
             menu_entries(FILE_MENU)
+        );
+        assert!(
+            galley_texts(&file).iter().any(|text| text == "Open Recent"),
+            "Open Recent stays visible when the list is empty"
         );
         let edit = panel(&ctx, &mut app, |app, ui| app.edit_menu(ui));
         assert_eq!(
