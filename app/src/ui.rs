@@ -4470,7 +4470,20 @@ mod tests {
         assert!(app.recent.contains(&template.display().to_string()));
         assert!(app.recent.contains(&document.display().to_string()));
 
-        let legacy_text = template_text.replacen("kind: Template,\n", "", 1);
+        let mut skipped_kind = false;
+        let legacy_text = template_text
+            .lines()
+            .filter(|line| {
+                let drop_project_kind = !skipped_kind && line.trim().starts_with("kind:");
+                if drop_project_kind {
+                    skipped_kind = true;
+                }
+                !drop_project_kind
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(skipped_kind, "{legacy_text}");
+        assert!(legacy_text.contains("kind:"), "{legacy_text}");
         std::fs::write(&legacy, &legacy_text).unwrap();
         app.read_project_file(&legacy);
         assert!(!app.doc.is_dirty());

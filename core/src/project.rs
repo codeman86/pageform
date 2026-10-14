@@ -198,11 +198,25 @@ mod tests {
     fn a_project_without_kind_loads_as_a_document() {
         let doc = Document::letter();
         let text = doc.to_project_ron(ProjectKind::Document).unwrap();
-        let legacy = text.replacen("kind: Document,\n", "", 1);
+        let legacy = without_kind_field(&text);
         assert!(!legacy.contains("kind:"), "{legacy}");
         let loaded = Document::from_project_ron(&legacy).unwrap();
         assert_eq!(loaded.kind, ProjectKind::Document);
         assert!(!loaded.document.is_dirty());
+    }
+
+    fn without_kind_field(text: &str) -> String {
+        let mut skipped = false;
+        text.lines()
+            .filter(|line| {
+                let drop_project_kind = !skipped && line.trim().starts_with("kind:");
+                if drop_project_kind {
+                    skipped = true;
+                }
+                !drop_project_kind
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
