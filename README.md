@@ -21,7 +21,7 @@ Insert menu, alphabetical:
 | Text Box | Static text block with basic wrapping. Not a form field. |
 | Text Field | One-line fillable AcroForm text field. |
 
-Toolbar insert icons, alphabetical: Checkbox, Date, Drop-down, Image, Line, Radio, Shapes (Square or Rectangle), Signature, Table, Text, Text Box, Text Field. New Blank Document, New from Template, Open, Save, Save As, Print, and Insert Page report that they are not implemented yet.
+Toolbar insert icons, alphabetical: Checkbox, Date, Drop-down, Image, Line, Radio, Shapes (Square or Rectangle), Signature, Table, Text, Text Box, Text Field. Edit has Select All, Copy, Cut, Paste, and Delete, with Ctrl or Cmd+A, C, X, and V. New Blank Document, New from Template, and Insert Page are not implemented yet. Open, Save, Save As, and Print are disabled and say Coming soon.
 
 ![PageForm toolbar](docs/toolbar.png)
 

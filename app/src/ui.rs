@@ -10,7 +10,7 @@ use eframe::egui::{
 };
 use pageform_core::{
     default_size, export_pdf, hit_handle, move_rect, place_default, rect_from_drag, resize_rect,
-    snap_point, AlignEdge, BorderStyleKind, CheckboxStyle, Document, FieldId, FieldKind,
+    snap_point, AlignEdge, BorderStyleKind, CheckboxStyle, Document, Field, FieldId, FieldKind,
     FontFamily, GridSize, Handle, Page, PdfPoint, RectPt, Rgb, ScreenRect, TextAlign,
     ViewTransform, TABLE_COLUMNS, TABLE_ROWS,
 };
@@ -160,6 +160,8 @@ struct PageFormApp {
     fitted: bool,
     canvas_rect: Option<Rect>,
     drag: Option<Drag>,
+    clipboard: Vec<Field>,
+    paste_steps: i32,
     name_buf: String,
     caption_buf: String,
     tooltip_buf: String,
@@ -216,6 +218,8 @@ impl PageFormApp {
             fitted: false,
             canvas_rect: None,
             drag: None,
+            clipboard: Vec::new(),
+            paste_steps: 0,
             name_buf: String::new(),
             caption_buf: String::new(),
             tooltip_buf: String::new(),
@@ -253,19 +257,83 @@ impl PageFormApp {
     }
 
     /// Clear a status message a few seconds after it was set. The edit prompt
-    /// stays until the edit finishes.
-    fn fade_status(&mut self, time: f64) {
+    /// stays until the edit finishes. Returns the time left so the window can
+    /// repaint without waiting for the next input event.
+    fn fade_status(&mut self, time: f64) -> Option<f64> {
         if self.status != self.status_seen {
             self.status_seen.clone_from(&self.status);
             self.status_at = time;
         }
         if self.inline.is_some() || self.status.is_empty() {
-            return;
+            return None;
         }
-        if time - self.status_at >= 4.0 {
+        let remaining = 4.0 - (time - self.status_at);
+        if remaining <= 0.0 {
             self.status.clear();
             self.status_seen.clear();
+            None
+        } else {
+            Some(remaining)
         }
+    }
+
+    fn select_all(&mut self) {
+        self.selection = self.doc.fields().iter().map(|field| field.id()).collect();
+        let count = self.selection.len();
+        self.status = if count == 1 {
+            "Selected 1 item".to_string()
+        } else {
+            format!("Selected {count} items")
+        };
+    }
+
+    fn copy_selection(&mut self) {
+        self.clipboard = self
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.field(*id).cloned())
+            .collect();
+        self.paste_steps = 0;
+        let count = self.clipboard.len();
+        self.status = if count == 1 {
+            "Copied 1 item".to_string()
+        } else {
+            format!("Copied {count} items")
+        };
+    }
+
+    fn cut_selection(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.copy_selection();
+        let count = self.clipboard.len();
+        self.delete_selection();
+        self.status = if count == 1 {
+            "Cut 1 item".to_string()
+        } else {
+            format!("Cut {count} items")
+        };
+    }
+
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            self.status = "Nothing to paste".to_string();
+            return;
+        }
+        self.paste_steps += 1;
+        let step = self.grid_size.minor_pt() * self.paste_steps as f32;
+        let mut ids = Vec::new();
+        for field in self.clipboard.clone() {
+            ids.push(self.doc.paste_copy(&field, step, -step));
+        }
+        self.selection = ids;
+        let count = self.selection.len();
+        self.status = if count == 1 {
+            "Pasted 1 item".to_string()
+        } else {
+            format!("Pasted {count} items")
+        };
     }
 
     /// Snap spacing is the minor step of the active preset, hidden grid included.
@@ -685,6 +753,42 @@ impl PageFormApp {
                 "Select" => {
                     if menu_command(ui, label, Some("Esc"), self.tool == Tool::Select) {
                         self.tool = Tool::Select;
+                    }
+                }
+                "Select All" => {
+                    let shortcut = command_shortcut(ui, egui::Key::A);
+                    if menu_command(ui, label, Some(&shortcut), false) {
+                        self.select_all();
+                    }
+                }
+                "Copy" => {
+                    let shortcut = command_shortcut(ui, egui::Key::C);
+                    let copy = ui
+                        .add_enabled(!self.selection.is_empty(), egui::Button::new(*label))
+                        .on_hover_text(shortcut);
+                    if copy.clicked() {
+                        self.copy_selection();
+                        ui.close();
+                    }
+                }
+                "Cut" => {
+                    let shortcut = command_shortcut(ui, egui::Key::X);
+                    let cut = ui
+                        .add_enabled(!self.selection.is_empty(), egui::Button::new(*label))
+                        .on_hover_text(shortcut);
+                    if cut.clicked() {
+                        self.cut_selection();
+                        ui.close();
+                    }
+                }
+                "Paste" => {
+                    let shortcut = command_shortcut(ui, egui::Key::V);
+                    let paste = ui
+                        .add_enabled(!self.clipboard.is_empty(), egui::Button::new(*label))
+                        .on_hover_text(shortcut);
+                    if paste.clicked() {
+                        self.paste_clipboard();
+                        ui.close();
                     }
                 }
                 "Delete" => {
@@ -1368,11 +1472,20 @@ impl PageFormApp {
         }
 
         if !ctx.wants_keyboard_input() {
+            let command = ctx.input(|input| input.modifiers.command || input.modifiers.ctrl);
             if ctx.input(|input| input.key_pressed(Key::Escape)) {
                 self.drag = None;
                 self.tool = Tool::Select;
             }
-            if ctx
+            if command && ctx.input(|input| input.key_pressed(Key::A)) {
+                self.select_all();
+            } else if command && ctx.input(|input| input.key_pressed(Key::C)) {
+                self.copy_selection();
+            } else if command && ctx.input(|input| input.key_pressed(Key::X)) {
+                self.cut_selection();
+            } else if command && ctx.input(|input| input.key_pressed(Key::V)) {
+                self.paste_clipboard();
+            } else if ctx
                 .input(|input| input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace))
             {
                 self.delete_selection();
@@ -2279,7 +2392,9 @@ impl eframe::App for PageFormApp {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let now = ctx.input(|input| input.time);
-        self.fade_status(now);
+        if let Some(remaining) = self.fade_status(now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+        }
         crate::theme::apply(ctx, self.dark);
         if self.persist_theme || self.persist_panel {
             if let Some(storage) = frame.storage_mut() {
@@ -2524,6 +2639,11 @@ fn placeholder_icon(ui: &mut egui::Ui) {
         FontId::proportional(40.0),
         egui::Color32::WHITE,
     );
+}
+
+fn command_shortcut(ui: &egui::Ui, key: egui::Key) -> String {
+    ui.ctx()
+        .format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key))
 }
 
 fn coming_soon_item(ui: &mut egui::Ui, label: &str) {
@@ -3256,19 +3376,84 @@ mod tests {
     fn status_fades_after_four_seconds_and_stays_while_editing() {
         let mut app = PageFormApp::new(false, None);
         app.status = "Placed Text".to_string();
-        app.fade_status(0.0);
+        let remaining = app.fade_status(0.0).expect("timer");
+        assert!((remaining - 4.0).abs() < 0.001);
         assert_eq!(app.status, "Placed Text");
-        app.fade_status(3.9);
+        let remaining = app.fade_status(3.9).expect("timer");
+        assert!((remaining - 0.1).abs() < 0.001);
         assert_eq!(app.status, "Placed Text");
-        app.fade_status(4.0);
+        assert_eq!(app.fade_status(4.0), None);
         assert!(app.status.is_empty());
 
         app.insert_at_view(FieldKind::StaticText);
         let id = app.primary().unwrap();
         assert!(app.begin_inline(id));
-        app.fade_status(0.0);
-        app.fade_status(9.0);
+        assert_eq!(app.fade_status(0.0), None);
+        assert_eq!(app.fade_status(9.0), None);
         assert!(app.status.starts_with("Editing text."));
+    }
+
+    #[test]
+    fn select_all_copy_cut_and_paste_round_trip() {
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let original = app.doc.fields()[0].rect();
+        app.copy_selection();
+        app.paste_clipboard();
+        assert_eq!(app.doc.fields().len(), 2);
+        let pasted = app.doc.field(app.primary().unwrap()).unwrap().rect();
+        assert!((pasted.x - original.x).abs() > 1.0);
+        app.select_all();
+        assert_eq!(app.selection.len(), 2);
+        app.cut_selection();
+        assert!(app.doc.fields().is_empty());
+        app.paste_clipboard();
+        assert_eq!(app.doc.fields().len(), 2);
+    }
+
+    #[test]
+    fn two_selected_items_show_align_and_distribute_in_the_sidebar() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let first = app.doc.add_field(
+            FieldKind::Text,
+            RectPt {
+                x: 72.0,
+                y: 700.0,
+                w: 72.0,
+                h: 18.0,
+            },
+        );
+        let second = app.doc.add_field(
+            FieldKind::Text,
+            RectPt {
+                x: 200.0,
+                y: 640.0,
+                w: 90.0,
+                h: 18.0,
+            },
+        );
+        app.selection = vec![first, second];
+        let output = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        let texts = galley_texts(&output);
+        for label in [
+            "Align",
+            "Left",
+            "Center",
+            "Right",
+            "Top",
+            "Middle",
+            "Bottom",
+            "Horizontally",
+            "Vertically",
+            "Width",
+            "Height",
+        ] {
+            assert!(
+                texts.iter().any(|text| text.contains(label)),
+                "{label} missing from {texts:?}"
+            );
+        }
     }
 
     #[test]
@@ -3337,10 +3522,6 @@ mod tests {
             "Save",
             "Save As",
             "Print",
-            "Select All",
-            "Copy",
-            "Cut",
-            "Paste",
             "New Blank Document",
             "New from Template",
             "Insert Page",
@@ -3670,9 +3851,9 @@ mod tests {
         click_menu(&ctx, &mut app, "Print", |app, ui| app.file_menu(ui));
         assert_eq!(app.status, before, "Open, Save As, and Print stay disabled");
         click_menu(&ctx, &mut app, "Select All", |app, ui| app.edit_menu(ui));
-        assert_eq!(app.status, "Select All is not implemented yet");
+        assert_eq!(app.status, "Selected 0 items");
         click_menu(&ctx, &mut app, "Paste", |app, ui| app.edit_menu(ui));
-        assert_eq!(app.status, "Paste is not implemented yet");
+        assert_eq!(app.status, "Selected 0 items");
 
         click_menu(&ctx, &mut app, "Preferences", |app, ui| app.edit_menu(ui));
         assert!(app.show_preferences);

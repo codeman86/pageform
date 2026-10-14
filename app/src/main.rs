@@ -170,8 +170,9 @@ File: New opens New Blank Document and New from Template. Those are not
 implemented yet. Open, Save, Save As, and Print are disabled and say Coming soon.
 Export PDF asks where to save the PDF. If there is no system file dialog,
 PageForm asks for the folder and file name. Exit closes the window.
-Edit: Select and Delete work. Select All, Copy, Cut, and Paste are not
-implemented yet. Preferences is a dialog for the theme and radio labels.
+Edit: Select, Select All, Copy, Cut, Paste, and Delete work. Ctrl or Cmd
+with A, C, X, V, and the Delete key do the same. Preferences is a dialog
+for the theme and radio labels.
 Insert drops a default item in the view, listed alphabetically. A toolbar
 insert tool places that default size on a click and sizes the item when you
 drag. The items are: Checkbox,

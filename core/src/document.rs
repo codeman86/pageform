@@ -490,6 +490,52 @@ impl Document {
         self.set_line_ends(id, start, end);
     }
 
+    /// Place a copy of `source`, shifted by `(dx, dy)`. The copy gets a new name.
+    pub fn paste_copy(&mut self, source: &Field, dx: f32, dy: f32) -> FieldId {
+        let page = self.page;
+        let rect = clamp_rect(
+            RectPt {
+                x: source.rect.x + dx,
+                y: source.rect.y + dy,
+                w: source.rect.w,
+                h: source.rect.h,
+            },
+            &page,
+        );
+        let name = self.unique_name(source.kind);
+        let id = self.insert(
+            source.kind,
+            &name,
+            rect,
+            source.caption.clone(),
+            source.on_state.clone(),
+            source.options.clone(),
+        );
+        if let Some(field) = self.fields.iter_mut().find(|field| field.id == id) {
+            field.style = source.style.clone();
+        }
+        if let Some((start, end)) = source.line {
+            self.set_line_ends(
+                id,
+                clamp_point(
+                    PdfPoint {
+                        x: start.x + dx,
+                        y: start.y + dy,
+                    },
+                    &page,
+                ),
+                clamp_point(
+                    PdfPoint {
+                        x: end.x + dx,
+                        y: end.y + dy,
+                    },
+                    &page,
+                ),
+            );
+        }
+        id
+    }
+
     pub fn remove(&mut self, id: FieldId) -> bool {
         let before = self.fields.len();
         self.fields.retain(|field| field.id != id);
@@ -884,8 +930,14 @@ fn line_bounds(start: PdfPoint, end: PdfPoint, page: &Page) -> RectPt {
 
 fn map_line(start: PdfPoint, end: PdfPoint, old: RectPt, new: RectPt) -> (PdfPoint, PdfPoint) {
     let map = |value: f32, origin: f32, span: f32, new_origin: f32, new_span: f32| {
-        if span <= 1.0 {
-            new_origin + new_span * 0.5
+        let same_origin = (origin - new_origin).abs() < 0.001;
+        let same_span = (span - new_span).abs() < 0.001;
+        // An unchanged axis stays put. A flat line is stored in a 1 pt box, so
+        // recentering that pad would walk the other coordinate by 0.5 pt.
+        if same_origin && same_span {
+            value
+        } else if span <= 1.0 {
+            value + (new_origin - origin) + (new_span - span) * 0.5
         } else {
             new_origin + (value - origin) / span * new_span
         }
@@ -1173,6 +1225,44 @@ mod tests {
         let (_, end) = doc.field(drawn).unwrap().line_ends().unwrap();
         assert!((end.x - 90.0).abs() < 0.1);
         assert!((end.y - 90.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn moving_a_line_on_one_axis_leaves_the_other_axis_alone() {
+        let mut doc = Document::letter();
+        let id = doc.add_line(
+            PdfPoint { x: 40.0, y: 80.0 },
+            PdfPoint { x: 140.0, y: 80.0 },
+        );
+        for _ in 0..4 {
+            let rect = doc.field(id).unwrap().rect();
+            let mut next = rect;
+            next.x += 1.0;
+            doc.set_bounds(id, next);
+        }
+        let (start, end) = doc.field(id).unwrap().line_ends().unwrap();
+        assert!(
+            (start.y - 80.0).abs() < 0.01,
+            "x edit moved y to {}",
+            start.y
+        );
+        assert!((end.y - 80.0).abs() < 0.01, "x edit moved y to {}", end.y);
+        assert!((start.x - 44.0).abs() < 0.01);
+        assert!((end.x - 144.0).abs() < 0.01);
+
+        let rect = doc.field(id).unwrap().rect();
+        let mut next = rect;
+        next.y += 2.0;
+        doc.set_bounds(id, next);
+        let (start, end) = doc.field(id).unwrap().line_ends().unwrap();
+        assert!(
+            (start.x - 44.0).abs() < 0.01,
+            "y edit moved x to {}",
+            start.x
+        );
+        assert!((end.x - 144.0).abs() < 0.01, "y edit moved x to {}", end.x);
+        assert!((start.y - 82.0).abs() < 0.01);
+        assert!((end.y - 82.0).abs() < 0.01);
     }
 
     #[test]
