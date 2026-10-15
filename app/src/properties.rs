@@ -704,7 +704,7 @@ fn drag_pt(
     value: f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> Option<f32> {
-    drag_pt_impl(ui, label, value, range, false)
+    drag_pt_wheel(ui, label, value, range)
 }
 
 /// Wheel changes the value by 1 pt. Shift+wheel uses 0.5 pt. The scroll is consumed.
@@ -1167,6 +1167,77 @@ mod tests {
             },
         );
         assert_eq!(value, 0.0, "border width does not go below 0");
+    }
+
+    #[test]
+    fn stroke_width_and_size_drag_values_follow_the_wheel() {
+        let ctx = egui::Context::default();
+        let mut width = 1.5_f32;
+        let mut height = 18.0_f32;
+        let mut time = 0.0_f64;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
+        let input = |time: f64, events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let show = |ctx: &egui::Context, width: &mut f32, height: &mut f32| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(next) = drag_pt(ui, "Width", *width, 0.0..=24.0) {
+                    *width = next;
+                }
+                if let Some(next) = drag_pt(ui, "H", *height, 1.0..=2000.0) {
+                    *height = next;
+                }
+            });
+        };
+        time += 1.0;
+        let placed = ctx.run(input(time, vec![]), |ctx| {
+            show(ctx, &mut width, &mut height)
+        });
+        let width_at = galley_center(&placed, "1.5").expect("stroke width");
+        let height_at = galley_center(&placed, "18.0")
+            .or_else(|| galley_center(&placed, "18"))
+            .expect("height");
+        time += 1.0;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(width_at),
+                    wheel(egui::vec2(0.0, 1.0), false),
+                ],
+            ),
+            |ctx| show(ctx, &mut width, &mut height),
+        );
+        assert_eq!(width, 2.5, "wheel up increases stroke width");
+        assert_eq!(height, 18.0, "only the hovered value changes");
+        time += 1.0;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(width_at),
+                    wheel(egui::vec2(0.0, -1.0), false),
+                ],
+            ),
+            |ctx| show(ctx, &mut width, &mut height),
+        );
+        assert_eq!(width, 1.5, "wheel down decreases stroke width");
+        time += 1.0;
+        let _ = ctx.run(
+            input(
+                time,
+                vec![
+                    egui::Event::PointerMoved(height_at),
+                    wheel(egui::vec2(0.0, 1.0), false),
+                ],
+            ),
+            |ctx| show(ctx, &mut width, &mut height),
+        );
+        assert_eq!(height, 19.0, "wheel up increases a size field");
+        assert_eq!(width, 1.5);
     }
 
     fn galley_center(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {

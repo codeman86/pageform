@@ -227,6 +227,8 @@ struct PageFormApp {
     properties_pinned: bool,
     persist_panel: bool,
     context_field: Option<FieldId>,
+    /// PDF point under the last right-click, for Paste on the canvas.
+    context_at: Option<PdfPoint>,
     inline: Option<InlineEdit>,
     status_before_inline: Option<String>,
     /// False until the user pans or zooms, so the page stays centered as the canvas resizes.
@@ -306,6 +308,7 @@ impl PageFormApp {
             properties_pinned: crate::prefs::is_pinned(pinned.as_deref()),
             persist_panel: false,
             context_field: None,
+            context_at: None,
             inline: None,
             status_before_inline: None,
             navigated: false,
@@ -389,16 +392,22 @@ impl PageFormApp {
         ctx.copy_text(text);
     }
 
-    fn paste_clipboard(&mut self) {
+    fn paste_items(&mut self, at: Option<PdfPoint>) {
         if self.clipboard.is_empty() {
             self.status = "Nothing to paste".to_string();
             return;
         }
-        self.paste_steps += 1;
-        let step = self.grid_size.minor_pt() * self.paste_steps as f32;
+        let (dx, dy) = if let Some(at) = at {
+            let origin = self.clipboard[0].rect();
+            (at.x - origin.x, at.y - origin.y)
+        } else {
+            self.paste_steps += 1;
+            let step = self.grid_size.minor_pt() * self.paste_steps as f32;
+            (step, -step)
+        };
         let mut ids = Vec::new();
         for field in self.clipboard.clone() {
-            ids.push(self.doc.paste_copy(&field, step, -step));
+            ids.push(self.doc.paste_copy(&field, dx, dy));
         }
         self.selection = ids;
         let count = self.selection.len();
@@ -406,6 +415,29 @@ impl PageFormApp {
             "Pasted 1 item".to_string()
         } else {
             format!("Pasted {count} items")
+        };
+    }
+
+    fn duplicate_selection(&mut self) {
+        let fields: Vec<Field> = self
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.field(*id).cloned())
+            .collect();
+        if fields.is_empty() {
+            return;
+        }
+        let step = self.grid_size.minor_pt();
+        let mut ids = Vec::new();
+        for field in fields {
+            ids.push(self.doc.paste_copy(&field, step, -step));
+        }
+        self.selection = ids;
+        let count = self.selection.len();
+        self.status = if count == 1 {
+            "Duplicated 1 item".to_string()
+        } else {
+            format!("Duplicated {count} items")
         };
     }
 
@@ -1339,7 +1371,14 @@ impl PageFormApp {
                     let shortcut = command_shortcut(ui, egui::Key::V);
                     if menu_command_enabled(ui, label, Some(&shortcut), !self.clipboard.is_empty())
                     {
-                        self.paste_clipboard();
+                        self.paste_items(None);
+                    }
+                }
+                "Duplicate" => {
+                    let shortcut = command_shortcut(ui, egui::Key::D);
+                    if menu_command_enabled(ui, label, Some(&shortcut), !self.selection.is_empty())
+                    {
+                        self.duplicate_selection();
                     }
                 }
                 "Delete" => {
@@ -2035,57 +2074,54 @@ impl PageFormApp {
     }
 
     /// Shortcuts are read before widgets so the first Ctrl/Cmd chord is not lost.
-    /// Copy, cut, and paste arrive as events, not as key presses.
+    ///
+    /// The canvas keeps its own item clipboard. Ctrl/Cmd+C, X, V, and D work
+    /// from the keys when an item is selected and no text field is focused.
+    /// Copy and paste events are accepted too, but a different system-clipboard
+    /// string does not block pasting the items.
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.wants_keyboard_input() {
             return;
         }
-        let mut copy = false;
-        let mut cut = false;
-        let mut pasted: Option<String> = None;
+        let mut copy_event = false;
+        let mut cut_event = false;
+        let mut paste_event = false;
         ctx.input_mut(|input| {
             input.events.retain(|event| match event {
                 egui::Event::Copy => {
-                    copy = true;
+                    copy_event = true;
                     false
                 }
                 egui::Event::Cut => {
-                    cut = true;
+                    cut_event = true;
                     false
                 }
-                egui::Event::Paste(text) => {
-                    pasted = Some(text.clone());
+                egui::Event::Paste(_) => {
+                    paste_event = true;
                     false
                 }
                 _ => true,
             });
         });
-        // egui emits Paste only when the OS clipboard already has text, and it
-        // does not also emit Key::V. Accept either, but only paste once.
-        // A paste whose text is not the item text we wrote is someone else's
-        // clipboard, so the canvas leaves it alone.
-        let paste_key = ctx.input_mut(|input| {
-            input.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND,
-                egui::Key::V,
-            ))
-        });
-        if cut {
-            let had_selection = !self.selection.is_empty();
+        let command = |key| {
+            ctx.input_mut(|input| {
+                input.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key))
+            })
+        };
+        let copy = copy_event || command(egui::Key::C);
+        let cut = cut_event || command(egui::Key::X);
+        let paste = paste_event || command(egui::Key::V);
+        let duplicate = command(egui::Key::D);
+        if cut && !self.selection.is_empty() {
             self.cut_selection();
-            if had_selection {
-                self.publish_item_clipboard(ctx);
-            }
-        } else if copy {
+            self.publish_item_clipboard(ctx);
+        } else if copy && !self.selection.is_empty() {
             self.copy_selection();
             self.publish_item_clipboard(ctx);
-        } else {
-            let foreign = pasted
-                .as_ref()
-                .is_some_and(|text| self.item_paste_text.as_deref() != Some(text));
-            if !foreign && (pasted.is_some() || paste_key) {
-                self.paste_clipboard();
-            }
+        } else if paste {
+            self.paste_items(None);
+        } else if duplicate {
+            self.duplicate_selection();
         }
         let save_as = egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
@@ -2471,15 +2507,15 @@ impl PageFormApp {
     }
 
     fn field_context_menu(&mut self, response: &egui::Response) {
-        let popup_id = response.id.with("popup");
-        if response.secondary_clicked() && self.context_field.is_none() {
-            egui::Popup::close_id(&response.ctx, popup_id);
-            return;
+        if response.secondary_clicked() {
+            self.context_at = self.pointer_pdf(&response.ctx);
         }
-        let open = egui::Popup::is_id_open(&response.ctx, popup_id);
-        if self.context_field.is_some() && (response.secondary_clicked() || open) {
-            egui::Popup::context_menu(response).show(|ui| {
-                ui.set_min_width(200.0);
+        let on_item = self.context_field.is_some();
+        egui::Popup::context_menu(response).show(|ui| {
+            ui.set_min_width(220.0);
+            self.clipboard_commands(ui, on_item);
+            if on_item {
+                ui.separator();
                 if ui.button("Properties").clicked() {
                     self.open_properties();
                     ui.close();
@@ -2488,7 +2524,47 @@ impl PageFormApp {
                     ui.separator();
                     self.align_commands(ui, true);
                 }
-            });
+            }
+        });
+    }
+
+    /// Cut, copy, paste, duplicate, and delete. On an item, paste uses the
+    /// click point. On empty canvas, only Paste is offered.
+    fn clipboard_commands(&mut self, ui: &mut egui::Ui, on_item: bool) {
+        let copy = command_shortcut(ui, egui::Key::C);
+        let cut = command_shortcut(ui, egui::Key::X);
+        let paste = command_shortcut(ui, egui::Key::V);
+        let duplicate = command_shortcut(ui, egui::Key::D);
+        if on_item && menu_command_enabled(ui, "Cut", Some(&cut), !self.selection.is_empty()) {
+            self.cut_selection();
+            self.publish_item_clipboard(ui.ctx());
+        }
+        if on_item && menu_command_enabled(ui, "Copy", Some(&copy), !self.selection.is_empty()) {
+            self.copy_selection();
+            self.publish_item_clipboard(ui.ctx());
+        }
+        if menu_command_enabled(ui, "Paste", Some(&paste), !self.clipboard.is_empty()) {
+            self.paste_items(self.context_at);
+        }
+        if on_item
+            && menu_command_enabled(
+                ui,
+                "Duplicate",
+                Some(&duplicate),
+                !self.selection.is_empty(),
+            )
+        {
+            self.duplicate_selection();
+        }
+        if on_item {
+            let delete = ui.add_enabled(
+                !self.selection.is_empty(),
+                egui::Button::new("Delete").shortcut_text("Del"),
+            );
+            if delete.clicked() {
+                self.delete_selection();
+                ui.close();
+            }
         }
     }
 
@@ -3218,6 +3294,7 @@ const EDIT_MENU: &[&str] = &[
     "Copy",
     "Cut",
     "Paste",
+    "Duplicate",
     "Delete",
     "",
     "Align",
@@ -3249,7 +3326,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "How do I select, move, and delete?",
-        "Edit > Select, or the Select tool. Drag on empty canvas to draw a box around the items you want. Drag a selected item to move it, and drag a handle to resize it. Edit > Delete, or the Delete key, removes the selection. Edit > Align, or a right-click, lines up two or more selected items.",
+        "Edit > Select, or the Select tool. Drag on empty canvas to draw a box around the items you want. Drag a selected item to move it, and drag a handle to resize it. Edit > Delete, or the Delete key, removes the selection. Right-click an item for Cut, Copy, Paste, Duplicate, and Delete. Ctrl or Cmd+C, X, V, and D do the same when no text field is focused. Paste on empty canvas drops the copy at the click. Edit > Align, or a right-click, lines up two or more selected items.",
     ),
     (
         "Where are theme and radio labels?",
@@ -4181,6 +4258,7 @@ mod tests {
                 "Copy",
                 "Cut",
                 "Paste",
+                "Duplicate",
                 "Delete",
                 "Align",
                 "Preferences"
@@ -4365,15 +4443,11 @@ mod tests {
             modifiers: egui::Modifiers::COMMAND,
         });
         let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
-        assert!(
-            app.doc.fields().is_empty(),
-            "a foreign clipboard does not paste items"
+        assert_eq!(
+            app.doc.fields().len(),
+            1,
+            "the internal clipboard pastes even when the system text differs"
         );
-
-        let mut input = screen_input();
-        input.events.push(egui::Event::Paste("Ada".into()));
-        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
-        assert_eq!(app.doc.fields().len(), 1);
         assert_ne!(app.selection, placed);
         assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
 
@@ -4444,6 +4518,121 @@ mod tests {
         input.events.push(egui::Event::Copy);
         let _ = ctx.run(input, |ctx| pair.handle_shortcuts(ctx));
         assert_eq!(pair.item_paste_text.as_deref(), Some("Ada\nBob"));
+    }
+
+    #[test]
+    fn a_selected_checkbox_copies_and_pastes_from_the_keys() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let id = app.doc.add_field(
+            FieldKind::Checkbox,
+            RectPt {
+                x: 80.0,
+                y: 500.0,
+                w: 18.0,
+                h: 18.0,
+            },
+        );
+        app.doc.set_caption(id, "Agree").unwrap();
+        app.selection = vec![id];
+        press_command(&ctx, &mut app, egui::Key::C, false);
+        assert_eq!(app.clipboard.len(), 1);
+        assert_eq!(app.clipboard[0].kind(), FieldKind::Checkbox);
+        assert_eq!(app.item_paste_text.as_deref(), Some("Agree"));
+        press_command(&ctx, &mut app, egui::Key::V, false);
+        assert_eq!(app.doc.fields().len(), 2);
+        assert_eq!(app.selection.len(), 1);
+        assert_ne!(app.selection[0], id);
+        let copy = app.doc.field(app.selection[0]).unwrap();
+        assert_eq!(copy.kind(), FieldKind::Checkbox);
+        assert_eq!(copy.caption(), "Agree");
+        assert!((copy.rect().x - 80.0).abs() > 1.0);
+        press_command(&ctx, &mut app, egui::Key::D, false);
+        assert_eq!(app.doc.fields().len(), 3);
+        assert_eq!(app.selection.len(), 1);
+        assert_ne!(app.selection[0], id);
+    }
+
+    #[test]
+    fn every_item_type_pastes_a_shifted_selected_copy() {
+        for kind in FieldKind::INSERT {
+            let mut app = PageFormApp::new(false, None);
+            let id = if kind == FieldKind::Line {
+                app.doc.add_line(
+                    PdfPoint { x: 40.0, y: 80.0 },
+                    PdfPoint { x: 140.0, y: 120.0 },
+                )
+            } else {
+                app.doc.add_field(
+                    kind,
+                    RectPt {
+                        x: 72.0,
+                        y: 400.0,
+                        w: 90.0,
+                        h: 18.0,
+                    },
+                )
+            };
+            app.selection = vec![id];
+            let before = app.doc.field(id).unwrap().rect();
+            app.copy_selection();
+            app.paste_items(None);
+            assert_eq!(app.doc.fields().len(), 2, "{}", kind.label());
+            assert_eq!(app.selection.len(), 1, "{}", kind.label());
+            let pasted = app.selection[0];
+            assert_ne!(pasted, id, "{}", kind.label());
+            let after = app.doc.field(pasted).unwrap();
+            assert_eq!(after.kind(), kind, "{}", kind.label());
+            assert!(
+                (after.rect().x - before.x).abs() > 1.0 || (after.rect().y - before.y).abs() > 1.0,
+                "{}",
+                kind.label()
+            );
+            app.paste_items(Some(PdfPoint { x: 200.0, y: 300.0 }));
+            let dropped = app.doc.field(app.selection[0]).unwrap().rect();
+            assert!((dropped.x - 200.0).abs() < 0.1, "{}", kind.label());
+            assert!((dropped.y - 300.0).abs() < 0.1, "{}", kind.label());
+        }
+    }
+
+    #[test]
+    fn the_item_context_menu_lists_clipboard_commands() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let id = app.doc.add_field(
+            FieldKind::Checkbox,
+            RectPt {
+                x: 10.0,
+                y: 10.0,
+                w: 18.0,
+                h: 18.0,
+            },
+        );
+        app.clipboard.push(app.doc.field(id).unwrap().clone());
+        app.selection = vec![id];
+        let output = panel(&ctx, &mut app, |app, ui| app.clipboard_commands(ui, true));
+        let texts = galley_texts(&output);
+        for label in [
+            "Cut",
+            "Copy",
+            "Paste",
+            "Duplicate",
+            "Delete",
+            "Ctrl+C",
+            "Ctrl+X",
+            "Ctrl+V",
+            "Ctrl+D",
+            "Del",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == label),
+                "{label} missing from {texts:?}"
+            );
+        }
+        let empty = panel(&ctx, &mut app, |app, ui| app.clipboard_commands(ui, false));
+        let texts = galley_texts(&empty);
+        assert!(texts.iter().any(|text| text == "Paste"));
+        assert!(texts.iter().all(|text| text != "Cut"));
     }
 
     #[test]
@@ -4586,7 +4775,7 @@ mod tests {
         app.insert_at_view(FieldKind::Text);
         let original = app.doc.fields()[0].rect();
         app.copy_selection();
-        app.paste_clipboard();
+        app.paste_items(None);
         assert_eq!(app.doc.fields().len(), 2);
         let pasted = app.doc.field(app.primary().unwrap()).unwrap().rect();
         assert!((pasted.x - original.x).abs() > 1.0);
@@ -4594,7 +4783,7 @@ mod tests {
         assert_eq!(app.selection.len(), 2);
         app.cut_selection();
         assert!(app.doc.fields().is_empty());
-        app.paste_clipboard();
+        app.paste_items(None);
         assert_eq!(app.doc.fields().len(), 2);
     }
 
