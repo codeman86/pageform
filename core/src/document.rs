@@ -6,8 +6,17 @@
 //! Static text and the table placeholder are canvas objects. They are not
 //! AcroForm fields. Radio buttons that share a name are one radio group.
 
-use crate::geom::{clamp_rect, Page, PdfPoint, RectPt};
+use crate::geom::{
+    align_rects, clamp_rect, distribute_rects, inset_rect, match_size, AlignEdge, Page, PdfPoint,
+    RectPt,
+};
 use crate::grid::GridSize;
+use crate::style::{clean_text, FieldStyle, Margins, Orientation, PageSize, Rgb};
+
+#[path = "project.rs"]
+mod project;
+
+pub use project::{LoadedProject, ProjectKind};
 
 pub const SAMPLE_TEXT_NAME: &str = "full_name";
 pub const SAMPLE_CHECK_NAME: &str = "agree";
@@ -81,7 +90,7 @@ pub fn default_size(kind: FieldKind, grid: GridSize) -> (f32, f32) {
 pub struct FieldId(pub u64);
 
 /// Page objects. Designer objects are not form fields.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FieldKind {
     /// One-line fillable AcroForm text field.
     Text,
@@ -170,6 +179,7 @@ pub struct Field {
     options: Vec<String>,
     /// Endpoints for a line. `None` for every other kind.
     line: Option<(PdfPoint, PdfPoint)>,
+    style: FieldStyle,
 }
 
 impl Field {
@@ -208,6 +218,10 @@ impl Field {
 
     pub fn line_ends(&self) -> Option<(PdfPoint, PdfPoint)> {
         self.line
+    }
+
+    pub fn style(&self) -> &FieldStyle {
+        &self.style
     }
 
     /// Lines use distance to the segment. Everything else uses the rectangle.
@@ -260,19 +274,32 @@ impl std::error::Error for NameError {}
 #[derive(Clone, Debug)]
 pub struct Document {
     page: Page,
+    page_size: PageSize,
+    orientation: Orientation,
+    margins: Margins,
+    header_text: String,
+    footer_text: String,
     fields: Vec<Field>,
     next_id: u64,
     /// Adjacent radio captions. Off hides them on the canvas and in the export.
     radio_labels: bool,
+    /// Not written into the project file. Set by edits, cleared by save and open.
+    dirty: bool,
 }
 
 impl Document {
     pub fn letter() -> Self {
         Self {
             page: Page::letter(),
+            page_size: PageSize::Letter,
+            orientation: Orientation::Portrait,
+            margins: Margins::default(),
+            header_text: "Header".to_string(),
+            footer_text: "Footer".to_string(),
             fields: Vec::new(),
             next_id: 1,
             radio_labels: true,
+            dirty: false,
         }
     }
 
@@ -295,7 +322,24 @@ impl Document {
             String::new(),
             Vec::new(),
         );
+        doc.mark_clean();
         doc
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn mark_clean(&mut self) {
+        self.dirty = false;
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn touch(&mut self) {
+        self.dirty = true;
     }
 
     pub fn page(&self) -> Page {
@@ -316,6 +360,72 @@ impl Document {
 
     pub fn set_radio_labels(&mut self, show: bool) {
         self.radio_labels = show;
+        self.touch();
+    }
+
+    pub fn page_size(&self) -> PageSize {
+        self.page_size
+    }
+
+    pub fn orientation(&self) -> Orientation {
+        self.orientation
+    }
+
+    pub fn margins(&self) -> Margins {
+        self.margins
+    }
+
+    /// Print-safe rectangle from the current margins. Canvas only.
+    pub fn margin_rect(&self) -> RectPt {
+        let margins = self.margins;
+        inset_rect(
+            &self.page,
+            margins.top,
+            margins.right,
+            margins.bottom,
+            margins.left,
+        )
+    }
+
+    pub fn header_text(&self) -> &str {
+        &self.header_text
+    }
+
+    pub fn footer_text(&self) -> &str {
+        &self.footer_text
+    }
+
+    pub fn set_page_size(&mut self, size: PageSize) {
+        self.page_size = size;
+        self.rebuild_page();
+        self.touch();
+    }
+
+    pub fn set_orientation(&mut self, orientation: Orientation) {
+        self.orientation = orientation;
+        self.rebuild_page();
+        self.touch();
+    }
+
+    pub fn set_margins(&mut self, margins: Margins) {
+        let cap = self.page.width.min(self.page.height) * 0.45;
+        self.margins = Margins {
+            top: margins.top.clamp(0.0, cap),
+            right: margins.right.clamp(0.0, cap),
+            bottom: margins.bottom.clamp(0.0, cap),
+            left: margins.left.clamp(0.0, cap),
+        };
+        self.touch();
+    }
+
+    pub fn set_header_text(&mut self, text: &str) {
+        self.header_text = clean_text(text, false);
+        self.touch();
+    }
+
+    pub fn set_footer_text(&mut self, text: &str) {
+        self.footer_text = clean_text(text, false);
+        self.touch();
     }
 
     pub fn add_field(&mut self, kind: FieldKind, rect: RectPt) -> FieldId {
@@ -352,35 +462,28 @@ impl Document {
     }
 
     pub fn update_rect(&mut self, id: FieldId, rect: RectPt) {
+        self.set_bounds(id, rect);
+    }
+
+    /// Set an exact rectangle. Lines scale their endpoints into the new bounds.
+    pub fn set_bounds(&mut self, id: FieldId, rect: RectPt) {
         let page = self.page;
-        let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+        let Some(index) = self.fields.iter().position(|field| field.id == id) else {
             return;
         };
         let rect = clamp_rect(rect, &page);
-        if field.kind == FieldKind::Line {
-            if let Some((start, end)) = field.line {
-                let dx = rect.x - field.rect.x;
-                let dy = rect.y - field.rect.y;
-                let start = clamp_point(
-                    PdfPoint {
-                        x: start.x + dx,
-                        y: start.y + dy,
-                    },
-                    &page,
-                );
-                let end = clamp_point(
-                    PdfPoint {
-                        x: end.x + dx,
-                        y: end.y + dy,
-                    },
-                    &page,
-                );
-                field.line = Some((start, end));
-                field.rect = line_bounds(start, end, &page);
+        if self.fields[index].kind == FieldKind::Line {
+            if let Some((start, end)) = self.fields[index].line {
+                let old = self.fields[index].rect;
+                let (start, end) = map_line(start, end, old, rect);
+                let start = clamp_point(start, &page);
+                let end = clamp_point(end, &page);
+                self.set_line_ends(id, start, end);
                 return;
             }
         }
-        field.rect = rect;
+        self.fields[index].rect = rect;
+        self.touch();
     }
 
     /// Place a line from `start` to `end`. A click with no drag uses `add_field`.
@@ -419,10 +522,60 @@ impl Document {
         self.set_line_ends(id, start, end);
     }
 
+    /// Place a copy of `source`, shifted by `(dx, dy)`. The copy gets a new name.
+    pub fn paste_copy(&mut self, source: &Field, dx: f32, dy: f32) -> FieldId {
+        let page = self.page;
+        let rect = clamp_rect(
+            RectPt {
+                x: source.rect.x + dx,
+                y: source.rect.y + dy,
+                w: source.rect.w,
+                h: source.rect.h,
+            },
+            &page,
+        );
+        let name = self.unique_name(source.kind);
+        let id = self.insert(
+            source.kind,
+            &name,
+            rect,
+            source.caption.clone(),
+            source.on_state.clone(),
+            source.options.clone(),
+        );
+        if let Some(field) = self.fields.iter_mut().find(|field| field.id == id) {
+            field.style = source.style.clone();
+        }
+        if let Some((start, end)) = source.line {
+            self.set_line_ends(
+                id,
+                clamp_point(
+                    PdfPoint {
+                        x: start.x + dx,
+                        y: start.y + dy,
+                    },
+                    &page,
+                ),
+                clamp_point(
+                    PdfPoint {
+                        x: end.x + dx,
+                        y: end.y + dy,
+                    },
+                    &page,
+                ),
+            );
+        }
+        id
+    }
+
     pub fn remove(&mut self, id: FieldId) -> bool {
         let before = self.fields.len();
         self.fields.retain(|field| field.id != id);
-        self.fields.len() != before
+        let removed = self.fields.len() != before;
+        if removed {
+            self.touch();
+        }
+        removed
     }
 
     pub fn set_name(&mut self, id: FieldId, name: &str) -> Result<(), NameError> {
@@ -434,6 +587,7 @@ impl Document {
             return Err(NameError::Duplicate);
         }
         let kind = self.fields[index].kind;
+        self.touch();
         let old_name = self.fields[index].name.clone();
         if kind == FieldKind::Radio {
             for field in &mut self.fields {
@@ -447,9 +601,10 @@ impl Document {
         Ok(())
     }
 
-    /// Caption for static text or the label beside a radio button.
+    /// Caption for static text, a text box, or the label beside a radio or checkbox.
+    /// A newline is kept so a text box can break lines. Other control characters are rejected.
     pub fn set_caption(&mut self, id: FieldId, caption: &str) -> Result<(), NameError> {
-        if caption.chars().any(|ch| ch.is_control()) {
+        if caption.chars().any(|ch| ch.is_control() && ch != '\n') {
             return Err(NameError::Control);
         }
         let Some(field) = self.fields.iter().find(|field| field.id == id) else {
@@ -462,13 +617,16 @@ impl Document {
         } else {
             None
         };
-        let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
-            return Err(NameError::Missing);
-        };
-        field.caption = caption.to_string();
-        if let Some(on_state) = on_state {
-            field.on_state = on_state;
+        {
+            let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+                return Err(NameError::Missing);
+            };
+            field.caption = caption.to_string();
+            if let Some(on_state) = on_state {
+                field.on_state = on_state;
+            }
         }
+        self.touch();
         Ok(())
     }
 
@@ -488,14 +646,176 @@ impl Document {
         {
             return Err(NameError::Control);
         }
-        let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
-            return Err(NameError::Missing);
-        };
-        if field.kind != FieldKind::Dropdown {
-            return Err(NameError::Missing);
+        {
+            let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+                return Err(NameError::Missing);
+            };
+            if field.kind != FieldKind::Dropdown {
+                return Err(NameError::Missing);
+            }
+            field.options = cleaned;
         }
-        field.options = cleaned;
+        self.touch();
         Ok(())
+    }
+
+    pub fn update_style(&mut self, id: FieldId, edit: impl FnOnce(&mut FieldStyle)) {
+        {
+            let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+                return;
+            };
+            edit(&mut field.style);
+            field.style.font_size = field.style.font_size.clamp(4.0, 96.0);
+            field.style.border_width = field.style.border_width.clamp(0.0, 24.0);
+            field.style.stroke_width = field.style.stroke_width.clamp(0.0, 24.0);
+            field.style.text_color = Rgb::new(
+                field.style.text_color.r,
+                field.style.text_color.g,
+                field.style.text_color.b,
+            );
+            field.style.border_color = Rgb::new(
+                field.style.border_color.r,
+                field.style.border_color.g,
+                field.style.border_color.b,
+            );
+            field.style.stroke_color = Rgb::new(
+                field.style.stroke_color.r,
+                field.style.stroke_color.g,
+                field.style.stroke_color.b,
+            );
+            if let Some(fill) = field.style.fill {
+                field.style.fill = Some(Rgb::new(fill.r, fill.g, fill.b));
+            }
+            if let Some(max) = field.style.max_chars {
+                field.style.max_chars = Some(max.clamp(1, 5000));
+            }
+        }
+        self.touch();
+    }
+
+    pub fn set_tooltip(&mut self, id: FieldId, tooltip: &str) {
+        let tooltip = clean_text(tooltip, false);
+        self.update_style(id, |style| style.tooltip = tooltip);
+    }
+
+    pub fn set_default_value(&mut self, id: FieldId, value: &str) {
+        let value = clean_text(value, true);
+        self.update_style(id, |style| style.default_value = value);
+    }
+
+    /// Required is stored on every button in a radio group.
+    pub fn set_required(&mut self, id: FieldId, required: bool) {
+        self.set_group_flag(id, |style| style.required = required);
+    }
+
+    /// Read-only is stored on every button in a radio group.
+    pub fn set_read_only(&mut self, id: FieldId, read_only: bool) {
+        self.set_group_flag(id, |style| style.read_only = read_only);
+    }
+
+    /// Checkbox and radio defaults. A selected radio clears the others.
+    pub fn set_checked(&mut self, id: FieldId, checked: bool) {
+        let Some(field) = self.fields.iter().find(|field| field.id == id) else {
+            return;
+        };
+        if field.kind == FieldKind::Radio {
+            let group = field.name.clone();
+            for member in &mut self.fields {
+                if member.kind != FieldKind::Radio || member.name != group {
+                    continue;
+                }
+                if checked {
+                    member.style.default_value = if member.id == id {
+                        "On".to_string()
+                    } else {
+                        String::new()
+                    };
+                } else if member.id == id {
+                    member.style.default_value.clear();
+                }
+            }
+            self.touch();
+            return;
+        }
+        self.update_style(id, |style| {
+            style.default_value = if checked {
+                "Yes".to_string()
+            } else {
+                String::new()
+            };
+        });
+    }
+
+    pub fn align_fields(&mut self, ids: &[FieldId], edge: AlignEdge) {
+        self.map_selection(ids, 2, |rects| align_rects(rects, edge));
+    }
+
+    pub fn distribute_fields(&mut self, ids: &[FieldId], horizontal: bool) {
+        self.map_selection(ids, 3, |rects| distribute_rects(rects, horizontal));
+    }
+
+    /// `reference` is an index into `ids`. That item keeps its size.
+    pub fn match_field_size(
+        &mut self,
+        ids: &[FieldId],
+        reference: usize,
+        width: bool,
+        height: bool,
+    ) {
+        self.map_selection(ids, 2, |rects| match_size(rects, reference, width, height));
+    }
+
+    fn set_group_flag(&mut self, id: FieldId, edit: impl Fn(&mut FieldStyle)) {
+        let Some(field) = self.fields.iter().find(|field| field.id == id) else {
+            return;
+        };
+        let group = (field.kind == FieldKind::Radio).then(|| field.name.clone());
+        for member in &mut self.fields {
+            let same = member.id == id
+                || group
+                    .as_ref()
+                    .is_some_and(|group| member.kind == FieldKind::Radio && member.name == *group);
+            if same {
+                edit(&mut member.style);
+            }
+        }
+        self.touch();
+    }
+
+    /// Uses each item's bounding rectangle. A diagonal line therefore lines up
+    /// by that box, not by its endpoints. That is the intended behavior.
+    fn map_selection(&mut self, ids: &[FieldId], min: usize, edit: impl FnOnce(&mut [RectPt])) {
+        let items: Vec<(FieldId, RectPt)> = ids
+            .iter()
+            .filter_map(|id| self.field(*id).map(|field| (*id, field.rect())))
+            .collect();
+        if items.len() < min {
+            return;
+        }
+        let mut rects: Vec<RectPt> = items.iter().map(|(_, rect)| *rect).collect();
+        edit(&mut rects);
+        for (index, (id, _)) in items.iter().enumerate() {
+            self.set_bounds(*id, rects[index]);
+        }
+    }
+
+    fn rebuild_page(&mut self) {
+        let (mut width, mut height) = self.page_size.portrait_pt();
+        if self.orientation == Orientation::Landscape {
+            std::mem::swap(&mut width, &mut height);
+        }
+        self.page = Page { width, height };
+        let ids: Vec<FieldId> = self.fields.iter().map(|field| field.id).collect();
+        for id in ids {
+            let rect = self.field(id).map(|field| field.rect()).unwrap_or(RectPt {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            });
+            self.set_bounds(id, rect);
+        }
+        self.set_margins(self.margins);
     }
 
     fn insert(
@@ -520,17 +840,22 @@ impl Document {
             on_state,
             options,
             line,
+            style: FieldStyle::for_kind(kind),
         });
+        self.touch();
         id
     }
 
     fn set_line_ends(&mut self, id: FieldId, start: PdfPoint, end: PdfPoint) {
         let page = self.page;
-        let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
-            return;
-        };
-        field.line = Some((start, end));
-        field.rect = line_bounds(start, end, &page);
+        {
+            let Some(field) = self.fields.iter_mut().find(|field| field.id == id) else {
+                return;
+            };
+            field.line = Some((start, end));
+            field.rect = line_bounds(start, end, &page);
+        }
+        self.touch();
     }
 
     fn name_conflicts(&self, id: FieldId, new_name: &str) -> bool {
@@ -654,6 +979,32 @@ fn line_bounds(start: PdfPoint, end: PdfPoint, page: &Page) -> RectPt {
             h: (start.y - end.y).abs().max(1.0),
         },
         page,
+    )
+}
+
+fn map_line(start: PdfPoint, end: PdfPoint, old: RectPt, new: RectPt) -> (PdfPoint, PdfPoint) {
+    let map = |value: f32, origin: f32, span: f32, new_origin: f32, new_span: f32| {
+        let same_origin = (origin - new_origin).abs() < 0.001;
+        let same_span = (span - new_span).abs() < 0.001;
+        // An unchanged axis stays put. A flat line is stored in a 1 pt box, so
+        // recentering that pad would walk the other coordinate by 0.5 pt.
+        if same_origin && same_span {
+            value
+        } else if span <= 1.0 {
+            value + (new_origin - origin) + (new_span - span) * 0.5
+        } else {
+            new_origin + (value - origin) / span * new_span
+        }
+    };
+    (
+        PdfPoint {
+            x: map(start.x, old.x, old.w, new.x, new.w),
+            y: map(start.y, old.y, old.h, new.y, new.h),
+        },
+        PdfPoint {
+            x: map(end.x, old.x, old.w, new.x, new.w),
+            y: map(end.y, old.y, old.h, new.y, new.h),
+        },
     )
 }
 
@@ -862,6 +1213,16 @@ mod tests {
     }
 
     #[test]
+    fn caption_keeps_a_newline_and_rejects_other_controls() {
+        let mut doc = Document::letter();
+        let id = doc.add_field(FieldKind::TextBox, SAMPLE_TEXT_RECT);
+        assert_eq!(doc.set_caption(id, "Line one\nLine two"), Ok(()));
+        assert_eq!(doc.field(id).unwrap().caption(), "Line one\nLine two");
+        assert_eq!(doc.set_caption(id, "bad\u{0001}"), Err(NameError::Control));
+        assert_eq!(doc.field(id).unwrap().caption(), "Line one\nLine two");
+    }
+
+    #[test]
     fn static_text_caption_is_not_a_field_name() {
         let mut doc = Document::letter();
         let id = doc.add_field(FieldKind::StaticText, SAMPLE_TEXT_RECT);
@@ -918,6 +1279,44 @@ mod tests {
         let (_, end) = doc.field(drawn).unwrap().line_ends().unwrap();
         assert!((end.x - 90.0).abs() < 0.1);
         assert!((end.y - 90.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn moving_a_line_on_one_axis_leaves_the_other_axis_alone() {
+        let mut doc = Document::letter();
+        let id = doc.add_line(
+            PdfPoint { x: 40.0, y: 80.0 },
+            PdfPoint { x: 140.0, y: 80.0 },
+        );
+        for _ in 0..4 {
+            let rect = doc.field(id).unwrap().rect();
+            let mut next = rect;
+            next.x += 1.0;
+            doc.set_bounds(id, next);
+        }
+        let (start, end) = doc.field(id).unwrap().line_ends().unwrap();
+        assert!(
+            (start.y - 80.0).abs() < 0.01,
+            "x edit moved y to {}",
+            start.y
+        );
+        assert!((end.y - 80.0).abs() < 0.01, "x edit moved y to {}", end.y);
+        assert!((start.x - 44.0).abs() < 0.01);
+        assert!((end.x - 144.0).abs() < 0.01);
+
+        let rect = doc.field(id).unwrap().rect();
+        let mut next = rect;
+        next.y += 2.0;
+        doc.set_bounds(id, next);
+        let (start, end) = doc.field(id).unwrap().line_ends().unwrap();
+        assert!(
+            (start.x - 44.0).abs() < 0.01,
+            "y edit moved x to {}",
+            start.x
+        );
+        assert!((end.x - 144.0).abs() < 0.01, "y edit moved x to {}", end.x);
+        assert!((start.y - 82.0).abs() < 0.01);
+        assert!((end.y - 82.0).abs() < 0.01);
     }
 
     #[test]

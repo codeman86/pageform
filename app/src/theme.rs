@@ -79,8 +79,9 @@ pub fn canvas_colors(dark: bool) -> CanvasColors {
             page: Color32::from_rgb(36, 40, 46),
             shadow: Color32::from_rgba_unmultiplied(0, 0, 0, 110),
             page_edge: Color32::from_rgb(168, 176, 188),
-            minor_dot: Color32::from_rgb(164, 172, 184),
-            major_dot: Color32::from_rgb(226, 230, 236),
+            // Quiet against the page so lines and labels stay in front.
+            minor_dot: Color32::from_rgb(84, 92, 104),
+            major_dot: Color32::from_rgb(122, 130, 142),
             minor_guide: Color32::from_rgb(86, 116, 140),
             major_guide: Color32::from_rgb(156, 190, 214),
             selection: Color32::from_rgb(120, 176, 255),
@@ -88,8 +89,9 @@ pub fn canvas_colors(dark: bool) -> CanvasColors {
             check_stroke: Color32::from_rgb(32, 32, 36),
             field_fill: Color32::WHITE,
             field_text: Color32::from_rgb(50, 58, 72),
-            label_text: Color32::from_rgb(232, 236, 242),
-            shape_stroke: Color32::from_rgb(214, 220, 228),
+            // Brighter and warmer than the gray grid dots so lines, squares, and labels stay readable.
+            label_text: Color32::from_rgb(255, 248, 230),
+            shape_stroke: Color32::from_rgb(255, 196, 120),
             handle_fill: Color32::WHITE,
             margin: Color32::from_rgb(220, 146, 146),
         }
@@ -109,8 +111,8 @@ pub fn canvas_colors(dark: bool) -> CanvasColors {
             check_stroke: Color32::from_rgb(32, 32, 36),
             field_fill: Color32::WHITE,
             field_text: Color32::from_rgb(50, 58, 72),
-            label_text: Color32::from_rgb(50, 58, 72),
-            shape_stroke: Color32::from_rgb(36, 48, 72),
+            label_text: Color32::from_rgb(28, 32, 40),
+            shape_stroke: Color32::from_rgb(20, 24, 32),
             handle_fill: Color32::WHITE,
             margin: Color32::from_rgb(186, 112, 112),
         }
@@ -163,7 +165,7 @@ mod tests {
     fn dark_canvas_marks_are_lighter_than_the_page() {
         let colors = canvas_colors(true);
         let page = rel_luma(colors.page);
-        assert!(rel_luma(colors.minor_dot) > page + 0.15);
+        assert!(rel_luma(colors.minor_dot) > page + 0.05);
         assert!(rel_luma(colors.major_dot) > rel_luma(colors.minor_dot));
         assert!(rel_luma(colors.minor_guide) > page + 0.05);
         assert!(rel_luma(colors.major_guide) > rel_luma(colors.minor_guide));

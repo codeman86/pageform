@@ -87,7 +87,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y file curl ca-certificates \
-            libxkbcommon0 libwayland-client0 libwayland-cursor0 libwayland-egl1
+            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
+            libwayland-client0 libwayland-cursor0 libwayland-egl1
           packaging/make-appimage.sh
 
       - name: Upload Linux AppImage

@@ -1,3 +1,4 @@
+mod prefs;
 mod preview;
 mod theme;
 mod ui;
@@ -71,7 +72,65 @@ fn dispatch() -> Result<(), String> {
         return Ok(());
     }
 
+    #[cfg(target_os = "linux")]
+    ensure_keyboard_libraries()?;
+
     ui::run_gui(demo).map_err(|err| err.to_string())
+}
+
+/// winit loads these with dlopen, and a missing one panics inside the window
+/// startup. The AppImage bundles both. A raw binary should say which library
+/// is missing instead of aborting.
+#[cfg(target_os = "linux")]
+fn ensure_keyboard_libraries() -> Result<(), String> {
+    let needed = [
+        ("libxkbcommon-x11.so.0", "libxkbcommon-x11-0"),
+        ("libxcb-xkb.so.1", "libxcb-xkb1"),
+    ];
+    let missing: Vec<(&str, &str)> = needed
+        .into_iter()
+        .filter(|(soname, _)| !shared_library_loads(soname))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let libraries = missing
+        .iter()
+        .map(|(soname, _)| *soname)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    let packages = missing
+        .iter()
+        .map(|(_, package)| *package)
+        .collect::<Vec<_>>()
+        .join(" and ");
+    Err(format!(
+        "missing {libraries} for keyboard input. The PageForm AppImage includes them. Install {packages}, or run the AppImage."
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn shared_library_loads(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // RTLD_NOW so a missing dependency (libxcb-xkb under libxkbcommon-x11) fails here.
+    const RTLD_NOW: i32 = 2;
+    unsafe {
+        let handle = dlopen(name.as_ptr(), RTLD_NOW);
+        if handle.is_null() {
+            false
+        } else {
+            dlclose(handle);
+            true
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn dlopen(filename: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+    fn dlclose(handle: *mut std::ffi::c_void) -> i32;
 }
 
 fn required_value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
@@ -96,12 +155,41 @@ Usage:
 Scroll to zoom. Middle-drag or Space-drag to pan.
 The window opens in the dark theme. Edit → Preferences, View → Dark / Light,
 or the toolbar moon/sun icon switches it, and the choice is restored next launch.
-File: New opens New Blank Document and New from Template. Those, plus Open, Save,
-Save As, and Print, are not implemented yet.
-Export PDF writes sample-form.pdf. Exit closes the window.
-Edit: Select and Delete work. Select All, Copy, Cut, and Paste are not
-implemented yet. Preferences is a dialog for the theme and radio labels.
-Insert drops a default item in the view, listed alphabetically: Checkbox,
+The properties panel starts hidden. View → Properties, the toolbar icon,
+or right-click Properties opens it. Double-click edits visible text on the
+page. Enter finishes, Esc cancels, and Shift+Enter adds a line in a text box
+or multiline field. Pin keeps the panel open.
+Unpinned, it closes when you click empty canvas with Select, or when the
+selection is deleted. Preferences stores that open and pinned choice.
+Nothing selected edits the page. One item edits that item. Drag on empty
+canvas to draw a selection box. Shift-click or Ctrl-click selects several
+items. Edit > Align, the properties panel, and the right-click menu align,
+distribute, and match size.
+Calculations are a placeholder. Margins, header, and footer stay on the canvas.
+File: New Blank Document starts a blank page and asks before discarding
+unsaved work. Ctrl or Cmd+N does that. New from Template opens a .pgt
+template as a new untitled document and does not change the template. That
+document stays clean until you edit it. Open reads .pgd documents, .pgt
+templates, and older .pageform files. Ctrl or Cmd+O opens. Ctrl or Cmd+S
+saves the current .pgd. A document opened from a template has no linked
+file, so Save asks for a new .pgd and cannot overwrite the template. Ctrl or
+Cmd+Shift+S is Save As. A .pgt is written only when Template is chosen, and
+an existing template asks before it is replaced. Saving a template does not
+link that file. Ctrl or Cmd+P prints. The window title shows the file name
+and a * when there are unsaved changes. Exit uses Ctrl or Cmd+Q and asks
+before closing a changed file. The window close button and Alt+F4 ask the
+same question, once. Open Recent and the Open window show the file name, with
+(template) on a .pgt file, and the full path as the tooltip. Copy places
+the selected items' text on the clipboard, one item per line. Ctrl or Cmd+V
+on the canvas pastes those items while that text is still on the clipboard.
+Export PDF asks where to save the PDF. If there is no system file dialog,
+PageForm asks for the folder and file name.
+Edit: Select, Select All, Copy, Cut, Paste, and Delete work. Ctrl or Cmd
+with A, C, X, V, and the Delete key do the same. Preferences is a dialog
+for the theme and radio labels.
+Insert drops a default item in the view, listed alphabetically. A toolbar
+insert tool places that default size on a click and sizes the item when you
+drag. The items are: Checkbox,
 Date, Drop-down, Image, Line, Radio, Signature, Square/Rectangle, Table,
 Text (static label), Text Box, and Text Field. Toolbar icons use that same
 order, with Square and Rectangle as separate tools under one Shapes icon. Insert Page is not

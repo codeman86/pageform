@@ -46,11 +46,18 @@ export APPIMAGE_EXTRACT_AND_RUN=1
 # Keep the host GPU driver. Bundling Ubuntu's libGL/libEGL/libvulkan breaks Arch.
 export LINUXDEPLOY_EXCLUDED_LIBRARIES="${LINUXDEPLOY_EXCLUDED_LIBRARIES:-libGL.so.1:libEGL.so.1:libvulkan.so.1}"
 
+# winit dlopens libxkbcommon-x11, which needs libxcb-xkb. They are not NEEDED
+# by the binary, so linuxdeploy will not pick them up unless named here.
+required_libs=(libxkbcommon-x11.so.0 libxcb-xkb.so.1)
+optional_libs=(libxkbcommon.so.0 libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1)
 library_args=()
-for name in libxkbcommon.so.0 libwayland-client.so.0 libwayland-cursor.so.0 libwayland-egl.so.1; do
+for name in "${required_libs[@]}" "${optional_libs[@]}"; do
   found=$(ldconfig -p | awk -v lib="$name" '$1 == lib { print $NF; exit }')
   if [[ -n "${found:-}" && -f "$found" ]]; then
     library_args+=(--library "$found")
+  elif printf '%s\n' "${required_libs[@]}" | grep -qx "$name"; then
+    echo "required library $name is not installed" >&2
+    exit 1
   fi
 done
 
@@ -78,6 +85,12 @@ if [[ "$bundled" -lt 1 ]]; then
   echo "AppDir has no shared libraries; the AppImage would not be portable." >&2
   exit 1
 fi
+for name in "${required_libs[@]}"; do
+  if ! find AppDir -name "$name" -print -quit | grep -q .; then
+    echo "AppImage is missing $name" >&2
+    exit 1
+  fi
+done
 
 size=$(stat -c%s dist/PageForm-x86_64.AppImage)
 echo "dist/PageForm-x86_64.AppImage size: $size"

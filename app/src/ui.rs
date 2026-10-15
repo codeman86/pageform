@@ -2,15 +2,17 @@
 
 #[path = "icons.rs"]
 mod icons;
+#[path = "properties.rs"]
+mod properties;
 
 use eframe::egui::{
     self, Align2, CursorIcon, FontId, Key, PointerButton, Pos2, Rect, Sense, Stroke, Vec2,
 };
 use pageform_core::{
-    default_size, export_pdf, hit_handle, move_rect, place_default, print_safe_rect,
-    rect_from_drag, resize_rect, snap_point, Document, FieldId, FieldKind, GridSize, Handle, Page,
-    PdfPoint, RectPt, ScreenRect, ViewTransform, DATE_HINT, PRINT_SAFE_MARGIN_PT, TABLE_COLUMNS,
-    TABLE_ROWS,
+    default_size, export_pdf, hit_handle, move_rect, place_default, rect_from_drag, resize_rect,
+    snap_point, AlignEdge, BorderStyleKind, CheckboxStyle, Document, Field, FieldId, FieldKind,
+    FontFamily, GridSize, Handle, Page, PdfPoint, ProjectKind, RectPt, Rgb, ScreenRect, TextAlign,
+    ViewTransform, TABLE_COLUMNS, TABLE_ROWS,
 };
 
 pub fn run_gui(demo: bool) -> eframe::Result<()> {
@@ -87,7 +89,25 @@ impl Tool {
     }
 }
 
-#[derive(Clone, Copy)]
+/// Which string a canvas text editor writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineTarget {
+    /// Static text, text box, radio or checkbox label, signature word.
+    Caption,
+    /// Fillable field's default value.
+    DefaultValue,
+}
+
+struct InlineEdit {
+    id: FieldId,
+    target: InlineTarget,
+    buffer: String,
+    original: String,
+    multiline: bool,
+    request_focus: bool,
+}
+
+#[derive(Clone)]
 enum Drag {
     Pan,
     Place {
@@ -95,9 +115,10 @@ enum Drag {
         kind: FieldKind,
     },
     Move {
-        id: FieldId,
+        grab_id: FieldId,
         grab_x: f32,
         grab_y: f32,
+        origins: Vec<(FieldId, RectPt)>,
     },
     Resize {
         id: FieldId,
@@ -108,12 +129,58 @@ enum Drag {
         id: FieldId,
         index: usize,
     },
+    Marquee {
+        start: PdfPoint,
+        extend: bool,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnsavedChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+enum NativePick {
+    Path(std::path::PathBuf),
+    Cancel,
+    Fallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptKind {
+    ExportPdf,
+    SaveProject,
+    OpenProject,
+    OpenTemplate,
+}
+
+#[derive(Clone)]
+enum PendingFileAction {
+    NewBlank,
+    Open,
+    OpenPath(String),
+    NewFromTemplate,
+    Exit,
+}
+
+#[derive(Clone)]
+struct FilePrompt {
+    kind: PromptKind,
+    directory: String,
+    file_name: String,
+    /// The chosen path already exists. The next Save replaces it.
+    replace: bool,
+    /// Save As writes a `.pgt` template instead of a `.pgd` document.
+    save_as_template: bool,
 }
 
 struct PageFormApp {
     doc: Document,
     tool: Tool,
-    selection: Option<FieldId>,
+    /// Last entry is the primary item (handles, properties, match-size reference).
+    selection: Vec<FieldId>,
     dots_visible: bool,
     guides_visible: bool,
     margins_visible: bool,
@@ -126,18 +193,51 @@ struct PageFormApp {
     fitted: bool,
     canvas_rect: Option<Rect>,
     drag: Option<Drag>,
+    clipboard: Vec<Field>,
+    /// Exact text last written to the OS clipboard for those items.
+    /// A canvas paste of this string pastes the items. Any other text is not.
+    item_paste_text: Option<String>,
+    paste_steps: i32,
+    /// The Insert menu click is also over the canvas. Ignore that pointer
+    /// press so it does not clear the selection just made.
+    suppress_place_click: bool,
     name_buf: String,
     caption_buf: String,
+    tooltip_buf: String,
+    value_buf: String,
     options_buf: String,
     name_for: Option<FieldId>,
     name_error: Option<String>,
     export_path: String,
+    project_path: Option<String>,
+    recent: Vec<String>,
+    unsaved: Option<PendingFileAction>,
+    after_save: Option<PendingFileAction>,
+    allow_close: bool,
+    last_title: String,
+    /// A project save just succeeded. Continue New, Open, or Exit afterwards.
+    saved_follow_up: bool,
     status: String,
+    /// Status text last observed, so a change restarts the fade timer.
+    status_seen: String,
+    status_at: f64,
     dark: bool,
     persist_theme: bool,
+    properties_open: bool,
+    properties_pinned: bool,
+    persist_panel: bool,
+    context_field: Option<FieldId>,
+    /// PDF point under the last right-click, for Paste on the canvas.
+    context_at: Option<PdfPoint>,
+    inline: Option<InlineEdit>,
+    status_before_inline: Option<String>,
+    /// False until the user pans or zooms, so the page stays centered as the canvas resizes.
+    navigated: bool,
+    canvas_size: Option<Vec2>,
     show_preferences: bool,
     show_about: bool,
     show_help: bool,
+    file_prompt: Option<FilePrompt>,
 }
 
 impl PageFormApp {
@@ -149,11 +249,18 @@ impl PageFormApp {
         };
         let page = doc.page();
         let stored = storage.and_then(|storage| storage.get_string(crate::theme::STORAGE_KEY));
+        let open = storage.and_then(|storage| storage.get_string(crate::prefs::OPEN_KEY));
+        let pinned = storage.and_then(|storage| storage.get_string(crate::prefs::PIN_KEY));
+        let recent = crate::prefs::parse_recent(
+            storage
+                .and_then(|storage| storage.get_string(crate::prefs::RECENT_KEY))
+                .as_deref(),
+        );
         Self {
             view: ViewTransform::new(page.height),
             doc,
             tool: Tool::Select,
-            selection: None,
+            selection: Vec::new(),
             dots_visible: true,
             guides_visible: true,
             margins_visible: true,
@@ -165,23 +272,173 @@ impl PageFormApp {
             fitted: false,
             canvas_rect: None,
             drag: None,
+            clipboard: Vec::new(),
+            item_paste_text: None,
+            paste_steps: 0,
+            suppress_place_click: false,
             name_buf: String::new(),
             caption_buf: String::new(),
+            tooltip_buf: String::new(),
+            value_buf: String::new(),
             options_buf: String::new(),
             name_for: None,
             name_error: None,
             export_path: "sample-form.pdf".to_string(),
+            project_path: None,
+            recent,
+            unsaved: None,
+            after_save: None,
+            allow_close: false,
+            last_title: String::new(),
+            saved_follow_up: false,
             status: if demo {
                 "Sample page with full_name and agree".to_string()
             } else {
                 "Blank US Letter page".to_string()
             },
+            status_seen: if demo {
+                "Sample page with full_name and agree".to_string()
+            } else {
+                "Blank US Letter page".to_string()
+            },
+            status_at: 0.0,
             dark: crate::theme::is_dark(stored.as_deref()),
             persist_theme: false,
+            properties_open: crate::prefs::is_open(open.as_deref()),
+            properties_pinned: crate::prefs::is_pinned(pinned.as_deref()),
+            persist_panel: false,
+            context_field: None,
+            context_at: None,
+            inline: None,
+            status_before_inline: None,
+            navigated: false,
+            canvas_size: None,
             show_preferences: false,
             show_about: false,
             show_help: false,
+            file_prompt: None,
         }
+    }
+
+    /// Clear a status message a few seconds after it was set. The edit prompt
+    /// stays until the edit finishes. Returns the time left so the window can
+    /// repaint without waiting for the next input event.
+    fn fade_status(&mut self, time: f64) -> Option<f64> {
+        if self.status != self.status_seen {
+            self.status_seen.clone_from(&self.status);
+            self.status_at = time;
+        }
+        if self.inline.is_some() || self.status.is_empty() {
+            return None;
+        }
+        let remaining = 4.0 - (time - self.status_at);
+        if remaining <= 0.0 {
+            self.status.clear();
+            self.status_seen.clear();
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    fn select_all(&mut self) {
+        self.selection = self.doc.fields().iter().map(|field| field.id()).collect();
+        let count = self.selection.len();
+        self.status = if count == 1 {
+            "Selected 1 item".to_string()
+        } else {
+            format!("Selected {count} items")
+        };
+    }
+
+    fn copy_selection(&mut self) {
+        self.clipboard = self
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.field(*id).cloned())
+            .collect();
+        self.paste_steps = 0;
+        self.item_paste_text = if self.clipboard.is_empty() {
+            None
+        } else {
+            Some(items_clipboard_text(&self.clipboard))
+        };
+        let count = self.clipboard.len();
+        self.status = if count == 1 {
+            "Copied 1 item".to_string()
+        } else {
+            format!("Copied {count} items")
+        };
+    }
+
+    fn cut_selection(&mut self) {
+        if self.selection.is_empty() {
+            return;
+        }
+        self.copy_selection();
+        let count = self.clipboard.len();
+        self.delete_selection();
+        self.status = if count == 1 {
+            "Cut 1 item".to_string()
+        } else {
+            format!("Cut {count} items")
+        };
+    }
+
+    fn publish_item_clipboard(&mut self, ctx: &egui::Context) {
+        let Some(text) = self.item_paste_text.clone() else {
+            return;
+        };
+        ctx.copy_text(text);
+    }
+
+    fn paste_items(&mut self, at: Option<PdfPoint>) {
+        if self.clipboard.is_empty() {
+            self.status = "Nothing to paste".to_string();
+            return;
+        }
+        let (dx, dy) = if let Some(at) = at {
+            let origin = self.clipboard[0].rect();
+            (at.x - origin.x, at.y - origin.y)
+        } else {
+            self.paste_steps += 1;
+            let step = self.grid_size.minor_pt() * self.paste_steps as f32;
+            (step, -step)
+        };
+        let mut ids = Vec::new();
+        for field in self.clipboard.clone() {
+            ids.push(self.doc.paste_copy(&field, dx, dy));
+        }
+        self.selection = ids;
+        let count = self.selection.len();
+        self.status = if count == 1 {
+            "Pasted 1 item".to_string()
+        } else {
+            format!("Pasted {count} items")
+        };
+    }
+
+    fn duplicate_selection(&mut self) {
+        let fields: Vec<Field> = self
+            .selection
+            .iter()
+            .filter_map(|id| self.doc.field(*id).cloned())
+            .collect();
+        if fields.is_empty() {
+            return;
+        }
+        let step = self.grid_size.minor_pt();
+        let mut ids = Vec::new();
+        for field in fields {
+            ids.push(self.doc.paste_copy(&field, step, -step));
+        }
+        self.selection = ids;
+        let count = self.selection.len();
+        self.status = if count == 1 {
+            "Duplicated 1 item".to_string()
+        } else {
+            format!("Duplicated {count} items")
+        };
     }
 
     /// Snap spacing is the minor step of the active preset, hidden grid included.
@@ -208,13 +465,9 @@ impl PageFormApp {
     }
 
     fn place_rect(&self, start: PdfPoint, current: PdfPoint, kind: FieldKind) -> RectPt {
-        let (x0, y0) = self.view.pdf_to_screen(start);
-        let (x1, y1) = self.view.pdf_to_screen(current);
-        let dx = x0 - x1;
-        let dy = y0 - y1;
         let page = self.doc.page();
         let square = self.tool == Tool::Square && kind == FieldKind::Rectangle;
-        if dx * dx + dy * dy < 16.0 {
+        if is_click(&self.view, start, current) {
             let (mut w, mut h) = default_size(kind, self.grid_size);
             if square {
                 let side = w.min(h);
@@ -229,7 +482,559 @@ impl PageFormApp {
         }
     }
 
+    fn window_title(&self) -> String {
+        let name = self
+            .project_path
+            .as_ref()
+            .and_then(|path| std::path::Path::new(path).file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("Untitled");
+        if self.doc.is_dirty() {
+            format!("{name} * - PageForm")
+        } else {
+            format!("{name} - PageForm")
+        }
+    }
+
+    fn request_new_blank(&mut self) {
+        self.ask_or_run(PendingFileAction::NewBlank);
+    }
+
+    fn new_blank(&mut self) {
+        self.doc = Document::letter();
+        self.project_path = None;
+        self.selection.clear();
+        self.clipboard.clear();
+        self.item_paste_text = None;
+        self.paste_steps = 0;
+        self.inline = None;
+        self.drag = None;
+        self.fitted = false;
+        self.navigated = false;
+        self.view.page_height = self.doc.page().height;
+        self.status = "Blank US Letter page".to_string();
+    }
+
+    fn ask_or_run(&mut self, action: PendingFileAction) {
+        if self.doc.is_dirty() {
+            self.unsaved = Some(action);
+        } else {
+            self.run_file_action(action);
+        }
+    }
+
+    fn run_file_action(&mut self, action: PendingFileAction) {
+        match action {
+            PendingFileAction::NewBlank => self.new_blank(),
+            PendingFileAction::Open => self.begin_open(),
+            PendingFileAction::OpenPath(path) => {
+                self.read_project_file(std::path::Path::new(&path))
+            }
+            PendingFileAction::NewFromTemplate => self.begin_new_from_template(),
+            PendingFileAction::Exit => self.allow_close = true,
+        }
+    }
+
     fn export_current(&mut self) {
+        match pick_native(
+            true,
+            "Export PDF",
+            &[("PDF", &["pdf"])],
+            &export_file_name(&self.export_path),
+        ) {
+            NativePick::Path(mut path) => {
+                if path.extension().is_none() {
+                    path.set_extension("pdf");
+                }
+                self.export_path = path.display().to_string();
+                self.write_export();
+            }
+            NativePick::Cancel => self.status = "Export cancelled".to_string(),
+            NativePick::Fallback => self.open_builtin_prompt(PromptKind::ExportPdf),
+        }
+    }
+
+    fn begin_open(&mut self) {
+        match pick_native(false, "Open PageForm", OPEN_FILTERS, "") {
+            NativePick::Path(path) => self.read_project_file(&path),
+            NativePick::Cancel => self.status = "Open cancelled".to_string(),
+            NativePick::Fallback => self.open_builtin_prompt(PromptKind::OpenProject),
+        }
+    }
+
+    fn begin_new_from_template(&mut self) {
+        match pick_native(false, "New from Template", TEMPLATE_FILTERS, "") {
+            NativePick::Path(path) => self.read_project_file_as_untitled(&path),
+            NativePick::Cancel => self.status = "New from Template cancelled".to_string(),
+            NativePick::Fallback => self.open_builtin_prompt(PromptKind::OpenTemplate),
+        }
+    }
+
+    fn save_project(&mut self) {
+        // No linked document: Save As, defaulting to a new `.pgd`. A `.pgt` is
+        // never the target of plain Save.
+        if let Some(path) = self.linked_document_path() {
+            self.write_project_file(std::path::Path::new(&path));
+        } else {
+            self.save_project_as();
+        }
+    }
+
+    /// The `.pgd` or legacy `.pageform` this document would overwrite.
+    /// `None` for a new document and for anything opened from a template.
+    fn linked_document_path(&self) -> Option<String> {
+        self.project_path
+            .clone()
+            .filter(|path| !is_template_path(std::path::Path::new(path)))
+    }
+
+    fn save_project_as(&mut self) {
+        let name = suggested_project_name(self.project_path.as_deref(), false);
+        match pick_native(true, "Save PageForm", SAVE_FILTERS, &name) {
+            NativePick::Path(path) => self.save_chosen_project(native_project_save_path(path)),
+            NativePick::Cancel => {
+                self.after_save = None;
+                self.status = "Save cancelled".to_string();
+            }
+            NativePick::Fallback => self.open_builtin_prompt(PromptKind::SaveProject),
+        }
+    }
+
+    /// A `.pgt` is stored only when Save As already resolved to that extension,
+    /// which is the Template type. An existing template asks before replacement.
+    fn save_chosen_project(&mut self, path: std::path::PathBuf) {
+        if is_template_path(&path) && path.exists() {
+            self.confirm_template_replace(path);
+            return;
+        }
+        self.write_project_file(&path);
+    }
+
+    fn confirm_template_replace(&mut self, path: std::path::PathBuf) {
+        let directory = path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_else(default_export_dir);
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Untitled.pgt")
+            .to_string();
+        self.file_prompt = Some(FilePrompt {
+            kind: PromptKind::SaveProject,
+            directory,
+            file_name,
+            replace: true,
+            save_as_template: true,
+        });
+        self.status = "That template already exists. Save again to replace it.".to_string();
+    }
+
+    fn open_builtin_prompt(&mut self, kind: PromptKind) {
+        let (directory, file_name, status) = match kind {
+            PromptKind::ExportPdf => (
+                parent_dir(&self.export_path),
+                export_file_name(&self.export_path),
+                "Choose where to save the PDF.",
+            ),
+            PromptKind::SaveProject => {
+                let name = suggested_project_name(self.project_path.as_deref(), false);
+                let directory = self
+                    .project_path
+                    .as_deref()
+                    .map(parent_dir)
+                    .unwrap_or_else(default_export_dir);
+                (
+                    directory,
+                    name,
+                    "Choose Document (.pgd) or Template (.pgt).",
+                )
+            }
+            PromptKind::OpenProject => (
+                default_export_dir(),
+                String::new(),
+                "Enter a .pgd or .pgt path. Legacy .pageform files still open.",
+            ),
+            PromptKind::OpenTemplate => (
+                default_export_dir(),
+                String::new(),
+                "Choose a .pgt template. It opens as a new untitled document.",
+            ),
+        };
+        self.file_prompt = Some(FilePrompt {
+            kind,
+            directory,
+            file_name,
+            replace: false,
+            save_as_template: false,
+        });
+        self.status = status.to_string();
+    }
+
+    fn export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.file_prompt.clone() else {
+            return;
+        };
+        let mut prompt = prompt;
+        let original_dir = prompt.directory.clone();
+        let original_name = prompt.file_name.clone();
+        let mut close = false;
+        let mut save = false;
+        let mut open_recent: Option<String> = None;
+        let kind = prompt.kind;
+        let recent = self.recent.clone();
+        let response = egui::Modal::new(egui::Id::new("pageform_file")).show(ctx, |ui| {
+            let submit = ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let cancel_key = ui.input(|input| input.key_pressed(egui::Key::Escape));
+            ui.set_min_width(480.0);
+            ui.heading(match kind {
+                PromptKind::ExportPdf => "Export PDF",
+                PromptKind::SaveProject => "Save PageForm",
+                PromptKind::OpenProject => "Open PageForm",
+                PromptKind::OpenTemplate => "New from Template",
+            });
+            ui.add_space(8.0);
+            if is_open_prompt(kind) {
+                ui.label("Path");
+                let hint = if kind == PromptKind::OpenTemplate {
+                    "/path/to/form.pgt"
+                } else {
+                    "/path/to/form.pgd"
+                };
+                ui.add(
+                    egui::TextEdit::singleline(&mut prompt.file_name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(hint),
+                );
+                let shown: Vec<String> = if kind == PromptKind::OpenTemplate {
+                    recent
+                        .iter()
+                        .filter(|path| is_template_path(std::path::Path::new(path)))
+                        .cloned()
+                        .collect()
+                } else {
+                    recent.clone()
+                };
+                if !shown.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label("Recent");
+                    for path in &shown {
+                        if recent_entry(ui, path).clicked() {
+                            open_recent = Some(path.clone());
+                        }
+                    }
+                }
+            } else {
+                ui.label("Folder");
+                ui.add(
+                    egui::TextEdit::singleline(&mut prompt.directory).desired_width(f32::INFINITY),
+                );
+                ui.add_space(6.0);
+                ui.label("File name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut prompt.file_name).desired_width(f32::INFINITY),
+                );
+                if kind == PromptKind::SaveProject {
+                    ui.add_space(6.0);
+                    ui.label("Type");
+                    let was_template = prompt.save_as_template;
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut prompt.save_as_template, false, "Document (.pgd)");
+                        ui.radio_value(&mut prompt.save_as_template, true, "Template (.pgt)");
+                    });
+                    if prompt.save_as_template != was_template {
+                        prompt.file_name =
+                            retarget_project_name(&prompt.file_name, prompt.save_as_template);
+                    }
+                }
+                let path = if kind == PromptKind::ExportPdf {
+                    ensure_extension(
+                        export_file_path(&prompt.directory, &prompt.file_name),
+                        "pdf",
+                    )
+                } else {
+                    project_save_path(
+                        &prompt.directory,
+                        &prompt.file_name,
+                        prompt.save_as_template,
+                    )
+                };
+                ui.add_space(6.0);
+                ui.label(path.display().to_string());
+                if prompt.replace {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 160, 80),
+                        "That file already exists. Save again to replace it.",
+                    );
+                }
+            }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let label = if is_open_prompt(kind) {
+                    "Open"
+                } else if prompt.replace {
+                    "Replace"
+                } else {
+                    "Save"
+                };
+                if ui.button(label).clicked() {
+                    save = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+            if submit {
+                save = true;
+            }
+            if cancel_key {
+                close = true;
+            }
+        });
+        if prompt.directory != original_dir || prompt.file_name != original_name {
+            prompt.replace = false;
+        }
+        if let Some(path) = open_recent {
+            self.file_prompt = None;
+            if kind == PromptKind::OpenTemplate {
+                self.read_project_file_as_untitled(std::path::Path::new(&path));
+            } else {
+                self.read_project_file(std::path::Path::new(&path));
+            }
+            return;
+        }
+        if close || response.should_close() {
+            self.file_prompt = None;
+            self.after_save = None;
+            self.status = match kind {
+                PromptKind::OpenProject => "Open cancelled".to_string(),
+                PromptKind::OpenTemplate => "New from Template cancelled".to_string(),
+                PromptKind::SaveProject => "Save cancelled".to_string(),
+                PromptKind::ExportPdf => "Export cancelled".to_string(),
+            };
+            return;
+        }
+        if save {
+            if is_open_prompt(kind) {
+                let path = prompt.file_name.trim().to_string();
+                let as_untitled = kind == PromptKind::OpenTemplate;
+                self.file_prompt = None;
+                if path.is_empty() {
+                    self.status = "Enter a file path to open".to_string();
+                } else if as_untitled {
+                    self.read_project_file_as_untitled(std::path::Path::new(&path));
+                } else {
+                    self.read_project_file(std::path::Path::new(&path));
+                }
+                return;
+            }
+            let path = if kind == PromptKind::ExportPdf {
+                ensure_extension(
+                    export_file_path(&prompt.directory, &prompt.file_name),
+                    "pdf",
+                )
+            } else {
+                project_save_path(
+                    &prompt.directory,
+                    &prompt.file_name,
+                    prompt.save_as_template,
+                )
+            };
+            if path.exists() && !prompt.replace {
+                prompt.replace = true;
+                self.file_prompt = Some(prompt);
+                return;
+            }
+            self.file_prompt = None;
+            match kind {
+                PromptKind::ExportPdf => {
+                    self.export_path = path.display().to_string();
+                    self.write_export();
+                }
+                PromptKind::SaveProject => self.write_project_file(&path),
+                PromptKind::OpenProject | PromptKind::OpenTemplate => {}
+            }
+            return;
+        }
+        self.file_prompt = Some(prompt);
+    }
+
+    fn write_project_file(&mut self, path: &std::path::Path) {
+        let template = is_template_path(path);
+        let kind = if template {
+            ProjectKind::Template
+        } else {
+            ProjectKind::Document
+        };
+        match self.doc.to_project_ron(kind) {
+            Ok(text) => match std::fs::write(path, text) {
+                Ok(()) => {
+                    self.remember_recent(path);
+                    if template {
+                        self.after_save = None;
+                        self.saved_follow_up = false;
+                        self.status = if self.project_path.is_none() {
+                            format!(
+                                "Saved template {}. Save will store a new .pgd document.",
+                                path.display()
+                            )
+                        } else {
+                            format!("Saved template {}.", path.display())
+                        };
+                    } else {
+                        self.project_path = Some(path.display().to_string());
+                        self.doc.mark_clean();
+                        self.status = format!("Saved {}", path.display());
+                        self.saved_follow_up = true;
+                    }
+                }
+                Err(err) => {
+                    self.after_save = None;
+                    self.status = format!("Could not write {}: {err}", path.display());
+                }
+            },
+            Err(err) => {
+                self.after_save = None;
+                self.status = format!("Could not save: {err}");
+            }
+        }
+    }
+
+    fn read_project_file(&mut self, path: &std::path::Path) {
+        self.load_project(path, false);
+    }
+
+    /// File > New from Template. The chosen file stays unchanged.
+    fn read_project_file_as_untitled(&mut self, path: &std::path::Path) {
+        self.load_project(path, true);
+    }
+
+    fn load_project(&mut self, path: &std::path::Path, force_untitled: bool) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.status = format!("Could not open {}: {err}", path.display());
+                return;
+            }
+        };
+        match Document::from_project_ron(&text) {
+            Ok(loaded) => {
+                let untitled = force_untitled
+                    || is_template_path(path)
+                    || loaded.kind == ProjectKind::Template;
+                self.doc = loaded.document;
+                self.selection.clear();
+                self.inline = None;
+                self.drag = None;
+                self.fitted = false;
+                self.navigated = false;
+                self.view.page_height = self.doc.page().height;
+                self.remember_recent(path);
+                if untitled {
+                    self.project_path = None;
+                    self.status = format!(
+                        "Opened {} as a new document. Save stores a .pgd and does not change this file.",
+                        path.display()
+                    );
+                } else {
+                    self.project_path = Some(path.display().to_string());
+                    self.status = format!("Opened {}", path.display());
+                }
+            }
+            Err(err) => self.status = err,
+        }
+    }
+
+    fn remember_recent(&mut self, path: &std::path::Path) {
+        let text = path.display().to_string();
+        self.recent.retain(|item| item != &text);
+        self.recent.insert(0, text);
+        self.recent.truncate(8);
+        self.persist_panel = true;
+    }
+
+    /// Alt+F4 and the window close button arrive as `close_requested`.
+    /// Cancel that close while the document is dirty or a prompt is open, and
+    /// show the Exit prompt once.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.allow_close || !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        if !self.doc.is_dirty() && self.unsaved.is_none() {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        if self.doc.is_dirty() && self.unsaved.is_none() {
+            self.unsaved = Some(PendingFileAction::Exit);
+        }
+    }
+
+    fn print_current(&mut self) {
+        let bytes = match export_pdf(&self.doc) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.status = format!("Print failed: {err}");
+                return;
+            }
+        };
+        let path = std::env::temp_dir().join(format!("pageform-print-{}.pdf", std::process::id()));
+        if let Err(err) = std::fs::write(&path, bytes) {
+            self.status = format!("Could not write a temporary PDF: {err}");
+            return;
+        }
+        self.status = send_to_printer(&path);
+    }
+
+    fn unsaved_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.unsaved.clone() else {
+            return;
+        };
+        let name = self
+            .project_path
+            .as_deref()
+            .map(export_file_name)
+            .unwrap_or_else(|| "Untitled".to_string());
+        let mut choice: Option<UnsavedChoice> = None;
+        let response = egui::Modal::new(egui::Id::new("pageform_unsaved")).show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.heading("Unsaved changes");
+            ui.add_space(8.0);
+            ui.label(format!("Save changes to {name} before continuing?"));
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(UnsavedChoice::Save);
+                }
+                if ui.button("Don't Save").clicked() {
+                    choice = Some(UnsavedChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(UnsavedChoice::Cancel);
+                }
+            });
+        });
+        if response.should_close() {
+            choice = Some(UnsavedChoice::Cancel);
+        }
+        match choice {
+            Some(UnsavedChoice::Save) => {
+                self.unsaved = None;
+                self.after_save = Some(action);
+                self.save_project();
+            }
+            Some(UnsavedChoice::Discard) => {
+                self.unsaved = None;
+                self.doc.mark_clean();
+                self.run_file_action(action);
+            }
+            Some(UnsavedChoice::Cancel) => self.unsaved = None,
+            None => {}
+        }
+    }
+
+    fn write_export(&mut self) {
         if self.export_path.trim().is_empty() {
             self.status = "Enter a file path to export".to_string();
             return;
@@ -253,14 +1058,173 @@ impl PageFormApp {
     }
 
     fn delete_selection(&mut self) {
-        let Some(id) = self.selection else {
+        if self.selection.is_empty() {
+            return;
+        }
+        let ids = std::mem::take(&mut self.selection);
+        let count = ids.len();
+        for id in ids {
+            self.doc.remove(id);
+        }
+        self.drag = None;
+        self.status = if count == 1 {
+            "Deleted field".to_string()
+        } else {
+            format!("Deleted {count} items")
+        };
+        self.dismiss_unpinned();
+    }
+
+    fn primary(&self) -> Option<FieldId> {
+        self.selection.last().copied()
+    }
+
+    fn set_properties_open(&mut self, open: bool) {
+        if self.properties_open != open {
+            self.properties_open = open;
+            self.persist_panel = true;
+        }
+    }
+
+    fn set_properties_pinned(&mut self, pinned: bool) {
+        if self.properties_pinned != pinned {
+            self.properties_pinned = pinned;
+            self.persist_panel = true;
+            self.status = if pinned {
+                "Properties pinned".to_string()
+            } else {
+                "Properties unpinned. Click empty canvas to close.".to_string()
+            };
+        }
+    }
+
+    fn open_properties(&mut self) {
+        self.set_properties_open(true);
+    }
+
+    /// Start canvas editing for an item that shows text. Returns false for shapes and other items.
+    fn begin_inline(&mut self, id: FieldId) -> bool {
+        if self.inline.as_ref().is_some_and(|edit| edit.id == id) {
+            return true;
+        }
+        let started = self.doc.field(id).and_then(|field| {
+            inline_target(field.kind(), field.style().multiline).map(|(target, multiline)| {
+                let text = match target {
+                    InlineTarget::Caption => field.caption().to_string(),
+                    InlineTarget::DefaultValue => field.style().default_value.clone(),
+                };
+                (target, multiline, text)
+            })
+        });
+        let Some((target, multiline, text)) = started else {
+            return false;
+        };
+        if self.inline.is_some() {
+            self.finish_inline();
+        }
+        self.inline = Some(InlineEdit {
+            id,
+            target,
+            buffer: text.clone(),
+            original: text,
+            multiline,
+            request_focus: true,
+        });
+        self.name_for = None;
+        self.sync_field_buffers();
+        if self.status_before_inline.is_none() {
+            self.status_before_inline = Some(self.status.clone());
+        }
+        self.status = if multiline {
+            "Editing text. Enter finishes, Shift+Enter adds a line, Esc cancels.".to_string()
+        } else {
+            "Editing text. Enter or a click outside finishes, Esc cancels.".to_string()
+        };
+        true
+    }
+
+    fn inline_hides_text(&self, id: FieldId) -> bool {
+        self.inline.as_ref().is_some_and(|edit| edit.id == id)
+    }
+
+    fn apply_inline(&mut self) {
+        let Some(edit) = self.inline.as_ref() else {
             return;
         };
-        if self.doc.remove(id) {
-            self.status = "Deleted field".to_string();
+        let id = edit.id;
+        let target = edit.target;
+        let text = edit.buffer.clone();
+        match target {
+            InlineTarget::Caption => {
+                let _ = self.doc.set_caption(id, &text);
+            }
+            InlineTarget::DefaultValue => self.doc.set_default_value(id, &text),
         }
-        self.selection = None;
-        self.drag = None;
+        if self.name_for == Some(id) {
+            match target {
+                InlineTarget::Caption => self.caption_buf.clone_from(&text),
+                InlineTarget::DefaultValue => self.value_buf.clone_from(&text),
+            }
+        }
+    }
+
+    fn cancel_inline(&mut self) {
+        let Some(edit) = self.inline.take() else {
+            return;
+        };
+        match edit.target {
+            InlineTarget::Caption => {
+                let _ = self.doc.set_caption(edit.id, &edit.original);
+            }
+            InlineTarget::DefaultValue => self.doc.set_default_value(edit.id, &edit.original),
+        }
+        if self.name_for == Some(edit.id) {
+            match edit.target {
+                InlineTarget::Caption => self.caption_buf = edit.original,
+                InlineTarget::DefaultValue => self.value_buf = edit.original,
+            }
+        }
+        self.clear_inline_status();
+    }
+
+    fn finish_inline(&mut self) {
+        self.apply_inline();
+        self.inline = None;
+        self.clear_inline_status();
+    }
+
+    fn clear_inline_status(&mut self) {
+        if let Some(previous) = self.status_before_inline.take() {
+            self.status = previous;
+        } else if self.status.starts_with("Editing text.") {
+            self.status.clear();
+        }
+    }
+
+    /// Sidebar edits land in the canvas editor when both show the same item.
+    fn note_sidebar_text(&mut self, id: FieldId, target: InlineTarget, text: &str) {
+        if let Some(edit) = &mut self.inline {
+            if edit.id == id && edit.target == target && edit.buffer != text {
+                edit.buffer = text.to_string();
+            }
+        }
+    }
+
+    /// Unpinned panels close when the user is done with the selection.
+    fn dismiss_unpinned(&mut self) {
+        if self.properties_open && !self.properties_pinned {
+            self.set_properties_open(false);
+        }
+    }
+
+    fn hit_field_id(&self, pdf: PdfPoint) -> Option<FieldId> {
+        let radius = 8.0 / self.view.zoom;
+        self.doc
+            .fields()
+            .iter()
+            .rev()
+            .find(|field| field.contains_point(pdf, radius))
+            .map(|field| field.id())
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -296,6 +1260,47 @@ impl PageFormApp {
                 continue;
             }
             match *label {
+                "Open" => {
+                    let shortcut = command_shortcut(ui, egui::Key::O);
+                    if menu_command(ui, "Open", Some(&shortcut), false) {
+                        self.ask_or_run(PendingFileAction::Open);
+                    }
+                    if self.recent.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("Open Recent"))
+                            .on_disabled_hover_text("No recent files");
+                    } else {
+                        ui.menu_button("Open Recent", |ui| {
+                            ui.set_min_width(280.0);
+                            for path in self.recent.clone() {
+                                if recent_entry(ui, &path).clicked() {
+                                    self.ask_or_run(PendingFileAction::OpenPath(path));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                }
+                "Save" => {
+                    let shortcut = command_shortcut(ui, egui::Key::S);
+                    if menu_command(ui, "Save", Some(&shortcut), false) {
+                        self.save_project();
+                    }
+                }
+                "Save As" => {
+                    let shortcut = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
+                        egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                        egui::Key::S,
+                    ));
+                    if menu_command(ui, "Save As", Some(&shortcut), false) {
+                        self.save_project_as();
+                    }
+                }
+                "Print" => {
+                    let shortcut = command_shortcut(ui, egui::Key::P);
+                    if menu_command(ui, "Print", Some(&shortcut), false) {
+                        self.print_current();
+                    }
+                }
                 "Export PDF" => {
                     let tip = format!(
                         "Write a fillable PDF to {}. Guides and margins stay on the canvas.",
@@ -308,20 +1313,19 @@ impl PageFormApp {
                     }
                 }
                 "Exit" => {
-                    if ui.button(*label).clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    let shortcut = command_shortcut(ui, egui::Key::Q);
+                    if menu_command(ui, "Exit", Some(&shortcut), false) {
+                        self.ask_or_run(PendingFileAction::Exit);
                     }
                 }
                 "New" => {
-                    ui.menu_button("New", |ui| {
-                        ui.set_min_width(180.0);
-                        for item in NEW_MENU {
-                            if ui.button(*item).clicked() {
-                                self.mark_not_implemented(item);
-                                ui.close_kind(egui::UiKind::Menu);
-                            }
-                        }
-                    });
+                    let shortcut = command_shortcut(ui, egui::Key::N);
+                    let mut atoms = egui::Atoms::new("New");
+                    atoms.push_right(egui::Atom::grow());
+                    atoms.push_right(egui::RichText::new(shortcut).weak());
+                    atoms.push_right(egui::containers::menu::SubMenuButton::RIGHT_ARROW);
+                    egui::containers::menu::SubMenuButton::from_button(egui::Button::new(atoms))
+                        .ui(ui, |ui| self.new_menu(ui));
                 }
                 other => self.stub_item(ui, other),
             }
@@ -341,15 +1345,54 @@ impl PageFormApp {
                         self.tool = Tool::Select;
                     }
                 }
+                "Select All" => {
+                    let shortcut = command_shortcut(ui, egui::Key::A);
+                    if menu_command(ui, label, Some(&shortcut), false) {
+                        self.select_all();
+                    }
+                }
+                "Copy" => {
+                    let shortcut = command_shortcut(ui, egui::Key::C);
+                    if menu_command_enabled(ui, label, Some(&shortcut), !self.selection.is_empty())
+                    {
+                        self.copy_selection();
+                        self.publish_item_clipboard(ui.ctx());
+                    }
+                }
+                "Cut" => {
+                    let shortcut = command_shortcut(ui, egui::Key::X);
+                    if menu_command_enabled(ui, label, Some(&shortcut), !self.selection.is_empty())
+                    {
+                        self.cut_selection();
+                        self.publish_item_clipboard(ui.ctx());
+                    }
+                }
+                "Paste" => {
+                    let shortcut = command_shortcut(ui, egui::Key::V);
+                    if menu_command_enabled(ui, label, Some(&shortcut), !self.clipboard.is_empty())
+                    {
+                        self.paste_items(None);
+                    }
+                }
+                "Duplicate" => {
+                    let shortcut = command_shortcut(ui, egui::Key::D);
+                    if menu_command_enabled(ui, label, Some(&shortcut), !self.selection.is_empty())
+                    {
+                        self.duplicate_selection();
+                    }
+                }
                 "Delete" => {
                     let delete = ui.add_enabled(
-                        self.selection.is_some(),
+                        !self.selection.is_empty(),
                         egui::Button::new(*label).shortcut_text("Del"),
                     );
                     if delete.clicked() {
                         self.delete_selection();
                         ui.close();
                     }
+                }
+                "Align" => {
+                    ui.menu_button("Align", |ui| self.align_menu(ui));
                 }
                 "Preferences" => {
                     if ui.button(*label).clicked() {
@@ -383,6 +1426,93 @@ impl PageFormApp {
         }
     }
 
+    fn align_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(220.0);
+        self.align_commands(ui, true);
+    }
+
+    /// Align, distribute, and match size. `close_menu` closes the menu after a command.
+    fn align_commands(&mut self, ui: &mut egui::Ui, close_menu: bool) {
+        let count = self.selection.len();
+        let align_ok = count >= 2;
+        let distribute_ok = count >= 3;
+        let need = if align_ok {
+            "Apply to the selection."
+        } else {
+            "Select two or more items."
+        };
+        for (label, edge) in ALIGN_EDGES {
+            let response = ui
+                .add_enabled(align_ok, egui::Button::new(*label))
+                .on_hover_text(need)
+                .on_disabled_hover_text("Select two or more items.");
+            if response.clicked() {
+                let ids = self.selection.clone();
+                self.doc.align_fields(&ids, *edge);
+                self.status = format!("Aligned {label}");
+                if close_menu {
+                    ui.close();
+                }
+            }
+        }
+        ui.separator();
+        for (label, horizontal) in [
+            ("Distribute horizontally", true),
+            ("Distribute vertically", false),
+        ] {
+            let response = ui
+                .add_enabled(distribute_ok, egui::Button::new(label))
+                .on_disabled_hover_text("Select three or more items.");
+            if response.clicked() {
+                let ids = self.selection.clone();
+                self.doc.distribute_fields(&ids, horizontal);
+                self.status = label.to_string();
+                if close_menu {
+                    ui.close();
+                }
+            }
+        }
+        for (label, width, height) in [("Match width", true, false), ("Match height", false, true)]
+        {
+            let response = ui
+                .add_enabled(align_ok, egui::Button::new(label))
+                .on_disabled_hover_text("Select two or more items.");
+            if response.clicked() {
+                let ids = self.selection.clone();
+                let reference = ids.len() - 1;
+                self.doc.match_field_size(&ids, reference, width, height);
+                self.status = label.to_string();
+                if close_menu {
+                    ui.close();
+                }
+            }
+        }
+    }
+
+    fn new_menu(&mut self, ui: &mut egui::Ui) {
+        ui.set_min_width(180.0);
+        for item in NEW_MENU {
+            if *item == "New Blank Document" {
+                let shortcut = command_shortcut(ui, egui::Key::N);
+                if menu_command(ui, item, Some(&shortcut), false) {
+                    self.request_new_blank();
+                }
+            } else if ui.button(*item).clicked() {
+                if *item == "New from Template" {
+                    self.ask_or_run(PendingFileAction::NewFromTemplate);
+                } else {
+                    self.mark_not_implemented(item);
+                }
+                ui.close();
+            }
+        }
+    }
+
+    fn toolbar_new(&mut self, ui: &mut egui::Ui) {
+        let response = icons::icon_menu(ui, icons::Icon::New, false, "New");
+        egui::Popup::menu(&response).show(|ui| self.new_menu(ui));
+    }
+
     fn stub_item(&mut self, ui: &mut egui::Ui, label: &str) {
         let button = ui.button(label).on_hover_text("Not implemented yet");
         if button.clicked() {
@@ -410,8 +1540,9 @@ impl PageFormApp {
     fn insert_at_view(&mut self, kind: FieldKind) {
         let rect = self.default_insert_rect(kind);
         let id = self.place_kind(kind, rect);
-        self.selection = Some(id);
+        self.selection = vec![id];
         self.drag = None;
+        self.suppress_place_click = true;
         self.status = format!("Placed {}", kind.label());
     }
 
@@ -426,7 +1557,7 @@ impl PageFormApp {
     }
 
     fn selected_radio_group(&self) -> Option<String> {
-        self.selection.and_then(|id| {
+        self.primary().and_then(|id| {
             self.doc.field(id).and_then(|field| {
                 (field.kind() == FieldKind::Radio).then(|| field.name().to_string())
             })
@@ -504,6 +1635,15 @@ impl PageFormApp {
 
     fn view_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(200.0);
+        let mut open = self.properties_open;
+        if ui
+            .checkbox(&mut open, "Properties")
+            .on_hover_text("Show or hide the properties panel.")
+            .changed()
+        {
+            self.set_properties_open(open);
+        }
+        ui.separator();
         ui.checkbox(&mut self.dots_visible, "Grid dots");
         ui.checkbox(&mut self.guides_visible, "Guide lines");
         ui.checkbox(&mut self.margins_visible, "Print-safe margin");
@@ -553,6 +1693,31 @@ impl PageFormApp {
             }
             ui.add_space(8.0);
             ui.label("Saved on this computer. Dark is the default.");
+            ui.add_space(18.0);
+            ui.label(egui::RichText::new("Properties panel").size(18.0));
+            ui.add_space(6.0);
+            let mut panel_open = self.properties_open;
+            if ui
+                .checkbox(&mut panel_open, "Open by default")
+                .on_hover_text("Show the properties panel the next time PageForm opens.")
+                .changed()
+            {
+                self.set_properties_open(panel_open);
+            }
+            let mut pinned = self.properties_pinned;
+            if ui
+                .checkbox(&mut pinned, "Pinned by default")
+                .on_hover_text(
+                    "Pinned panels stay open. Unpinned panels close when you click empty canvas.",
+                )
+                .changed()
+            {
+                self.set_properties_pinned(pinned);
+            }
+            ui.add_space(8.0);
+            ui.label(
+                "Saved on this computer. The panel starts hidden and unpinned.",
+            );
             ui.add_space(18.0);
             let mut show_labels = self.doc.radio_labels();
             if ui
@@ -626,7 +1791,7 @@ impl PageFormApp {
                 }
                 crate::theme::apply(ctx, dark);
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    help_faq(ui);
+                    help_faq(ui, dark);
                 });
                 let close = ctx.input(|input| input.viewport().close_requested());
                 HelpHost::Native { close }
@@ -640,7 +1805,7 @@ impl PageFormApp {
                     .default_size([520.0, 640.0])
                     .open(&mut self.show_help)
                     .show(ctx, |ui| {
-                        help_faq(ui);
+                        help_faq(ui, self.dark);
                     });
             }
             HelpHost::Native { close } => {
@@ -665,12 +1830,30 @@ impl PageFormApp {
     fn toolbar_documents(&mut self, ui: &mut egui::Ui) {
         for label in icons::DOC_COMMANDS {
             match *label {
-                "New" => self.icon_choices(ui, icons::Icon::New, false, "New", NEW_MENU),
-                "Open" => self.stub_icon(ui, icons::Icon::Open, "Open"),
-                "Save" => {
-                    self.icon_choices(ui, icons::Icon::Save, false, "Save", &["Save", "Save As"])
+                "New" => self.toolbar_new(ui),
+                "Open"
+                    if icons::icon_button(
+                        ui,
+                        icons::Icon::Open,
+                        false,
+                        "Open a .pgd or .pgt file",
+                    )
+                    .clicked() =>
+                {
+                    self.ask_or_run(PendingFileAction::Open);
                 }
-                "Print" => self.stub_icon(ui, icons::Icon::Print, "Print"),
+                "Save"
+                    if icons::icon_button(ui, icons::Icon::Save, false, "Save the project")
+                        .clicked() =>
+                {
+                    self.save_project();
+                }
+                "Print"
+                    if icons::icon_button(ui, icons::Icon::Print, false, "Print the page")
+                        .clicked() =>
+                {
+                    self.print_current();
+                }
                 _ => {}
             }
         }
@@ -705,13 +1888,13 @@ impl PageFormApp {
             ui,
             icons::Icon::Shapes,
             self.tool == Tool::Square || self.tool == Tool::Rectangle,
-            "Shapes",
+            "Click to place a default shape, or drag to size it.",
         );
         egui::Popup::menu(&response).show(|ui| {
             ui.set_min_width(160.0);
             if ui
                 .selectable_label(self.tool == Tool::Square, "Square")
-                .on_hover_text("Draw a square. The sides stay equal.")
+                .on_hover_text("Click to place a default square, or drag to size it. The sides stay equal.")
                 .clicked()
             {
                 self.tool = Tool::Square;
@@ -719,7 +1902,9 @@ impl PageFormApp {
             }
             if ui
                 .selectable_label(self.tool == Tool::Rectangle, "Rectangle")
-                .on_hover_text("Draw a rectangle. Width and height are independent.")
+                .on_hover_text(
+                    "Click to place a default rectangle, or drag to size it. Width and height are independent.",
+                )
                 .clicked()
             {
                 self.tool = Tool::Rectangle;
@@ -764,12 +1949,27 @@ impl PageFormApp {
             icons::Icon::Sun
         };
         let theme_tip = format!(
-            "{} — {}",
+            "{} - {}",
             crate::theme::toggle_label(self.dark),
             crate::theme::toggle_tip(self.dark)
         );
         if icons::icon_button(ui, theme_icon, false, &theme_tip).clicked() {
             self.set_dark(!self.dark);
+        }
+        let properties_tip = if self.properties_open {
+            "Properties. Click to hide the panel."
+        } else {
+            "Properties. Click to show the panel."
+        };
+        if icons::icon_button(
+            ui,
+            icons::Icon::Properties,
+            self.properties_open,
+            properties_tip,
+        )
+        .clicked()
+        {
+            self.set_properties_open(!self.properties_open);
         }
     }
 
@@ -797,173 +1997,37 @@ impl PageFormApp {
         }
     }
 
-    fn stub_icon(&mut self, ui: &mut egui::Ui, icon: icons::Icon, label: &str) {
-        if icons::icon_button(ui, icon, false, label).clicked() {
-            self.mark_not_implemented(label);
+    fn finish_marquee(&mut self, start: PdfPoint, current: PdfPoint, extend: bool) {
+        if is_click(&self.view, start, current) {
+            if !extend {
+                self.selection.clear();
+                self.dismiss_unpinned();
+            }
+            return;
         }
-    }
-
-    fn icon_choices(
-        &mut self,
-        ui: &mut egui::Ui,
-        icon: icons::Icon,
-        selected: bool,
-        tip: &str,
-        items: &[&str],
-    ) {
-        let response = icons::icon_menu(ui, icon, selected, tip);
-        egui::Popup::menu(&response).show(|ui| {
-            ui.set_min_width(180.0);
-            for label in items {
-                if ui.button(*label).clicked() {
-                    self.mark_not_implemented(label);
-                    ui.close();
+        let band = marquee_rect(start, current);
+        let hits: Vec<FieldId> = self
+            .doc
+            .fields()
+            .iter()
+            .filter(|field| rects_hit(field.rect(), band))
+            .map(|field| field.id())
+            .collect();
+        if extend {
+            for id in hits {
+                if !self.selection.contains(&id) {
+                    self.selection.push(id);
                 }
             }
-        });
-    }
-
-    fn properties(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Page");
-        let page = self.doc.page();
-        ui.label(format!(
-            "US Letter · {} × {} pt",
-            page.width as i32, page.height as i32
-        ));
-        ui.label("One page. Additional pages are a later milestone.");
-        ui.add_space(8.0);
-        ui.label(format!(
-            "{} grid · minor {:.1} pt ({}) · major {:.0} pt",
-            self.grid_size.label(),
-            self.grid_size.minor_pt(),
-            self.grid_size.minor_label(),
-            self.grid_size.major_pt()
-        ));
-        ui.label("Dots cover the whole page. Guide lines, the print-safe outline, header, footer, and page number are canvas only and are not exported.");
-        ui.label(format!(
-            "Print safe area is inset {:.0} pt (0.5 in).",
-            PRINT_SAFE_MARGIN_PT
-        ));
-        ui.label("Snap uses the minor spacing, even if dots or guides are hidden, so columns and rows stay even.");
-        ui.label("Insert drops a default-sized item in the view. A toolbar icon draws on the page. Square/Rectangle is under Shapes.");
-        ui.label("Edit → Preferences sets Dark or Light and radio labels.");
-        ui.separator();
-        ui.heading("Field");
-
-        if self.name_for != self.selection {
-            self.name_for = self.selection;
-            self.name_buf = self
-                .selection
-                .and_then(|id| self.doc.field(id).map(|field| field.name().to_string()))
-                .unwrap_or_default();
-            self.caption_buf = self
-                .selection
-                .and_then(|id| self.doc.field(id).map(|field| field.caption().to_string()))
-                .unwrap_or_default();
-            self.options_buf = self
-                .selection
-                .and_then(|id| self.doc.field(id).map(|field| field.options().join(", ")))
-                .unwrap_or_default();
-            self.name_error = None;
+        } else {
+            self.selection = hits;
         }
-
-        let Some(id) = self.selection else {
-            ui.label("Nothing selected.");
-            ui.label("Insert drops a default item. A toolbar icon draws on the page.");
-            return;
+        let count = self.selection.len();
+        self.status = if count == 1 {
+            "Selected 1 item".to_string()
+        } else {
+            format!("Selected {count} items")
         };
-        let (kind, rect, group_name) = {
-            let Some(field) = self.doc.field(id) else {
-                self.selection = None;
-                return;
-            };
-            (field.kind(), field.rect(), field.name().to_string())
-        };
-        ui.label(format!("Type  {}", kind.label()));
-        ui.label(kind_note(kind));
-        if kind.is_form_field() {
-            let name_label = if kind == FieldKind::Radio {
-                "Group"
-            } else {
-                "Name"
-            };
-            ui.label(name_label);
-            let edit = ui.add(egui::TextEdit::singleline(&mut self.name_buf).desired_width(200.0));
-            if edit.changed() {
-                self.name_error = self
-                    .doc
-                    .set_name(id, &self.name_buf)
-                    .err()
-                    .map(|err| err.to_string());
-            }
-        }
-        if matches!(
-            kind,
-            FieldKind::StaticText | FieldKind::TextBox | FieldKind::Radio
-        ) {
-            ui.label(if kind == FieldKind::Radio {
-                "Label"
-            } else {
-                "Text"
-            });
-            let edit =
-                ui.add(egui::TextEdit::singleline(&mut self.caption_buf).desired_width(200.0));
-            if edit.changed() {
-                self.name_error = self
-                    .doc
-                    .set_caption(id, &self.caption_buf)
-                    .err()
-                    .map(|err| err.to_string());
-            }
-            if kind == FieldKind::Radio && !self.doc.radio_labels() {
-                ui.label("Hidden until Radio labels is on in Edit → Preferences.");
-            }
-        }
-        if kind == FieldKind::Dropdown {
-            ui.label("Options");
-            let edit =
-                ui.add(egui::TextEdit::singleline(&mut self.options_buf).desired_width(200.0));
-            if edit.changed() {
-                let options = self
-                    .options_buf
-                    .split(',')
-                    .map(|option| option.trim().to_string())
-                    .filter(|option| !option.is_empty())
-                    .collect();
-                self.name_error = self
-                    .doc
-                    .set_options(id, options)
-                    .err()
-                    .map(|err| err.to_string());
-            }
-        }
-        if kind == FieldKind::Radio {
-            let members: Vec<(String, String)> = self
-                .doc
-                .fields()
-                .iter()
-                .filter(|member| member.kind() == FieldKind::Radio && member.name() == group_name)
-                .map(|member| (member.on_state().to_string(), member.caption().to_string()))
-                .collect();
-            ui.add_space(4.0);
-            ui.label("Options in this group");
-            for (state, caption) in &members {
-                ui.label(format!("{state}  {caption}"));
-            }
-            if ui.button("Add option to group").clicked() {
-                self.insert_at_view(FieldKind::Radio);
-            }
-        }
-        if let Some(error) = &self.name_error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        }
-        ui.add_space(6.0);
-        ui.label(format!("X  {} pt", fmt_pt(rect.x)));
-        ui.label(format!("Y  {} pt from bottom", fmt_pt(rect.y)));
-        ui.label(format!("W  {} pt", fmt_pt(rect.w)));
-        ui.label(format!("H  {} pt", fmt_pt(rect.h)));
-        ui.add_space(8.0);
-        ui.label("Delete removes the selected item.");
     }
 
     fn fit(&mut self, rect: Rect) {
@@ -983,15 +2047,107 @@ impl PageFormApp {
         self.fitted = true;
     }
 
+    /// Keep a fresh page centered in the canvas, including after the sidebar opens.
+    fn keep_page_centered(&mut self, rect: Rect) {
+        let size = rect.size();
+        let size_changed = self.canvas_size.is_none_or(|previous| {
+            (previous.x - size.x).abs() > 0.5 || (previous.y - size.y).abs() > 0.5
+        });
+        if rect.width() > 32.0
+            && rect.height() > 32.0
+            && (!self.fitted || (!self.navigated && size_changed))
+        {
+            self.fit(rect);
+        }
+        self.canvas_size = Some(size);
+    }
+
     fn canvas(&mut self, ui: &mut egui::Ui) {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         self.canvas_rect = Some(response.rect);
-        if !self.fitted {
-            self.fit(response.rect);
-        }
+        self.keep_page_centered(response.rect);
         self.handle_input(&response, ui.ctx());
         self.paint(&painter, response.rect);
         self.hover_cursor(&response, ui.ctx());
+        self.field_context_menu(&response);
+        self.inline_editor(ui);
+    }
+
+    /// Shortcuts are read before widgets so the first Ctrl/Cmd chord is not lost.
+    ///
+    /// The canvas keeps its own item clipboard. Ctrl/Cmd+C, X, V, and D work
+    /// from the keys when an item is selected and no text field is focused.
+    /// Copy and paste events are accepted too, but a different system-clipboard
+    /// string does not block pasting the items.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        let mut copy_event = false;
+        let mut cut_event = false;
+        let mut paste_event = false;
+        ctx.input_mut(|input| {
+            input.events.retain(|event| match event {
+                egui::Event::Copy => {
+                    copy_event = true;
+                    false
+                }
+                egui::Event::Cut => {
+                    cut_event = true;
+                    false
+                }
+                egui::Event::Paste(_) => {
+                    paste_event = true;
+                    false
+                }
+                _ => true,
+            });
+        });
+        let command = |key| {
+            ctx.input_mut(|input| {
+                input.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key))
+            })
+        };
+        let copy = copy_event || command(egui::Key::C);
+        let cut = cut_event || command(egui::Key::X);
+        let paste = paste_event || command(egui::Key::V);
+        let duplicate = command(egui::Key::D);
+        if cut && !self.selection.is_empty() {
+            self.cut_selection();
+            self.publish_item_clipboard(ctx);
+        } else if copy && !self.selection.is_empty() {
+            self.copy_selection();
+            self.publish_item_clipboard(ctx);
+        } else if paste {
+            self.paste_items(None);
+        } else if duplicate {
+            self.duplicate_selection();
+        }
+        let save_as = egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::S,
+        );
+        let save = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+        let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+        let new_blank = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
+        let print = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::P);
+        let exit = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
+        let select_all = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A);
+        if ctx.input_mut(|input| input.consume_shortcut(&save_as)) {
+            self.save_project_as();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&save)) {
+            self.save_project();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&open)) {
+            self.ask_or_run(PendingFileAction::Open);
+        } else if ctx.input_mut(|input| input.consume_shortcut(&new_blank)) {
+            self.request_new_blank();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&print)) {
+            self.print_current();
+        } else if ctx.input_mut(|input| input.consume_shortcut(&exit)) {
+            self.ask_or_run(PendingFileAction::Exit);
+        } else if ctx.input_mut(|input| input.consume_shortcut(&select_all)) {
+            self.select_all();
+        }
     }
 
     fn handle_input(&mut self, response: &egui::Response, ctx: &egui::Context) {
@@ -1002,20 +2158,20 @@ impl PageFormApp {
                     let factor = if scroll_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
                     let zoom = (self.view.zoom * factor).clamp(0.2, 8.0);
                     self.view.zoom_at(pos.x, pos.y, zoom);
+                    self.navigated = true;
                 }
             }
         }
 
-        if !ctx.wants_keyboard_input() {
-            if ctx.input(|input| input.key_pressed(Key::Escape)) {
-                self.drag = None;
-                self.tool = Tool::Select;
-            }
-            if ctx
+        if !ctx.wants_keyboard_input()
+            && ctx
                 .input(|input| input.key_pressed(Key::Delete) || input.key_pressed(Key::Backspace))
-            {
-                self.delete_selection();
-            }
+        {
+            self.delete_selection();
+        }
+        if !ctx.wants_keyboard_input() && ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.drag = None;
+            self.tool = Tool::Select;
         }
 
         let primary_pressed = ctx.input(|input| input.pointer.primary_pressed());
@@ -1024,9 +2180,38 @@ impl PageFormApp {
         let middle_pressed = ctx.input(|input| input.pointer.button_pressed(PointerButton::Middle));
         let space = ctx.input(|input| input.key_down(Key::Space));
 
+        if response.double_clicked() && self.tool == Tool::Select {
+            if let Some(pdf) = self.pointer_pdf(ctx) {
+                if let Some(id) = self.hit_text_item(pdf) {
+                    self.selection = vec![id];
+                    self.drag = None;
+                    self.begin_inline(id);
+                    return;
+                }
+            }
+        }
+        if response.secondary_clicked() {
+            if let Some(pdf) = self.pointer_pdf(ctx) {
+                if let Some(id) = self.hit_field_id(pdf) {
+                    if !self.selection.contains(&id) {
+                        self.selection = vec![id];
+                    }
+                    self.context_field = Some(id);
+                } else {
+                    self.context_field = None;
+                }
+            }
+        }
+
+        let (ignore_primary, still_suppress) = ignore_place_click(
+            self.suppress_place_click,
+            ctx.input(|input| input.pointer.primary_down()),
+        );
+        self.suppress_place_click = still_suppress;
+
         if middle_pressed && response.hovered() {
             self.drag = Some(Drag::Pan);
-        } else if primary_pressed && response.hovered() {
+        } else if primary_pressed && response.hovered() && !ignore_primary {
             if space {
                 self.drag = Some(Drag::Pan);
             } else {
@@ -1041,6 +2226,9 @@ impl PageFormApp {
             });
             if panning {
                 let delta = ctx.input(|input| input.pointer.delta());
+                if delta != Vec2::ZERO {
+                    self.navigated = true;
+                }
                 self.view.origin_x += delta.x;
                 self.view.origin_y += delta.y;
             } else {
@@ -1048,17 +2236,22 @@ impl PageFormApp {
             }
         }
 
-        if primary_down {
+        if primary_down && !ignore_primary {
             self.update_drag(ctx);
         }
 
-        if primary_released {
-            if let Some(Drag::Place { start, kind }) = self.drag {
+        if primary_released && !ignore_primary {
+            if let Some(Drag::Place { start, kind }) = self.drag.clone() {
                 if let Some(current) = self.pointer_pdf(ctx) {
                     let id = self.finish_place(start, current, kind);
-                    self.selection = Some(id);
+                    self.selection = vec![id];
                     self.tool = Tool::Select;
                     self.status = format!("Placed {}", kind.label());
+                }
+            }
+            if let Some(Drag::Marquee { start, extend }) = self.drag.clone() {
+                if let Some(current) = self.pointer_pdf(ctx) {
+                    self.finish_marquee(start, current, extend);
                 }
             }
             if !ctx.input(|input| input.pointer.button_down(PointerButton::Middle)) {
@@ -1074,7 +2267,7 @@ impl PageFormApp {
         match self.tool {
             Tool::Select => {
                 let radius = 8.0 / self.view.zoom;
-                if let Some(id) = self.selection {
+                if let Some(id) = self.primary() {
                     if let Some(field) = self.doc.field(id) {
                         if let Some(index) = field.hit_line_end(pdf, radius) {
                             self.drag = Some(Drag::LineEnd { id, index });
@@ -1092,24 +2285,34 @@ impl PageFormApp {
                         }
                     }
                 }
-                if let Some(field) = self
-                    .doc
-                    .fields()
-                    .iter()
-                    .rev()
-                    .find(|field| field.contains_point(pdf, radius))
-                {
-                    let id = field.id();
-                    let rect = field.rect();
-                    self.selection = Some(id);
-                    self.drag = Some(Drag::Move {
-                        id,
-                        grab_x: pdf.x - rect.x,
-                        grab_y: pdf.y - rect.y,
+                if let Some(id) = self.hit_field_id(pdf) {
+                    let rect = self.doc.field(id).map(|field| field.rect());
+                    let extend = ctx.input(|input| {
+                        input.modifiers.shift || input.modifiers.command || input.modifiers.ctrl
                     });
+                    self.selection = selection_after_click(&self.selection, id, extend);
+                    if let Some(rect) = rect.filter(|_| self.selection.contains(&id)) {
+                        let origins = self
+                            .selection
+                            .iter()
+                            .filter_map(|item| {
+                                self.doc.field(*item).map(|field| (*item, field.rect()))
+                            })
+                            .collect();
+                        self.drag = Some(Drag::Move {
+                            grab_id: id,
+                            grab_x: pdf.x - rect.x,
+                            grab_y: pdf.y - rect.y,
+                            origins,
+                        });
+                    } else {
+                        self.drag = None;
+                    }
                 } else {
-                    self.selection = None;
-                    self.drag = None;
+                    let extend = ctx.input(|input| {
+                        input.modifiers.shift || input.modifiers.command || input.modifiers.ctrl
+                    });
+                    self.drag = Some(Drag::Marquee { start: pdf, extend });
                 }
             }
             _ => {
@@ -1124,17 +2327,11 @@ impl PageFormApp {
     }
 
     fn finish_place(&mut self, start: PdfPoint, current: PdfPoint, kind: FieldKind) -> FieldId {
-        if kind == FieldKind::Line {
-            let (x0, y0) = self.view.pdf_to_screen(start);
-            let (x1, y1) = self.view.pdf_to_screen(current);
-            let dx = x0 - x1;
-            let dy = y0 - y1;
-            if dx * dx + dy * dy >= 16.0 {
-                let grid = self.snap_grid();
-                return self
-                    .doc
-                    .add_line(snap_point(start, grid), snap_point(current, grid));
-            }
+        if kind == FieldKind::Line && !is_click(&self.view, start, current) {
+            let grid = self.snap_grid();
+            return self
+                .doc
+                .add_line(snap_point(start, grid), snap_point(current, grid));
         }
         let rect = self.place_rect(start, current, kind);
         self.place_kind(kind, rect)
@@ -1146,11 +2343,33 @@ impl PageFormApp {
         };
         let page = self.doc.page();
         let grid = self.snap_grid();
-        match self.drag {
-            Some(Drag::Move { id, grab_x, grab_y }) => {
-                if let Some(field) = self.doc.field(id) {
-                    let rect = move_rect(field.rect(), pdf, grab_x, grab_y, grid, &page);
-                    self.doc.update_rect(id, rect);
+        match self.drag.clone() {
+            Some(Drag::Move {
+                grab_id,
+                grab_x,
+                grab_y,
+                origins,
+            }) => {
+                let Some(origin) = origins
+                    .iter()
+                    .find(|(id, _)| *id == grab_id)
+                    .map(|(_, rect)| *rect)
+                else {
+                    return;
+                };
+                let moved = move_rect(origin, pdf, grab_x, grab_y, grid, &page);
+                let dx = moved.x - origin.x;
+                let dy = moved.y - origin.y;
+                for (id, origin) in origins {
+                    self.doc.set_bounds(
+                        id,
+                        RectPt {
+                            x: origin.x + dx,
+                            y: origin.y + dy,
+                            w: origin.w,
+                            h: origin.h,
+                        },
+                    );
                 }
             }
             Some(Drag::Resize { id, handle, origin }) => {
@@ -1161,6 +2380,191 @@ impl PageFormApp {
                 self.doc.set_line_end(id, index, snap_point(pdf, grid));
             }
             _ => {}
+        }
+    }
+
+    fn hit_text_item(&self, pdf: PdfPoint) -> Option<FieldId> {
+        if let Some(id) = self.hit_field_id(pdf) {
+            let editable = self.doc.field(id).is_some_and(|field| {
+                inline_target(field.kind(), field.style().multiline).is_some()
+            });
+            if editable {
+                return Some(id);
+            }
+        }
+        self.doc.fields().iter().rev().find_map(|field| {
+            if !matches!(field.kind(), FieldKind::Radio | FieldKind::Checkbox) {
+                return None;
+            }
+            adjacent_label_rect(field.rect())
+                .contains(pdf)
+                .then_some(field.id())
+        })
+    }
+
+    fn inline_editor(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.inline.as_ref().map(|edit| edit.id) else {
+            return;
+        };
+        let Some(field) = self.doc.field(id) else {
+            self.inline = None;
+            return;
+        };
+        let kind = field.kind();
+        let style = field.style().clone();
+        let multiline = self.inline.as_ref().is_some_and(|edit| edit.multiline);
+        let rect = inline_screen_rect(&self.view, field.rect(), kind, style.font_size, multiline);
+        let font = canvas_font(&style, self.view.zoom);
+        let colors = crate::theme::canvas_colors(self.dark);
+        let light_fill = style
+            .fill
+            .is_some_and(|fill| fill.r + fill.g + fill.b > 1.5);
+        let color = canvas_text_color(
+            style.text_color,
+            light_fill && !matches!(kind, FieldKind::Radio | FieldKind::Checkbox),
+            &colors,
+        );
+        let cover = if let Some(fill) = style.fill {
+            if matches!(kind, FieldKind::Radio | FieldKind::Checkbox) {
+                colors.page
+            } else {
+                canvas_fill(fill, &colors)
+            }
+        } else {
+            colors.page
+        };
+        ui.painter().rect_filled(rect, 0.0, cover);
+        let request_focus = self.inline.as_ref().is_some_and(|edit| edit.request_focus);
+        let edit_id = egui::Id::new(("canvas-inline", id.0));
+        let hint = inline_hint(kind, &style, field.name());
+        let horizontal = match style.align {
+            TextAlign::Left => egui::Align::LEFT,
+            TextAlign::Center => egui::Align::Center,
+            TextAlign::Right => egui::Align::RIGHT,
+        };
+        let label_beside = matches!(kind, FieldKind::Radio | FieldKind::Checkbox);
+        // paint_label insets single-line text by 4 px and centers it. Multiline
+        // starts 4 px from the top. Radio and checkbox captions start at the rect.
+        let margin = if label_beside {
+            egui::Margin::ZERO
+        } else if multiline {
+            egui::Margin::symmetric(4, 4)
+        } else {
+            egui::Margin::symmetric(4, 0)
+        };
+
+        let response = {
+            let edit = self.inline.as_mut().unwrap();
+            let mut widget = if multiline {
+                egui::TextEdit::multiline(&mut edit.buffer).return_key(egui::KeyboardShortcut::new(
+                    egui::Modifiers::SHIFT,
+                    egui::Key::Enter,
+                ))
+            } else {
+                egui::TextEdit::singleline(&mut edit.buffer).return_key(
+                    egui::KeyboardShortcut::new(egui::Modifiers::NONE, egui::Key::Enter),
+                )
+            };
+            widget = widget
+                .id(edit_id)
+                .font(font)
+                .text_color(color)
+                .frame(false)
+                .margin(margin)
+                .min_size(rect.size())
+                .horizontal_align(horizontal)
+                .vertical_align(if multiline {
+                    egui::Align::Min
+                } else {
+                    egui::Align::Center
+                })
+                .desired_width(rect.width());
+            if !hint.is_empty() {
+                widget = widget.hint_text(hint);
+            }
+            ui.put(rect, widget)
+        };
+        if request_focus {
+            response.request_focus();
+            if let Some(edit) = &mut self.inline {
+                edit.request_focus = false;
+            }
+        }
+        if response.changed() {
+            self.apply_inline();
+        }
+        let escape = ui.input(|input| input.key_pressed(Key::Escape));
+        let enter = ui.input(|input| input.key_pressed(Key::Enter) && !input.modifiers.shift);
+        if escape && (response.has_focus() || response.lost_focus()) {
+            self.cancel_inline();
+            ui.memory_mut(|memory| memory.surrender_focus(edit_id));
+        } else if multiline && enter && response.has_focus() {
+            self.finish_inline();
+            ui.memory_mut(|memory| memory.surrender_focus(edit_id));
+        } else if response.lost_focus() {
+            self.finish_inline();
+        }
+    }
+
+    fn field_context_menu(&mut self, response: &egui::Response) {
+        if response.secondary_clicked() {
+            self.context_at = self.pointer_pdf(&response.ctx);
+        }
+        let on_item = self.context_field.is_some();
+        egui::Popup::context_menu(response).show(|ui| {
+            ui.set_min_width(220.0);
+            self.clipboard_commands(ui, on_item);
+            if on_item {
+                ui.separator();
+                if ui.button("Properties").clicked() {
+                    self.open_properties();
+                    ui.close();
+                }
+                if self.selection.len() >= 2 {
+                    ui.separator();
+                    self.align_commands(ui, true);
+                }
+            }
+        });
+    }
+
+    /// Cut, copy, paste, duplicate, and delete. On an item, paste uses the
+    /// click point. On empty canvas, only Paste is offered.
+    fn clipboard_commands(&mut self, ui: &mut egui::Ui, on_item: bool) {
+        let copy = command_shortcut(ui, egui::Key::C);
+        let cut = command_shortcut(ui, egui::Key::X);
+        let paste = command_shortcut(ui, egui::Key::V);
+        let duplicate = command_shortcut(ui, egui::Key::D);
+        if on_item && menu_command_enabled(ui, "Cut", Some(&cut), !self.selection.is_empty()) {
+            self.cut_selection();
+            self.publish_item_clipboard(ui.ctx());
+        }
+        if on_item && menu_command_enabled(ui, "Copy", Some(&copy), !self.selection.is_empty()) {
+            self.copy_selection();
+            self.publish_item_clipboard(ui.ctx());
+        }
+        if menu_command_enabled(ui, "Paste", Some(&paste), !self.clipboard.is_empty()) {
+            self.paste_items(self.context_at);
+        }
+        if on_item
+            && menu_command_enabled(
+                ui,
+                "Duplicate",
+                Some(&duplicate),
+                !self.selection.is_empty(),
+            )
+        {
+            self.duplicate_selection();
+        }
+        if on_item {
+            let delete = ui.add_enabled(
+                !self.selection.is_empty(),
+                egui::Button::new("Delete").shortcut_text("Del"),
+            );
+            if delete.clicked() {
+                self.delete_selection();
+                ui.close();
+            }
         }
     }
 
@@ -1189,7 +2593,29 @@ impl PageFormApp {
             self.paint_field(painter, field, &colors);
         }
 
-        if let Some(Drag::Place { start, kind }) = self.drag {
+        if let Some(Drag::Marquee { start, .. }) = &self.drag {
+            let start = *start;
+            if let Some(current) = self.pointer_pdf_from_painter(painter) {
+                if !is_click(&self.view, start, current) {
+                    let band = to_egui(self.view.pdf_rect_to_screen(marquee_rect(start, current)));
+                    painter.rect_filled(
+                        band,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            colors.selection.r(),
+                            colors.selection.g(),
+                            colors.selection.b(),
+                            40,
+                        ),
+                    );
+                    stroke_rect(painter, band, Stroke::new(1.0_f32, colors.selection));
+                }
+            }
+        }
+
+        if let Some(Drag::Place { start, kind }) = &self.drag {
+            let start = *start;
+            let kind = *kind;
             if let Some(current) = self.pointer_pdf_from_painter(painter) {
                 if kind == FieldKind::Line {
                     let (x0, y0) = self.view.pdf_to_screen(start);
@@ -1206,7 +2632,16 @@ impl PageFormApp {
             }
         }
 
-        if let Some(id) = self.selection {
+        for id in &self.selection {
+            let Some(field) = self.doc.field(*id) else {
+                continue;
+            };
+            if field.line_ends().is_none() {
+                let screen = to_egui(self.view.pdf_rect_to_screen(field.rect())).expand(3.0);
+                stroke_rect(painter, screen, Stroke::new(1.5_f32, colors.selection));
+            }
+        }
+        if let Some(id) = self.primary() {
             if let Some(field) = self.doc.field(id) {
                 if let Some((start, end)) = field.line_ends() {
                     for point in [start, end] {
@@ -1228,7 +2663,7 @@ impl PageFormApp {
         }
 
         if self.margins_visible {
-            let safe = to_egui(self.view.pdf_rect_to_screen(print_safe_rect(&page)));
+            let safe = to_egui(self.view.pdf_rect_to_screen(self.doc.margin_rect()));
             dash_rect(painter, safe, Stroke::new(1.0_f32, colors.margin));
         }
         self.paint_page_chrome(painter, page, &colors);
@@ -1242,98 +2677,172 @@ impl PageFormApp {
         field: &pageform_core::Field,
         colors: &crate::theme::CanvasColors,
     ) {
-        let selected = self.selection == Some(field.id());
-        let width = if selected { 2.0_f32 } else { 1.0 };
-        let stroke_color = if selected {
-            colors.selection
-        } else if matches!(
-            field.kind(),
-            FieldKind::Line | FieldKind::Rectangle | FieldKind::StaticText
-        ) {
-            colors.shape_stroke
-        } else if matches!(field.kind(), FieldKind::Checkbox | FieldKind::Radio) {
-            colors.check_stroke
+        let style = field.style();
+        let zoom = self.view.zoom;
+        let font = canvas_font(style, zoom);
+        let light_fill = style
+            .fill
+            .is_some_and(|fill| fill.r + fill.g + fill.b > 1.5);
+        let text_color = canvas_text_color(style.text_color, light_fill, colors);
+        let screen = if field.line_ends().is_none() {
+            Some(to_egui(self.view.pdf_rect_to_screen(field.rect())))
         } else {
-            colors.text_stroke
+            None
         };
-        let font = FontId::proportional((12.0 * self.view.zoom).clamp(8.0, 22.0));
+
         if let Some((start, end)) = field.line_ends() {
             let (x0, y0) = self.view.pdf_to_screen(start);
             let (x1, y1) = self.view.pdf_to_screen(end);
-            painter.line_segment(
-                [Pos2::new(x0, y0), Pos2::new(x1, y1)],
-                Stroke::new(width.max(1.25), stroke_color),
+            let color = canvas_stroke_color(style.stroke_color, false, colors, false);
+            let width = shape_stroke_px(style.stroke_width, zoom, style.stroke_color.is_black());
+            let stroke = Stroke::new(width, color);
+            if style.border_style == BorderStyleKind::Dashed {
+                dash_line(painter, Pos2::new(x0, y0), Pos2::new(x1, y1), stroke);
+            } else {
+                painter.line_segment([Pos2::new(x0, y0), Pos2::new(x1, y1)], stroke);
+            }
+            return;
+        }
+        let screen = screen.expect("box field");
+        let kind = field.kind();
+
+        if kind == FieldKind::Radio {
+            let center = screen.center();
+            let radius = (screen.width().min(screen.height()) * 0.5 - 1.5).max(2.0);
+            if let Some(fill) = style.fill {
+                painter.circle_filled(center, radius, canvas_fill(fill, colors));
+            }
+            let width = (style.border_width * zoom).clamp(0.8, 8.0);
+            painter.circle_stroke(
+                center,
+                radius,
+                Stroke::new(
+                    width,
+                    canvas_stroke_color(style.border_color, light_fill, colors, true),
+                ),
             );
+            if style.checked() {
+                painter.circle_filled(center, radius * 0.45, text_color);
+            }
+            if self.doc.radio_labels()
+                && !field.caption().is_empty()
+                && !self.inline_hides_text(field.id())
+            {
+                painter.text(
+                    screen.right_center() + Vec2::new(6.0, 0.0),
+                    Align2::LEFT_CENTER,
+                    field.caption(),
+                    font,
+                    text_color,
+                );
+            }
             return;
         }
 
-        let screen = to_egui(self.view.pdf_rect_to_screen(field.rect()));
-        let filled = !matches!(
-            field.kind(),
-            FieldKind::StaticText | FieldKind::Rectangle | FieldKind::Line | FieldKind::Radio
-        );
-        if filled {
-            painter.rect_filled(screen, 0.0, colors.field_fill);
+        if let Some(fill) = style.fill {
+            if kind != FieldKind::StaticText {
+                painter.rect_filled(screen, 0.0, canvas_fill(fill, colors));
+            }
         }
-        if field.kind() != FieldKind::Radio && (field.kind() != FieldKind::StaticText || selected) {
-            stroke_rect(painter, screen, Stroke::new(width, stroke_color));
+        let outline_pt = if matches!(
+            kind,
+            FieldKind::Rectangle | FieldKind::Image | FieldKind::Table
+        ) {
+            style.stroke_width
+        } else {
+            style.border_width
+        };
+        let outline_color = if matches!(
+            kind,
+            FieldKind::Rectangle | FieldKind::Image | FieldKind::Table
+        ) {
+            canvas_stroke_color(style.stroke_color, light_fill, colors, false)
+        } else {
+            canvas_stroke_color(
+                style.border_color,
+                light_fill,
+                colors,
+                kind == FieldKind::Checkbox,
+            )
+        };
+        if outline_pt > 0.05 {
+            let stand_in = match kind {
+                FieldKind::StaticText => style.border_color.is_black() && style.fill.is_none(),
+                FieldKind::Rectangle | FieldKind::Image | FieldKind::Table => {
+                    style.stroke_color.is_black() && !light_fill
+                }
+                _ => false,
+            };
+            paint_outline(
+                painter,
+                screen,
+                shape_stroke_px(outline_pt, zoom, stand_in),
+                outline_color,
+                style.border_style,
+            );
         }
-        match field.kind() {
+
+        match kind {
             FieldKind::Text | FieldKind::Signature | FieldKind::Date | FieldKind::Dropdown
-                if screen.height() > 12.0 =>
+                if screen.height() > 10.0 =>
             {
-                let label = match field.kind() {
+                let owned;
+                let label = match kind {
+                    FieldKind::Text if !style.default_value.is_empty() => {
+                        style.default_value.as_str()
+                    }
                     FieldKind::Text => field.name(),
                     FieldKind::Signature => field.caption(),
-                    FieldKind::Date => DATE_HINT,
+                    FieldKind::Date if !style.default_value.is_empty() => {
+                        style.default_value.as_str()
+                    }
+                    FieldKind::Date => style.date_format.as_str(),
+                    FieldKind::Dropdown if !style.default_value.is_empty() => {
+                        owned = style.default_value.clone();
+                        owned.as_str()
+                    }
                     FieldKind::Dropdown => {
                         field.options().first().map(String::as_str).unwrap_or("")
                     }
                     _ => "",
                 };
-                painter.text(
-                    screen.left_center() + Vec2::new(6.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    label,
-                    font.clone(),
-                    colors.field_text,
-                );
-                if field.kind() == FieldKind::Dropdown {
+                if !self.inline_hides_text(field.id()) {
+                    paint_label(
+                        painter,
+                        screen,
+                        label,
+                        &font,
+                        text_color,
+                        style.align,
+                        style.multiline && kind == FieldKind::Text,
+                    );
+                }
+                if kind == FieldKind::Dropdown {
                     painter.text(
                         screen.right_center() - Vec2::new(8.0, 0.0),
                         Align2::RIGHT_CENTER,
                         "v",
-                        font,
-                        colors.field_text,
+                        font.clone(),
+                        text_color,
                     );
                 }
             }
             FieldKind::StaticText => {
-                painter.text(
-                    screen.left_center() + Vec2::new(2.0, 0.0),
-                    Align2::LEFT_CENTER,
-                    field.caption(),
-                    font,
-                    colors.label_text,
-                );
-            }
-            FieldKind::Radio => {
-                let center = screen.center();
-                let radius = (screen.width().min(screen.height()) * 0.5 - 1.5).max(2.0);
-                painter.circle_filled(center, radius, colors.field_fill);
-                painter.circle_stroke(center, radius, Stroke::new(width, stroke_color));
-                if self.doc.radio_labels() && !field.caption().is_empty() {
-                    painter.text(
-                        screen.right_center() + Vec2::new(6.0, 0.0),
-                        Align2::LEFT_CENTER,
+                if !self.inline_hides_text(field.id()) {
+                    paint_label(
+                        painter,
+                        screen,
                         field.caption(),
-                        font,
-                        colors.label_text,
+                        &font,
+                        text_color,
+                        style.align,
+                        false,
                     );
                 }
             }
             FieldKind::Table => {
-                let stroke = Stroke::new(1.0_f32, colors.text_stroke);
+                let stroke =
+                    Stroke::new((style.stroke_width * zoom).clamp(0.6, 6.0), outline_color);
                 for column in 1..TABLE_COLUMNS {
                     let x =
                         screen.left() + screen.width() * (column as f32) / (TABLE_COLUMNS as f32);
@@ -1349,48 +2858,58 @@ impl PageFormApp {
                         stroke,
                     );
                 }
-                painter.text(
-                    screen.left_top() + Vec2::new(4.0, 4.0),
-                    Align2::LEFT_TOP,
-                    "placeholder",
-                    font,
-                    colors.field_text,
-                );
             }
             FieldKind::TextBox => {
-                if screen.width() > 8.0 {
-                    let galley = painter.layout(
-                        field.caption().to_string(),
-                        font,
-                        colors.field_text,
-                        (screen.width() - 8.0).max(8.0),
-                    );
-                    painter.galley(
-                        screen.left_top() + Vec2::new(4.0, 4.0),
-                        galley,
-                        colors.field_text,
+                if !self.inline_hides_text(field.id()) {
+                    paint_label(
+                        painter,
+                        screen,
+                        field.caption(),
+                        &font,
+                        text_color,
+                        style.align,
+                        style.multiline,
                     );
                 }
             }
             FieldKind::Image => {
                 painter.line_segment(
                     [screen.left_top(), screen.right_bottom()],
-                    Stroke::new(1.0_f32, colors.text_stroke),
+                    Stroke::new(1.0_f32, outline_color),
                 );
                 painter.line_segment(
                     [screen.right_top(), screen.left_bottom()],
-                    Stroke::new(1.0_f32, colors.text_stroke),
+                    Stroke::new(1.0_f32, outline_color),
                 );
                 painter.text(
                     screen.center(),
                     Align2::CENTER_CENTER,
-                    "Image",
-                    font,
-                    colors.field_text,
+                    if field.caption().is_empty() {
+                        "Image"
+                    } else {
+                        field.caption()
+                    },
+                    font.clone(),
+                    text_color,
                 );
             }
-            FieldKind::Checkbox | FieldKind::Rectangle | FieldKind::Line => {}
+            FieldKind::Checkbox if style.checked() => {
+                paint_check_mark(painter, screen, style.checkbox_style, text_color);
+            }
+            FieldKind::Checkbox | FieldKind::Rectangle | FieldKind::Line | FieldKind::Radio => {}
             _ => {}
+        }
+        if kind == FieldKind::Checkbox
+            && !field.caption().is_empty()
+            && !self.inline_hides_text(field.id())
+        {
+            painter.text(
+                screen.right_center() + Vec2::new(6.0, 0.0),
+                Align2::LEFT_CENTER,
+                field.caption(),
+                font.clone(),
+                text_color,
+            );
         }
     }
 
@@ -1400,57 +2919,63 @@ impl PageFormApp {
         page: Page,
         colors: &crate::theme::CanvasColors,
     ) {
-        let band = PRINT_SAFE_MARGIN_PT;
+        let margins = self.doc.margins();
         let stroke = Stroke::new(1.0_f32, colors.margin);
         let font = FontId::proportional(13.0);
         if self.header_visible {
-            let y = page.height - band;
-            let (x0, sy) = self.view.pdf_to_screen(PdfPoint { x: band, y });
+            let y = page.height - margins.top;
+            let (x0, sy) = self.view.pdf_to_screen(PdfPoint { x: margins.left, y });
             let (x1, _) = self.view.pdf_to_screen(PdfPoint {
-                x: page.width - band,
+                x: page.width - margins.right,
                 y,
             });
             dash_line(painter, Pos2::new(x0, sy), Pos2::new(x1, sy), stroke);
-            let (_, label_y) = self.view.pdf_to_screen(PdfPoint {
-                x: page.width * 0.5,
-                y: page.height - band * 0.45,
-            });
-            let (label_x, _) = self.view.pdf_to_screen(PdfPoint {
-                x: page.width * 0.5,
-                y: page.height,
-            });
-            painter.text(
-                Pos2::new(label_x, label_y),
-                Align2::CENTER_CENTER,
-                "Header",
-                font.clone(),
-                colors.margin,
-            );
+            let header = self.doc.header_text();
+            if !header.is_empty() {
+                let (_, label_y) = self.view.pdf_to_screen(PdfPoint {
+                    x: page.width * 0.5,
+                    y: page.height - margins.top * 0.45,
+                });
+                let (label_x, _) = self.view.pdf_to_screen(PdfPoint {
+                    x: page.width * 0.5,
+                    y: page.height,
+                });
+                painter.text(
+                    Pos2::new(label_x, label_y),
+                    Align2::CENTER_CENTER,
+                    header,
+                    font.clone(),
+                    colors.margin,
+                );
+            }
         }
         if self.footer_visible {
-            let y = band;
-            let (x0, sy) = self.view.pdf_to_screen(PdfPoint { x: band, y });
+            let y = margins.bottom;
+            let (x0, sy) = self.view.pdf_to_screen(PdfPoint { x: margins.left, y });
             let (x1, _) = self.view.pdf_to_screen(PdfPoint {
-                x: page.width - band,
+                x: page.width - margins.right,
                 y,
             });
             dash_line(painter, Pos2::new(x0, sy), Pos2::new(x1, sy), stroke);
-            let (label_x, label_y) = self.view.pdf_to_screen(PdfPoint {
-                x: band + 8.0,
-                y: band * 0.45,
-            });
-            painter.text(
-                Pos2::new(label_x, label_y),
-                Align2::LEFT_CENTER,
-                "Footer",
-                font.clone(),
-                colors.margin,
-            );
+            let footer = self.doc.footer_text();
+            if !footer.is_empty() {
+                let (label_x, label_y) = self.view.pdf_to_screen(PdfPoint {
+                    x: margins.left + 8.0,
+                    y: margins.bottom * 0.45,
+                });
+                painter.text(
+                    Pos2::new(label_x, label_y),
+                    Align2::LEFT_CENTER,
+                    footer,
+                    font.clone(),
+                    colors.margin,
+                );
+            }
         }
         if self.page_numbers_visible {
             let (x, y) = self.view.pdf_to_screen(PdfPoint {
                 x: page.width * 0.5,
-                y: band * 0.45,
+                y: margins.bottom * 0.45,
             });
             painter.text(
                 Pos2::new(x, y),
@@ -1548,7 +3073,7 @@ impl PageFormApp {
         } else if let Some(pos) = response.hover_pos() {
             let pdf = self.view.screen_to_pdf(pos.x, pos.y);
             let radius = 8.0 / self.view.zoom;
-            if let Some(id) = self.selection {
+            if let Some(id) = self.primary() {
                 if let Some(field) = self.doc.field(id) {
                     if field.hit_line_end(pdf, radius).is_some() {
                         CursorIcon::Grab
@@ -1590,23 +3115,29 @@ impl PageFormApp {
 
 impl eframe::App for PageFormApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(
-            crate::theme::STORAGE_KEY,
-            crate::theme::storage_value(self.dark).to_owned(),
-        );
+        write_preferences(self, storage);
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ctx);
+        let now = ctx.input(|input| input.time);
+        if let Some(remaining) = self.fade_status(now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+        }
+        let title = self.window_title();
+        if title != self.last_title {
+            self.last_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+        self.handle_close_request(ctx);
         crate::theme::apply(ctx, self.dark);
-        if self.persist_theme {
+        if self.persist_theme || self.persist_panel {
             if let Some(storage) = frame.storage_mut() {
-                storage.set_string(
-                    crate::theme::STORAGE_KEY,
-                    crate::theme::storage_value(self.dark).to_owned(),
-                );
+                write_preferences(self, storage);
                 storage.flush();
             }
             self.persist_theme = false;
+            self.persist_panel = false;
         }
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             self.menu_bar(ui);
@@ -1623,20 +3154,54 @@ impl eframe::App for PageFormApp {
                 ui.label("Scroll to zoom · middle-drag or Space-drag to pan");
             });
         });
-        egui::SidePanel::right("properties")
-            .resizable(false)
-            .exact_width(260.0)
-            .show(ctx, |ui| {
-                ui.add_space(8.0);
-                self.properties(ui);
-            });
+        if self.properties_open {
+            egui::SidePanel::right("properties")
+                .resizable(true)
+                .default_width(300.0)
+                .width_range(260.0..=460.0)
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    self.properties_panel(ui);
+                    ui.add_space(8.0);
+                });
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             self.canvas(ui);
         });
         self.preferences_dialog(ctx);
         self.about_dialog(ctx);
         self.help_window(ctx);
+        self.export_dialog(ctx);
+        self.unsaved_dialog(ctx);
+        if self.saved_follow_up {
+            self.saved_follow_up = false;
+            if let Some(action) = self.after_save.take() {
+                self.run_file_action(action);
+            }
+        }
+        if self.allow_close {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
+}
+
+fn write_preferences(app: &PageFormApp, storage: &mut dyn eframe::Storage) {
+    storage.set_string(
+        crate::theme::STORAGE_KEY,
+        crate::theme::storage_value(app.dark).to_owned(),
+    );
+    storage.set_string(
+        crate::prefs::OPEN_KEY,
+        crate::prefs::open_value(app.properties_open).to_owned(),
+    );
+    storage.set_string(
+        crate::prefs::PIN_KEY,
+        crate::prefs::pin_value(app.properties_pinned).to_owned(),
+    );
+    storage.set_string(
+        crate::prefs::RECENT_KEY,
+        crate::prefs::format_recent(&app.recent),
+    );
 }
 
 fn to_egui(rect: ScreenRect) -> Rect {
@@ -1729,9 +3294,21 @@ const EDIT_MENU: &[&str] = &[
     "Copy",
     "Cut",
     "Paste",
+    "Duplicate",
     "Delete",
     "",
+    "Align",
+    "",
     "Preferences",
+];
+
+const ALIGN_EDGES: &[(&str, AlignEdge)] = &[
+    ("Align left", AlignEdge::Left),
+    ("Align center", AlignEdge::Center),
+    ("Align right", AlignEdge::Right),
+    ("Align top", AlignEdge::Top),
+    ("Align middle", AlignEdge::Middle),
+    ("Align bottom", AlignEdge::Bottom),
 ];
 
 const HELP_MENU: &[&str] = &["Help", "About"];
@@ -1745,19 +3322,27 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "How do I place something?",
-        "The Insert menu drops a default-sized item at the center of the visible page. A toolbar icon arms that tool so you can drag on the page. Square/Rectangle is the Shapes icon.",
+        "The Insert menu drops a default-sized item at the center of the visible page. A toolbar icon arms that tool: click the page for the default size, or drag to size it. Square/Rectangle is the Shapes icon.",
     ),
     (
         "How do I select, move, and delete?",
-        "Edit → Select, or the Select tool. Drag a selected item to move it, and drag a handle to resize it. Edit → Delete, or the Delete key, removes the selection.",
+        "Edit > Select, or the Select tool. Drag on empty canvas to draw a box around the items you want. Drag a selected item to move it, and drag a handle to resize it. Edit > Delete, or the Delete key, removes the selection. Right-click an item for Cut, Copy, Paste, Duplicate, and Delete. Ctrl or Cmd+C, X, V, and D do the same when no text field is focused. Paste on empty canvas drops the copy at the click. Edit > Align, or a right-click, lines up two or more selected items.",
     ),
     (
         "Where are theme and radio labels?",
-        "Edit → Preferences. Dark is the default, and the choice is saved. Radio labels shows or hides the text beside each radio button. The toolbar theme button switches Dark and Light as well.",
+        "Edit > Preferences. Dark is the default, and the choice is saved. Radio labels shows or hides the text beside each radio button. The toolbar theme button switches Dark and Light as well. Preferences also stores whether the properties panel opens and whether it is pinned.",
+    ),
+    (
+        "How do I open properties?",
+        "The properties panel starts hidden. Open it from View > Properties, the toolbar properties icon, or a right-click Properties command. The header has a close button and a pin. Pinned panels stay open. Unpinned panels close when you click empty canvas. Shift-click or Ctrl-click selects more than one item.",
+    ),
+    (
+        "How do I edit text on the page?",
+        "Double-click static text, a text box, a radio or checkbox label, a signature word, or the default text in a text, date, or drop-down field. Type in the box. Enter, or a click outside, finishes. Esc restores the previous text. On a multi-line item, Shift+Enter starts a new line and Enter finishes. The sidebar text field shows the same words while you type.",
     ),
     (
         "What do New, Open, Save, Save As, and Print do?",
-        "File → New lists New Blank Document and New from Template. Those, plus Open, Save, Save As, and Print, are not implemented yet. File → Export PDF writes sample-form.pdf. Guides, margins, the header, the footer, and the page number stay on the canvas. Header and footer are in the View menu only.",
+        "File > New Blank Document starts a blank page and asks before discarding unsaved work. Ctrl or Cmd+N does that, and the New menu shows that shortcut. New from Template opens a .pgt template as a new untitled document and does not change the template. The new document stays clean until you edit it. Open reads .pgd documents, .pgt templates, and older .pageform files. Ctrl or Cmd+O opens. Save uses Ctrl or Cmd+S and writes the current .pgd. A new document, including one opened from a template, has no linked file, so Save asks for a new .pgd name and cannot overwrite the template. Save As uses Ctrl or Cmd+Shift+S. A template file is written only when Template (.pgt) is chosen, and an existing template asks before it is replaced. Saving a template does not link that file, so the next Save still asks for a .pgd. Open and Save use the system file dialog, or PageForm's own path window when that dialog is unavailable. Open Recent and the Open window list the file name. A template is labeled template, and the full path is the tooltip. Copy places the selected items' text on the system clipboard, one item per line. Ctrl or Cmd+V on the canvas pastes the items when that text is still on the clipboard. The window title shows the file name and a * when there are unsaved changes. Exit uses Ctrl or Cmd+Q and asks before closing a changed file. The window close button and Alt+F4 use that same question, once. Print uses Ctrl or Cmd+P, writes a temporary PDF, and hands it to the system. Export PDF still writes a fillable PDF. Guides, margins, the header, the footer, and the page number stay on the canvas.",
     ),
     (
         "Is there a list box?",
@@ -1806,15 +3391,369 @@ fn placeholder_icon(ui: &mut egui::Ui) {
     );
 }
 
-fn help_faq(ui: &mut egui::Ui) {
+fn parent_dir(path: &str) -> String {
+    std::path::Path::new(path)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.display().to_string())
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(default_export_dir)
+}
+
+fn ensure_extension(mut path: std::path::PathBuf, ext: &str) -> std::path::PathBuf {
+    if path.extension().is_none() {
+        path.set_extension(ext);
+    }
+    path
+}
+
+const OPEN_FILTERS: &[(&str, &[&str])] = &[("PageForm", &["pgd", "pgt", "pageform"])];
+
+const SAVE_FILTERS: &[(&str, &[&str])] = &[
+    ("PageForm Document", &["pgd"]),
+    ("PageForm Template", &["pgt"]),
+];
+
+const TEMPLATE_FILTERS: &[(&str, &[&str])] = &[("PageForm Template", &["pgt"])];
+
+fn is_open_prompt(kind: PromptKind) -> bool {
+    matches!(kind, PromptKind::OpenProject | PromptKind::OpenTemplate)
+}
+
+fn extension_is(path: &std::path::Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(ext))
+}
+
+fn is_template_path(path: &std::path::Path) -> bool {
+    extension_is(path, "pgt")
+}
+
+fn retarget_project_name(file_name: &str, template: bool) -> String {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty() {
+        return if template {
+            "Untitled.pgt".to_string()
+        } else {
+            "Untitled.pgd".to_string()
+        };
+    }
+    let ext = if template { "pgt" } else { "pgd" };
+    std::path::PathBuf::from(trimmed)
+        .with_extension(ext)
+        .display()
+        .to_string()
+}
+
+fn suggested_project_name(project_path: Option<&str>, template: bool) -> String {
+    match project_path {
+        Some(path) => retarget_project_name(&export_file_name(path), template),
+        None => retarget_project_name("Untitled.pgd", template),
+    }
+}
+
+fn project_save_path(directory: &str, file_name: &str, template: bool) -> std::path::PathBuf {
+    let name = retarget_project_name(file_name, template);
+    let mut path = std::path::PathBuf::from(directory.trim());
+    if path.as_os_str().is_empty() {
+        path = std::path::PathBuf::from(default_export_dir());
+    }
+    path.push(name);
+    path
+}
+
+/// A missing extension becomes `.pgd`. `.pgt`, `.pgd`, and legacy `.pageform` stay.
+fn native_project_save_path(mut path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.extension().is_none() {
+        path.set_extension("pgd");
+    }
+    path
+}
+
+fn pick_native(
+    save: bool,
+    title: &str,
+    filters: &[(&str, &[&str])],
+    file_name: &str,
+) -> NativePick {
+    if !native_save_dialog_available() {
+        return NativePick::Fallback;
+    }
+    let started = std::time::Instant::now();
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    for (name, extensions) in filters {
+        dialog = dialog.add_filter(*name, extensions);
+    }
+    let dialog = if file_name.is_empty() {
+        dialog
+    } else {
+        dialog.set_file_name(file_name)
+    };
+    let chosen = if save {
+        dialog.save_file()
+    } else {
+        dialog.pick_file()
+    };
+    match chosen {
+        Some(path) => NativePick::Path(path),
+        None if started.elapsed() < std::time::Duration::from_millis(500) => NativePick::Fallback,
+        None => NativePick::Cancel,
+    }
+}
+
+#[cfg(windows)]
+fn send_to_printer(path: &std::path::Path) -> String {
+    send_to_printer_windows(path)
+}
+
+#[cfg(not(windows))]
+fn send_to_printer(path: &std::path::Path) -> String {
+    send_to_printer_unix(path)
+}
+
+#[cfg(windows)]
+fn send_to_printer_windows(path: &std::path::Path) -> String {
+    use std::os::windows::ffi::OsStrExt;
+    let operation: Vec<u16> = std::ffi::OsStr::new("print")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let code = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
+    };
+    if (code as isize) <= 32 {
+        format!(
+            "Windows could not print {} (ShellExecute returned {}). Export a PDF and print it from a viewer.",
+            path.display(),
+            code as isize
+        )
+    } else {
+        format!("Sent {} to the printer.", path.display())
+    }
+}
+
+#[cfg(windows)]
+extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+    ) -> *mut std::ffi::c_void;
+}
+
+#[cfg(not(windows))]
+fn send_to_printer_unix(path: &std::path::Path) -> String {
+    if unix_command("lp") {
+        match std::process::Command::new("lp").arg(path).status() {
+            Ok(status) if status.success() => format!("Sent {} to the printer.", path.display()),
+            Ok(status) => format!(
+                "lp could not print {} ({status}). Export a PDF and print it from a viewer.",
+                path.display()
+            ),
+            Err(err) => format!("Could not run lp: {err}"),
+        }
+    } else if unix_command("xdg-open") {
+        match std::process::Command::new("xdg-open").arg(path).spawn() {
+            Ok(_) => format!("Opened {} so you can print it.", path.display()),
+            Err(err) => format!("Could not open the PDF: {err}"),
+        }
+    } else {
+        format!(
+            "No print command found. Install lp or xdg-open, or export {} and print it from a viewer.",
+            path.display()
+        )
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_command(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
+/// `(ignore this primary click, keep suppressing while the button is held)`.
+fn ignore_place_click(suppress: bool, primary_down: bool) -> (bool, bool) {
+    if suppress {
+        (true, primary_down)
+    } else {
+        (false, false)
+    }
+}
+
+fn recent_file_name(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+}
+
+fn recent_menu_label(path: &str) -> String {
+    let name = recent_file_name(path);
+    if is_template_path(std::path::Path::new(path)) {
+        format!("{name} (template)")
+    } else {
+        name.to_string()
+    }
+}
+
+fn recent_entry(ui: &mut egui::Ui, path: &str) -> egui::Response {
+    let response = ui.button(recent_menu_label(path));
+    // Menus and the Open window are popups, and egui hides ordinary tooltips there.
+    if response.hovered() {
+        response.show_tooltip_ui(|ui| {
+            ui.label(path);
+        });
+    }
+    response
+}
+
+fn copied_item_text(field: &Field) -> String {
+    match field.kind() {
+        FieldKind::StaticText
+        | FieldKind::TextBox
+        | FieldKind::Radio
+        | FieldKind::Checkbox
+        | FieldKind::Signature => field.caption().to_string(),
+        FieldKind::Text | FieldKind::Date | FieldKind::Dropdown => {
+            field.style().default_value.clone()
+        }
+        FieldKind::Line | FieldKind::Rectangle | FieldKind::Image | FieldKind::Table => {
+            String::new()
+        }
+    }
+}
+
+fn items_clipboard_text(fields: &[Field]) -> String {
+    fields
+        .iter()
+        .map(copied_item_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn command_shortcut(ui: &egui::Ui, key: egui::Key) -> String {
+    ui.ctx()
+        .format_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, key))
+}
+
+fn marquee_rect(start: PdfPoint, current: PdfPoint) -> RectPt {
+    let left = start.x.min(current.x);
+    let right = start.x.max(current.x);
+    let bottom = start.y.min(current.y);
+    let top = start.y.max(current.y);
+    RectPt {
+        x: left,
+        y: bottom,
+        w: (right - left).max(0.0),
+        h: (top - bottom).max(0.0),
+    }
+}
+
+fn rects_hit(a: RectPt, b: RectPt) -> bool {
+    a.x < b.right() && b.x < a.right() && a.y < b.top() && b.y < a.top()
+}
+
+fn export_file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("form.pdf")
+        .to_string()
+}
+
+fn default_export_dir() -> String {
+    std::env::current_dir()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|_| ".".to_string())
+}
+
+fn export_file_path(directory: &str, file_name: &str) -> std::path::PathBuf {
+    let mut name = file_name.trim().to_string();
+    if name.is_empty() {
+        name = "form.pdf".to_string();
+    }
+    let mut path = std::path::PathBuf::from(directory.trim());
+    if path.as_os_str().is_empty() {
+        path = std::path::PathBuf::from(default_export_dir());
+    }
+    path.push(name);
+    if path.extension().is_none() {
+        path.set_extension("pdf");
+    }
+    path
+}
+
+#[cfg(target_os = "linux")]
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
+}
+
+/// rfd's Linux backend needs a desktop portal, zenity, or kdialog. Windows and
+/// macOS use the system dialog.
+fn native_save_dialog_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if command_on_path("zenity") || command_on_path("kdialog") {
+            return true;
+        }
+        let portal = [
+            "/usr/libexec/xdg-desktop-portal",
+            "/usr/lib/xdg-desktop-portal",
+            "/usr/bin/xdg-desktop-portal",
+        ]
+        .iter()
+        .any(|path| std::path::Path::new(path).is_file())
+            || command_on_path("xdg-desktop-portal");
+        portal && std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
+}
+
+fn help_faq(ui: &mut egui::Ui, dark: bool) {
+    let text = if dark {
+        egui::Color32::from_rgb(248, 248, 246)
+    } else {
+        egui::Color32::from_rgb(16, 18, 22)
+    };
+    ui.style_mut().visuals.override_text_color = Some(text);
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Heading, FontId::proportional(26.0));
+    ui.style_mut()
+        .text_styles
+        .insert(egui::TextStyle::Body, FontId::proportional(18.0));
     ui.heading("PageForm Help");
-    ui.label("Frequently asked questions");
+    ui.label(egui::RichText::new("Frequently asked questions").size(18.0));
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
         for (question, answer) in HELP_FAQ {
-            ui.strong(*question);
-            ui.label(*answer);
-            ui.add_space(10.0);
+            ui.label(egui::RichText::new(*question).size(20.0).strong());
+            ui.label(egui::RichText::new(*answer).size(18.0));
+            ui.add_space(12.0);
         }
     });
 }
@@ -1866,6 +3805,23 @@ fn menu_command(ui: &mut egui::Ui, label: &str, shortcut: Option<&str>, selected
     clicked
 }
 
+fn menu_command_enabled(
+    ui: &mut egui::Ui,
+    label: &str,
+    shortcut: Option<&str>,
+    enabled: bool,
+) -> bool {
+    let mut button = egui::Button::new(label);
+    if let Some(shortcut) = shortcut {
+        button = button.shortcut_text(shortcut);
+    }
+    let clicked = ui.add_enabled(enabled, button).clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+
 fn insert_tip(kind: FieldKind) -> &'static str {
     match kind {
         FieldKind::Text => "Drop a one-line fillable text field at the center of the visible page.",
@@ -1880,8 +3836,12 @@ fn insert_tip(kind: FieldKind) -> &'static str {
         }
         FieldKind::Date => "Drop a date field (YYYY-MM-DD text).",
         FieldKind::Dropdown => "Drop a combo drop-down. This is not a list box.",
-        FieldKind::Line => "Drop a horizontal line. Drag with the toolbar tool to set the angle.",
-        FieldKind::Rectangle => "Drop a rectangle. Drag with the toolbar tool to size it.",
+        FieldKind::Line => {
+            "Drop a horizontal line. The toolbar tool places that line on a click, or sets the angle when you drag."
+        }
+        FieldKind::Rectangle => {
+            "Drop a rectangle. The toolbar tool places the default size on a click, or sizes it when you drag."
+        }
         FieldKind::TextBox => "Drop a static text box. It is not a fillable field.",
         FieldKind::Image => "Drop an image placeholder. Choosing a file is not available yet.",
     }
@@ -1912,22 +3872,24 @@ fn kind_for_toolbar_label(label: &str) -> Option<FieldKind> {
 
 fn toolbar_tip(kind: FieldKind) -> &'static str {
     match kind {
-        FieldKind::Text => "Arm the text field tool, then drag on the page.",
+        FieldKind::Text => "Click to place a default text field, or drag to size it.",
         FieldKind::StaticText => {
-            "Arm the static text tool, then drag on the page. Not a fillable field."
+            "Click to place a default text label, or drag to size it. Not a fillable field."
         }
-        FieldKind::Checkbox => "Arm the checkbox tool, then drag on the page.",
+        FieldKind::Checkbox => "Click to place a default checkbox, or drag to size it.",
         FieldKind::Radio => {
-            "Arm the radio tool, then drag on the page. A selected radio joins that group."
+            "Click to place a default radio button, or drag to size it. A selected radio joins that group."
         }
-        FieldKind::Table => "Arm the table tool. Placeholder grid; cells are not editable yet.",
-        FieldKind::Signature => "Arm the signature tool. No ink capture in the app yet.",
-        FieldKind::Date => "Arm the date tool, then drag on the page.",
-        FieldKind::Dropdown => "Arm the drop-down tool. Combo box, not a list box.",
-        FieldKind::Line => "Arm the line tool, then drag from one point to another.",
-        FieldKind::Rectangle => "Arm the rectangle tool, then drag on the page.",
-        FieldKind::TextBox => "Arm the text box tool. Static text, not a fillable field.",
-        FieldKind::Image => "Arm the image tool. Placeholder box until a file can be chosen.",
+        FieldKind::Table => {
+            "Click to place a default table, or drag to size it. Cells are not editable yet."
+        }
+        FieldKind::Signature => "Click to place a default signature field, or drag to size it. No ink capture yet.",
+        FieldKind::Date => "Click to place a default date field, or drag to size it.",
+        FieldKind::Dropdown => "Click to place a default drop-down, or drag to size it. Not a list box.",
+        FieldKind::Line => "Click to place a default line, or drag to set its length and angle.",
+        FieldKind::Rectangle => "Click to place a default rectangle, or drag to size it.",
+        FieldKind::TextBox => "Click to place a default text box, or drag to size it. Not a fillable field.",
+        FieldKind::Image => "Click to place a default image box, or drag to size it. Choosing a file is not available yet.",
     }
 }
 
@@ -1937,7 +3899,7 @@ fn kind_note(kind: FieldKind) -> &'static str {
         FieldKind::StaticText => "Static label. Not a fillable field.",
         FieldKind::Checkbox => "Fillable checkbox.",
         FieldKind::Radio => "One button in a radio group. The first two labels are Yes and No.",
-        FieldKind::Table => "Table placeholder. A 3×2 grid. Cells are not editable yet.",
+        FieldKind::Table => "Table placeholder. A 3x2 grid. Cells are not editable yet.",
         FieldKind::Signature => {
             "Unsigned signature field. Drawing a signature is not available yet."
         }
@@ -1950,17 +3912,325 @@ fn kind_note(kind: FieldKind) -> &'static str {
     }
 }
 
-fn fmt_pt(value: f32) -> String {
-    if (value - value.round()).abs() < 0.05 {
-        format!("{}", value.round() as i32)
+fn inline_target(kind: FieldKind, multiline: bool) -> Option<(InlineTarget, bool)> {
+    match kind {
+        FieldKind::StaticText | FieldKind::Radio | FieldKind::Checkbox | FieldKind::Signature => {
+            Some((InlineTarget::Caption, false))
+        }
+        FieldKind::TextBox => Some((InlineTarget::Caption, multiline)),
+        FieldKind::Text => Some((InlineTarget::DefaultValue, multiline)),
+        FieldKind::Date | FieldKind::Dropdown => Some((InlineTarget::DefaultValue, false)),
+        FieldKind::Line | FieldKind::Rectangle | FieldKind::Image | FieldKind::Table => None,
+    }
+}
+
+fn adjacent_label_rect(rect: RectPt) -> RectPt {
+    RectPt {
+        x: rect.right() + 4.0,
+        y: rect.y,
+        w: 140.0,
+        h: rect.h.max(12.0),
+    }
+}
+
+fn inline_screen_rect(
+    view: &ViewTransform,
+    rect: RectPt,
+    kind: FieldKind,
+    _font_size: f32,
+    _multiline: bool,
+) -> Rect {
+    if matches!(kind, FieldKind::Radio | FieldKind::Checkbox) {
+        // Same origin as the caption painted at the control's right center + 6 px.
+        let control = to_egui(view.pdf_rect_to_screen(rect));
+        return Rect::from_min_size(
+            Pos2::new(control.right() + 6.0, control.top()),
+            Vec2::new((140.0 * view.zoom).max(80.0), control.height().max(12.0)),
+        );
+    }
+    // The whole item, so the editor covers the painted text. Vertical alignment
+    // inside the widget matches paint_label.
+    to_egui(view.pdf_rect_to_screen(rect))
+}
+
+fn inline_hint(kind: FieldKind, style: &pageform_core::FieldStyle, name: &str) -> String {
+    match kind {
+        FieldKind::Text if style.default_value.is_empty() => name.to_string(),
+        FieldKind::Date if style.default_value.is_empty() => style.date_format.clone(),
+        _ => String::new(),
+    }
+}
+
+fn selection_after_click(current: &[FieldId], hit: FieldId, extend: bool) -> Vec<FieldId> {
+    if extend {
+        let mut next = current.to_vec();
+        if let Some(index) = next.iter().position(|id| *id == hit) {
+            next.remove(index);
+        } else {
+            next.push(hit);
+        }
+        next
+    } else if current.len() > 1 && current.contains(&hit) {
+        current.to_vec()
     } else {
-        format!("{value:.1}")
+        vec![hit]
+    }
+}
+
+fn rgb32(color: Rgb) -> egui::Color32 {
+    egui::Color32::from_rgb(
+        (color.r * 255.0).round().clamp(0.0, 255.0) as u8,
+        (color.g * 255.0).round().clamp(0.0, 255.0) as u8,
+        (color.b * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn shape_stroke_px(width_pt: f32, zoom: f32, stand_in: bool) -> f32 {
+    let px = (width_pt * zoom).clamp(0.8, 14.0);
+    if stand_in {
+        px.max(2.0)
+    } else {
+        px
+    }
+}
+
+fn is_click(view: &ViewTransform, start: PdfPoint, current: PdfPoint) -> bool {
+    let (x0, y0) = view.pdf_to_screen(start);
+    let (x1, y1) = view.pdf_to_screen(current);
+    let dx = x0 - x1;
+    let dy = y0 - y1;
+    dx * dx + dy * dy < 12.0 * 12.0
+}
+
+fn canvas_font(style: &pageform_core::FieldStyle, zoom: f32) -> FontId {
+    let size = (style.font_size * zoom).clamp(7.0, 48.0);
+    match style.font {
+        FontFamily::Courier => FontId::monospace(size),
+        FontFamily::Helvetica | FontFamily::Times => FontId::proportional(size),
+    }
+}
+
+/// Black strokes on the dark page use the theme color so they stay visible.
+/// Any other color is drawn as stored. The PDF keeps the real value.
+fn canvas_stroke_color(
+    color: Rgb,
+    light_fill: bool,
+    colors: &crate::theme::CanvasColors,
+    button: bool,
+) -> egui::Color32 {
+    if color.is_black() {
+        if !light_fill {
+            colors.shape_stroke
+        } else if button {
+            colors.check_stroke
+        } else {
+            colors.text_stroke
+        }
+    } else {
+        rgb32(color)
+    }
+}
+
+fn canvas_fill(color: Rgb, colors: &crate::theme::CanvasColors) -> egui::Color32 {
+    if color.r >= 0.999 && color.g >= 0.999 && color.b >= 0.999 {
+        colors.field_fill
+    } else {
+        rgb32(color)
+    }
+}
+
+fn canvas_text_color(
+    color: Rgb,
+    light_fill: bool,
+    colors: &crate::theme::CanvasColors,
+) -> egui::Color32 {
+    if color.is_black() {
+        if light_fill {
+            colors.field_text
+        } else {
+            colors.label_text
+        }
+    } else {
+        rgb32(color)
+    }
+}
+
+fn paint_outline(
+    painter: &egui::Painter,
+    rect: Rect,
+    width: f32,
+    color: egui::Color32,
+    style: BorderStyleKind,
+) {
+    let stroke = Stroke::new(width, color);
+    match style {
+        BorderStyleKind::Dashed => dash_rect(painter, rect, stroke),
+        BorderStyleKind::Underline => {
+            painter.line_segment([rect.left_bottom(), rect.right_bottom()], stroke);
+        }
+        BorderStyleKind::Beveled | BorderStyleKind::Inset => {
+            stroke_rect(painter, rect, stroke);
+            let light = egui::Color32::from_white_alpha(if style == BorderStyleKind::Beveled {
+                180
+            } else {
+                40
+            });
+            painter.line_segment(
+                [rect.left_top(), rect.right_top()],
+                Stroke::new(width, light),
+            );
+            painter.line_segment(
+                [rect.left_top(), rect.left_bottom()],
+                Stroke::new(width, light),
+            );
+        }
+        BorderStyleKind::Solid => stroke_rect(painter, rect, stroke),
+    }
+}
+
+fn paint_label(
+    painter: &egui::Painter,
+    screen: Rect,
+    text: &str,
+    font: &FontId,
+    color: egui::Color32,
+    align: TextAlign,
+    multiline: bool,
+) {
+    if text.is_empty() || screen.width() < 4.0 {
+        return;
+    }
+    let (anchor, pos) = match align {
+        TextAlign::Left => (
+            Align2::LEFT_CENTER,
+            screen.left_center() + Vec2::new(4.0, 0.0),
+        ),
+        TextAlign::Center => (Align2::CENTER_CENTER, screen.center()),
+        TextAlign::Right => (
+            Align2::RIGHT_CENTER,
+            screen.right_center() - Vec2::new(4.0, 0.0),
+        ),
+    };
+    if multiline && screen.height() > 16.0 {
+        let mut job = egui::text::LayoutJob::default();
+        job.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
+        job.wrap.max_width = (screen.width() - 8.0).max(8.0);
+        job.halign = match align {
+            TextAlign::Left => egui::Align::LEFT,
+            TextAlign::Center => egui::Align::Center,
+            TextAlign::Right => egui::Align::RIGHT,
+        };
+        let galley = painter.layout_job(job);
+        painter.galley(screen.left_top() + Vec2::new(4.0, 4.0), galley, color);
+    } else {
+        painter.text(pos, anchor, text, font.clone(), color);
+    }
+}
+
+fn paint_check_mark(
+    painter: &egui::Painter,
+    screen: Rect,
+    style: CheckboxStyle,
+    color: egui::Color32,
+) {
+    let stroke = Stroke::new(1.6_f32, color);
+    let center = screen.center();
+    match style {
+        CheckboxStyle::Check => {
+            painter.line_segment(
+                [
+                    screen.left_center() + Vec2::new(screen.width() * 0.22, screen.height() * 0.05),
+                    screen.center() + Vec2::new(-screen.width() * 0.05, screen.height() * 0.22),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    screen.center() + Vec2::new(-screen.width() * 0.05, screen.height() * 0.22),
+                    screen.right_center()
+                        + Vec2::new(-screen.width() * 0.18, -screen.height() * 0.22),
+                ],
+                stroke,
+            );
+        }
+        CheckboxStyle::Cross => {
+            painter.line_segment(
+                [
+                    screen.left_top() + Vec2::splat(4.0),
+                    screen.right_bottom() - Vec2::splat(4.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    screen.right_top() + Vec2::new(-4.0, 4.0),
+                    screen.left_bottom() + Vec2::new(4.0, -4.0),
+                ],
+                stroke,
+            );
+        }
+        CheckboxStyle::Circle => {
+            painter.circle_filled(center, screen.width().min(screen.height()) * 0.22, color);
+        }
+        CheckboxStyle::Diamond => {
+            let r = screen.width().min(screen.height()) * 0.28;
+            painter.add(egui::Shape::closed_line(
+                vec![
+                    center + Vec2::new(0.0, -r),
+                    center + Vec2::new(r, 0.0),
+                    center + Vec2::new(0.0, r),
+                    center + Vec2::new(-r, 0.0),
+                ],
+                stroke,
+            ));
+        }
+        CheckboxStyle::Square => {
+            let side = screen.width().min(screen.height()) * 0.45;
+            let rect = Rect::from_center_size(center, Vec2::splat(side));
+            stroke_rect(painter, rect, stroke);
+        }
+        CheckboxStyle::Star => {
+            let r = screen.width().min(screen.height()) * 0.28;
+            painter.line_segment(
+                [center - Vec2::new(0.0, r), center + Vec2::new(0.0, r)],
+                stroke,
+            );
+            painter.line_segment(
+                [center - Vec2::new(r, 0.0), center + Vec2::new(r, 0.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center - Vec2::new(r * 0.7, r * 0.7),
+                    center + Vec2::new(r * 0.7, r * 0.7),
+                ],
+                stroke,
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eframe::Storage;
+
+    #[derive(Default)]
+    struct MemStorage {
+        values: std::collections::HashMap<String, String>,
+    }
+
+    impl eframe::Storage for MemStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.values.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.values.insert(key.to_string(), value);
+        }
+
+        fn flush(&mut self) {}
+    }
 
     #[test]
     fn menu_bar_order_is_file_edit_insert_view_help() {
@@ -1988,7 +4258,9 @@ mod tests {
                 "Copy",
                 "Cut",
                 "Paste",
+                "Duplicate",
                 "Delete",
+                "Align",
                 "Preferences"
             ]
         );
@@ -2000,6 +4272,16 @@ mod tests {
         );
         assert!(!app_version().is_empty());
         assert!(HELP_FAQ.len() >= 5);
+        for (question, answer) in HELP_FAQ {
+            assert!(!question.contains('→'), "{question}");
+            assert!(!answer.contains('→'), "{answer}");
+            assert!(!answer.contains('×'), "{answer}");
+        }
+        for kind in FieldKind::INSERT {
+            let tip = toolbar_tip(kind);
+            assert!(tip.contains("Click"), "{tip}");
+            assert!(tip.contains("drag"), "{tip}");
+        }
     }
 
     #[test]
@@ -2068,6 +4350,890 @@ mod tests {
     }
 
     #[test]
+    fn marquee_selects_items_in_the_drag_box_and_a_click_clears() {
+        let mut app = PageFormApp::new(false, None);
+        app.view.zoom = 1.0;
+        let text = app.doc.add_field(
+            FieldKind::Text,
+            RectPt {
+                x: 72.0,
+                y: 700.0,
+                w: 40.0,
+                h: 18.0,
+            },
+        );
+        let check = app.doc.add_field(
+            FieldKind::Checkbox,
+            RectPt {
+                x: 200.0,
+                y: 700.0,
+                w: 18.0,
+                h: 18.0,
+            },
+        );
+        app.finish_marquee(
+            PdfPoint { x: 60.0, y: 730.0 },
+            PdfPoint { x: 230.0, y: 690.0 },
+            false,
+        );
+        assert!(app.selection.contains(&text));
+        assert!(app.selection.contains(&check));
+        app.finish_marquee(
+            PdfPoint { x: 10.0, y: 10.0 },
+            PdfPoint { x: 12.0, y: 11.0 },
+            false,
+        );
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn status_fades_after_four_seconds_and_stays_while_editing() {
+        let mut app = PageFormApp::new(false, None);
+        app.status = "Placed Text".to_string();
+        let remaining = app.fade_status(0.0).expect("timer");
+        assert!((remaining - 4.0).abs() < 0.001);
+        assert_eq!(app.status, "Placed Text");
+        let remaining = app.fade_status(3.9).expect("timer");
+        assert!((remaining - 0.1).abs() < 0.001);
+        assert_eq!(app.status, "Placed Text");
+        assert_eq!(app.fade_status(4.0), None);
+        assert!(app.status.is_empty());
+
+        app.insert_at_view(FieldKind::StaticText);
+        let id = app.primary().unwrap();
+        assert!(app.begin_inline(id));
+        assert_eq!(app.fade_status(0.0), None);
+        assert_eq!(app.fade_status(9.0), None);
+        assert!(app.status.starts_with("Editing text."));
+    }
+
+    #[test]
+    fn clipboard_events_and_select_all_run_on_the_first_pass() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.doc.set_default_value(id, "Ada");
+        let placed = app.selection.clone();
+        assert!(app.suppress_place_click);
+        assert_eq!(ignore_place_click(true, false), (true, false));
+        assert_eq!(ignore_place_click(true, true), (true, true));
+
+        let mut input = screen_input();
+        input.events.push(egui::Event::Copy);
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(app.clipboard.len(), 1);
+        assert_eq!(app.item_paste_text.as_deref(), Some("Ada"));
+
+        let mut input = screen_input();
+        input.events.push(egui::Event::Cut);
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert!(app.doc.fields().is_empty());
+        assert_eq!(app.item_paste_text.as_deref(), Some("Ada"));
+
+        let mut input = screen_input();
+        input
+            .events
+            .push(egui::Event::Paste("not item data".into()));
+        input.events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(
+            app.doc.fields().len(),
+            1,
+            "the internal clipboard pastes even when the system text differs"
+        );
+        assert_ne!(app.selection, placed);
+        assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
+
+        let count = app.doc.fields().len();
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(
+            app.doc.fields().len(),
+            count + 1,
+            "Ctrl+V pastes without a Paste event"
+        );
+
+        let count = app.doc.fields().len();
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        input.events.push(egui::Event::Paste("Ada".into()));
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(
+            app.doc.fields().len(),
+            count + 1,
+            "a paste event and Ctrl+V in one frame paste once"
+        );
+
+        app.doc.add_field(
+            FieldKind::Checkbox,
+            RectPt {
+                x: 72.0,
+                y: 600.0,
+                w: 18.0,
+                h: 18.0,
+            },
+        );
+        let expected = app.doc.fields().len();
+        app.selection.clear();
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(app.selection.len(), expected);
+
+        let mut pair = PageFormApp::new(false, None);
+        pair.insert_at_view(FieldKind::Text);
+        let first = pair.primary().unwrap();
+        pair.doc.set_default_value(first, "Ada");
+        pair.insert_at_view(FieldKind::StaticText);
+        let second = pair.primary().unwrap();
+        pair.doc.set_caption(second, "Bob").unwrap();
+        pair.selection = vec![first, second];
+        let mut input = screen_input();
+        input.events.push(egui::Event::Copy);
+        let _ = ctx.run(input, |ctx| pair.handle_shortcuts(ctx));
+        assert_eq!(pair.item_paste_text.as_deref(), Some("Ada\nBob"));
+    }
+
+    #[test]
+    fn a_selected_checkbox_copies_and_pastes_from_the_keys() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let id = app.doc.add_field(
+            FieldKind::Checkbox,
+            RectPt {
+                x: 80.0,
+                y: 500.0,
+                w: 18.0,
+                h: 18.0,
+            },
+        );
+        app.doc.set_caption(id, "Agree").unwrap();
+        app.selection = vec![id];
+        press_command(&ctx, &mut app, egui::Key::C, false);
+        assert_eq!(app.clipboard.len(), 1);
+        assert_eq!(app.clipboard[0].kind(), FieldKind::Checkbox);
+        assert_eq!(app.item_paste_text.as_deref(), Some("Agree"));
+        press_command(&ctx, &mut app, egui::Key::V, false);
+        assert_eq!(app.doc.fields().len(), 2);
+        assert_eq!(app.selection.len(), 1);
+        assert_ne!(app.selection[0], id);
+        let copy = app.doc.field(app.selection[0]).unwrap();
+        assert_eq!(copy.kind(), FieldKind::Checkbox);
+        assert_eq!(copy.caption(), "Agree");
+        assert!((copy.rect().x - 80.0).abs() > 1.0);
+        press_command(&ctx, &mut app, egui::Key::D, false);
+        assert_eq!(app.doc.fields().len(), 3);
+        assert_eq!(app.selection.len(), 1);
+        assert_ne!(app.selection[0], id);
+    }
+
+    #[test]
+    fn every_item_type_pastes_a_shifted_selected_copy() {
+        for kind in FieldKind::INSERT {
+            let mut app = PageFormApp::new(false, None);
+            let id = if kind == FieldKind::Line {
+                app.doc.add_line(
+                    PdfPoint { x: 40.0, y: 80.0 },
+                    PdfPoint { x: 140.0, y: 120.0 },
+                )
+            } else {
+                app.doc.add_field(
+                    kind,
+                    RectPt {
+                        x: 72.0,
+                        y: 400.0,
+                        w: 90.0,
+                        h: 18.0,
+                    },
+                )
+            };
+            app.selection = vec![id];
+            let before = app.doc.field(id).unwrap().rect();
+            app.copy_selection();
+            app.paste_items(None);
+            assert_eq!(app.doc.fields().len(), 2, "{}", kind.label());
+            assert_eq!(app.selection.len(), 1, "{}", kind.label());
+            let pasted = app.selection[0];
+            assert_ne!(pasted, id, "{}", kind.label());
+            let after = app.doc.field(pasted).unwrap();
+            assert_eq!(after.kind(), kind, "{}", kind.label());
+            assert!(
+                (after.rect().x - before.x).abs() > 1.0 || (after.rect().y - before.y).abs() > 1.0,
+                "{}",
+                kind.label()
+            );
+            app.paste_items(Some(PdfPoint { x: 200.0, y: 300.0 }));
+            let dropped = app.doc.field(app.selection[0]).unwrap().rect();
+            assert!((dropped.x - 200.0).abs() < 0.1, "{}", kind.label());
+            assert!((dropped.y - 300.0).abs() < 0.1, "{}", kind.label());
+        }
+    }
+
+    #[test]
+    fn the_item_context_menu_lists_clipboard_commands() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let id = app.doc.add_field(
+            FieldKind::Checkbox,
+            RectPt {
+                x: 10.0,
+                y: 10.0,
+                w: 18.0,
+                h: 18.0,
+            },
+        );
+        app.clipboard.push(app.doc.field(id).unwrap().clone());
+        app.selection = vec![id];
+        let output = panel(&ctx, &mut app, |app, ui| app.clipboard_commands(ui, true));
+        let texts = galley_texts(&output);
+        for label in [
+            "Cut",
+            "Copy",
+            "Paste",
+            "Duplicate",
+            "Delete",
+            "Ctrl+C",
+            "Ctrl+X",
+            "Ctrl+V",
+            "Ctrl+D",
+            "Del",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == label),
+                "{label} missing from {texts:?}"
+            );
+        }
+        let empty = panel(&ctx, &mut app, |app, ui| app.clipboard_commands(ui, false));
+        let texts = galley_texts(&empty);
+        assert!(texts.iter().any(|text| text == "Paste"));
+        assert!(texts.iter().all(|text| text != "Cut"));
+    }
+
+    #[test]
+    fn window_close_uses_the_exit_prompt_once() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+
+        let output = ctx.run(close_input(), |ctx| app.handle_close_request(ctx));
+        assert!(matches!(app.unsaved, Some(PendingFileAction::Exit)));
+        assert!(viewport_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+
+        let output = ctx.run(close_input(), |ctx| app.handle_close_request(ctx));
+        assert!(matches!(app.unsaved, Some(PendingFileAction::Exit)));
+        assert!(viewport_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+
+        app.unsaved = Some(PendingFileAction::Open);
+        let output = ctx.run(close_input(), |ctx| app.handle_close_request(ctx));
+        assert!(
+            matches!(app.unsaved, Some(PendingFileAction::Open)),
+            "a second close does not open another prompt"
+        );
+        assert!(viewport_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+
+        let mut clean = PageFormApp::new(false, None);
+        let output = ctx.run(close_input(), |ctx| clean.handle_close_request(ctx));
+        assert!(clean.unsaved.is_none());
+        assert!(!viewport_commands(&output).contains(&egui::ViewportCommand::CancelClose));
+    }
+
+    fn close_input() -> egui::RawInput {
+        let mut input = screen_input();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .events
+            .push(egui::ViewportEvent::Close);
+        input
+    }
+
+    fn viewport_commands(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn file_shortcuts_are_labeled_and_dispatch_without_a_native_dialog() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let file = panel(&ctx, &mut app, |app, ui| app.file_menu(ui));
+        let texts = galley_texts(&file);
+        for shortcut in [
+            "Ctrl+N",
+            "Ctrl+O",
+            "Ctrl+S",
+            "Ctrl+Shift+S",
+            "Ctrl+P",
+            "Ctrl+Q",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == shortcut),
+                "{shortcut} missing from {texts:?}"
+            );
+        }
+        let new_menu = panel(&ctx, &mut app, |app, ui| app.new_menu(ui));
+        let texts = galley_texts(&new_menu);
+        assert!(texts.iter().any(|text| text == "Ctrl+N"), "{texts:?}");
+        assert_eq!(recent_menu_label("/tmp/t6.pgt"), "t6.pgt (template)");
+        assert_eq!(recent_menu_label("/tmp/t6.pgd"), "t6.pgd");
+
+        app.insert_at_view(FieldKind::Text);
+        press_command(&ctx, &mut app, egui::Key::Q, false);
+        assert!(matches!(app.unsaved, Some(PendingFileAction::Exit)));
+        assert!(!app.allow_close);
+        app.unsaved = None;
+        app.doc.mark_clean();
+        press_command(&ctx, &mut app, egui::Key::Q, false);
+        assert!(app.unsaved.is_none());
+        assert!(app.allow_close);
+        app.allow_close = false;
+
+        app.insert_at_view(FieldKind::Text);
+        press_command(&ctx, &mut app, egui::Key::O, false);
+        assert!(matches!(app.unsaved, Some(PendingFileAction::Open)));
+        app.unsaved = None;
+        press_command(&ctx, &mut app, egui::Key::N, false);
+        assert!(matches!(app.unsaved, Some(PendingFileAction::NewBlank)));
+
+        app.unsaved = None;
+        app.doc.mark_clean();
+        press_command(&ctx, &mut app, egui::Key::N, false);
+        assert!(app.unsaved.is_none());
+        assert!(!app.doc.is_dirty());
+        assert!(app.doc.fields().is_empty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
+
+        let path =
+            std::env::temp_dir().join(format!("pageform-shortcut-{}.pgd", std::process::id()));
+        app.insert_at_view(FieldKind::Text);
+        app.write_project_file(&path);
+        app.doc.set_header_text("Saved");
+        assert!(app.doc.is_dirty());
+        press_command(&ctx, &mut app, egui::Key::S, false);
+        assert!(!app.doc.is_dirty());
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("Saved"), "{saved}");
+        let _ = std::fs::remove_file(&path);
+
+        if !native_save_dialog_available() {
+            app.doc.set_header_text("Again");
+            press_command(&ctx, &mut app, egui::Key::S, true);
+            let prompt = app.file_prompt.clone().expect("save as dialog");
+            assert_eq!(prompt.kind, PromptKind::SaveProject);
+            assert!(!prompt.save_as_template);
+            assert!(prompt.file_name.ends_with(".pgd"), "{}", prompt.file_name);
+        }
+    }
+
+    fn press_command(ctx: &egui::Context, app: &mut PageFormApp, key: egui::Key, shift: bool) {
+        let mut modifiers = egui::Modifiers::COMMAND;
+        modifiers.shift = shift;
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+    }
+
+    #[test]
+    fn select_all_copy_cut_and_paste_round_trip() {
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let original = app.doc.fields()[0].rect();
+        app.copy_selection();
+        app.paste_items(None);
+        assert_eq!(app.doc.fields().len(), 2);
+        let pasted = app.doc.field(app.primary().unwrap()).unwrap().rect();
+        assert!((pasted.x - original.x).abs() > 1.0);
+        app.select_all();
+        assert_eq!(app.selection.len(), 2);
+        app.cut_selection();
+        assert!(app.doc.fields().is_empty());
+        app.paste_items(None);
+        assert_eq!(app.doc.fields().len(), 2);
+    }
+
+    #[test]
+    fn two_selected_items_show_align_and_distribute_in_the_sidebar() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let first = app.doc.add_field(
+            FieldKind::Text,
+            RectPt {
+                x: 72.0,
+                y: 700.0,
+                w: 72.0,
+                h: 18.0,
+            },
+        );
+        let second = app.doc.add_field(
+            FieldKind::Text,
+            RectPt {
+                x: 200.0,
+                y: 640.0,
+                w: 90.0,
+                h: 18.0,
+            },
+        );
+        app.selection = vec![first, second];
+        let output = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        let texts = galley_texts(&output);
+        for label in [
+            "Align",
+            "Left",
+            "Center",
+            "Right",
+            "Top",
+            "Middle",
+            "Bottom",
+            "Horizontally",
+            "Vertically",
+            "Width",
+            "Height",
+        ] {
+            assert!(
+                texts.iter().any(|text| text.contains(label)),
+                "{label} missing from {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_export_path_adds_pdf_and_starts_from_the_fallback_name() {
+        let path = export_file_path("/tmp/forms", "card");
+        assert_eq!(path, std::path::PathBuf::from("/tmp/forms/card.pdf"));
+        let kept = export_file_path("/tmp/forms", "card.PDF");
+        assert_eq!(kept.extension().and_then(|ext| ext.to_str()), Some("PDF"));
+        assert_eq!(export_file_name("sample-form.pdf"), "sample-form.pdf");
+        assert_eq!(export_file_name(""), "form.pdf");
+        let mut app = PageFormApp::new(false, None);
+        app.open_builtin_prompt(PromptKind::ExportPdf);
+        let prompt = app.file_prompt.expect("builtin dialog");
+        assert_eq!(prompt.file_name, "sample-form.pdf");
+        assert!(!prompt.replace);
+    }
+
+    #[test]
+    fn save_then_open_restores_the_project_and_clears_the_dirty_flag() {
+        let path =
+            std::env::temp_dir().join(format!("pageform-roundtrip-{}.pgd", std::process::id()));
+        let mut app = PageFormApp::new(false, None);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.doc.set_default_value(id, "Ada");
+        assert!(app.doc.is_dirty());
+        assert!(app.window_title().contains('*'));
+        app.write_project_file(&path);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.project_path.as_deref(), Some(path.to_str().unwrap()));
+        app.doc.set_header_text("Changed");
+        assert!(app.doc.is_dirty());
+        app.read_project_file(&path);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.doc.header_text(), "Header");
+        assert_eq!(app.doc.fields().len(), 1);
+        assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("kind: Document"), "{saved}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_template_opens_as_untitled_and_save_does_not_overwrite_it() {
+        let dir = std::env::temp_dir();
+        let template = dir.join(format!("pageform-template-{}.pgt", std::process::id()));
+        let document = dir.join(format!("pageform-from-template-{}.pgd", std::process::id()));
+        let legacy = dir.join(format!("pageform-legacy-{}.pageform", std::process::id()));
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.doc.set_default_value(id, "Ada");
+        app.write_project_file(&template);
+        assert!(app.project_path.is_none());
+        assert!(app.doc.is_dirty());
+        assert!(app.window_title().starts_with("Untitled"));
+        let template_bytes = std::fs::read(&template).unwrap();
+        let template_text = String::from_utf8(template_bytes.clone()).unwrap();
+        assert!(template_text.contains("kind: Template"), "{template_text}");
+
+        app.new_blank();
+        app.read_project_file(&template);
+        assert!(app.project_path.is_none());
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
+        assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
+        assert!(app.linked_document_path().is_none());
+        assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
+        assert_eq!(app.recent[0], template.display().to_string());
+
+        app.read_project_file_as_untitled(&template);
+        assert!(app.project_path.is_none());
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
+        assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
+
+        app.write_project_file(&document);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(
+            app.project_path.as_deref(),
+            Some(document.to_str().unwrap())
+        );
+        assert_eq!(std::fs::read(&template).unwrap(), template_bytes);
+        let document_bytes = std::fs::read(&document).unwrap();
+        app.write_project_file(&template);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(
+            app.project_path.as_deref(),
+            Some(document.to_str().unwrap())
+        );
+        assert_eq!(std::fs::read(&document).unwrap(), document_bytes);
+        assert!(app.recent.contains(&template.display().to_string()));
+        assert!(app.recent.contains(&document.display().to_string()));
+
+        let mut skipped_kind = false;
+        let legacy_text = template_text
+            .lines()
+            .filter(|line| {
+                let drop_project_kind = !skipped_kind && line.trim().starts_with("kind:");
+                if drop_project_kind {
+                    skipped_kind = true;
+                }
+                !drop_project_kind
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(skipped_kind, "{legacy_text}");
+        assert!(legacy_text.contains("kind:"), "{legacy_text}");
+        std::fs::write(&legacy, &legacy_text).unwrap();
+        app.read_project_file(&legacy);
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.project_path.as_deref(), Some(legacy.to_str().unwrap()));
+        assert!(app.window_title().contains(".pageform"));
+
+        let mut fresh = PageFormApp::new(false, None);
+        fresh.open_builtin_prompt(PromptKind::SaveProject);
+        let prompt = fresh.file_prompt.clone().expect("save dialog");
+        assert!(!prompt.save_as_template);
+        assert_eq!(prompt.file_name, "Untitled.pgd");
+        fresh.open_builtin_prompt(PromptKind::OpenTemplate);
+        assert_eq!(
+            fresh.file_prompt.expect("template dialog").kind,
+            PromptKind::OpenTemplate
+        );
+        assert_eq!(
+            suggested_project_name(None, false),
+            "Untitled.pgd".to_string()
+        );
+        assert_eq!(
+            project_save_path("/tmp/forms", "card.pgd", true),
+            std::path::PathBuf::from("/tmp/forms/card.pgt")
+        );
+        assert_eq!(
+            project_save_path("/tmp/forms", "card.pageform", false),
+            std::path::PathBuf::from("/tmp/forms/card.pgd")
+        );
+        assert_eq!(
+            native_project_save_path(std::path::PathBuf::from("/tmp/forms/card")),
+            std::path::PathBuf::from("/tmp/forms/card.pgd")
+        );
+        assert!(is_template_path(&template));
+        let suggested = suggested_project_name(app.project_path.as_deref(), false);
+        assert!(suggested.ends_with(".pgd"), "{suggested}");
+        assert!(!suggested.ends_with(".pageform"), "{suggested}");
+
+        let _ = std::fs::remove_file(&template);
+        let _ = std::fs::remove_file(&document);
+        let _ = std::fs::remove_file(&legacy);
+    }
+
+    #[test]
+    fn opening_a_template_leaves_no_linked_path() {
+        let template =
+            std::env::temp_dir().join(format!("pageform-unlinked-{}.pgt", std::process::id()));
+        let mut source = PageFormApp::new(false, None);
+        source.insert_at_view(FieldKind::Text);
+        let id = source.primary().unwrap();
+        source.doc.set_default_value(id, "Ada");
+        let text = source
+            .doc
+            .to_project_ron(pageform_core::ProjectKind::Template)
+            .unwrap();
+        std::fs::write(&template, &text).unwrap();
+        let original = std::fs::read(&template).unwrap();
+
+        let mut app = PageFormApp::new(false, None);
+        app.read_project_file(&template);
+        assert!(
+            app.project_path.is_none(),
+            "opening a template must not link a path"
+        );
+        assert!(app.linked_document_path().is_none());
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled - PageForm");
+        assert_eq!(app.doc.fields()[0].style().default_value, "Ada");
+        assert_eq!(
+            suggested_project_name(app.project_path.as_deref(), false),
+            "Untitled.pgd"
+        );
+        app.doc.set_header_text("Edited");
+        assert!(app.doc.is_dirty());
+        assert_eq!(app.window_title(), "Untitled * - PageForm");
+        assert!(app.linked_document_path().is_none());
+        app.open_builtin_prompt(PromptKind::SaveProject);
+        let prompt = app.file_prompt.clone().expect("plain save asks for a name");
+        assert_eq!(prompt.kind, PromptKind::SaveProject);
+        assert!(!prompt.save_as_template);
+        assert_eq!(prompt.file_name, "Untitled.pgd");
+        let document_path = project_save_path(
+            &prompt.directory,
+            template.file_name().unwrap().to_str().unwrap(),
+            false,
+        );
+        assert_eq!(
+            document_path.extension().and_then(|ext| ext.to_str()),
+            Some("pgd")
+        );
+        assert_ne!(document_path, template);
+        assert_eq!(std::fs::read(&template).unwrap(), original);
+
+        let _ = std::fs::remove_file(&template);
+    }
+
+    #[test]
+    fn replacing_an_existing_template_asks_before_writing() {
+        let ctx = egui::Context::default();
+        let dir = std::env::temp_dir();
+        let template = dir.join(format!("pageform-replace-{}.pgt", std::process::id()));
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.doc.set_default_value(id, "Ada");
+        let original = app
+            .doc
+            .to_project_ron(pageform_core::ProjectKind::Template)
+            .unwrap();
+        std::fs::write(&template, &original).unwrap();
+        app.doc.set_default_value(id, "Changed");
+
+        app.open_builtin_prompt(PromptKind::SaveProject);
+        {
+            let prompt = app.file_prompt.as_mut().expect("save dialog");
+            prompt.directory = dir.display().to_string();
+            prompt.file_name = template
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace(".pgt", ".pgd");
+        }
+        let _ = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let at = text_center(
+            &show_settled(&ctx, &mut app, |app, ctx| {
+                egui::CentralPanel::default().show(ctx, |_| {});
+                app.export_dialog(ctx);
+            }),
+            "Template (.pgt)",
+        )
+        .expect("template type");
+        click_at(&ctx, &mut app, at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let prompt = app.file_prompt.clone().expect("dialog stays open");
+        assert!(prompt.save_as_template);
+        assert!(prompt.file_name.ends_with(".pgt"), "{}", prompt.file_name);
+
+        let save_at = text_center(
+            &show_settled(&ctx, &mut app, |app, ctx| {
+                egui::CentralPanel::default().show(ctx, |_| {});
+                app.export_dialog(ctx);
+            }),
+            "Save",
+        )
+        .expect("save");
+        click_at(&ctx, &mut app, save_at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        assert_eq!(std::fs::read_to_string(&template).unwrap(), original);
+        assert!(app.project_path.is_none());
+        let confirm = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&confirm);
+        assert!(
+            texts.iter().any(|text| text.contains("already exists")),
+            "{texts:?}"
+        );
+        let replace_at = text_center(&confirm, "Replace").expect("replace");
+        click_at(&ctx, &mut app, replace_at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let saved = std::fs::read_to_string(&template).unwrap();
+        assert_ne!(saved, original);
+        assert!(saved.contains("kind: Template"), "{saved}");
+        assert!(saved.contains("Changed"), "{saved}");
+        assert!(
+            app.project_path.is_none(),
+            "saving a template must not link it"
+        );
+        assert!(app.linked_document_path().is_none());
+
+        let _ = std::fs::remove_file(&template);
+    }
+
+    #[test]
+    fn save_as_dialog_switches_between_document_and_template() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.open_builtin_prompt(PromptKind::SaveProject);
+        let output = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&output);
+        assert!(
+            texts.iter().any(|text| text.contains("Document (.pgd)")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("Template (.pgt)")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("Untitled.pgd")),
+            "{texts:?}"
+        );
+        let at = text_center(&output, "Template (.pgt)").expect("template type");
+        click_at(&ctx, &mut app, at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let prompt = app.file_prompt.clone().expect("dialog stays open");
+        assert!(prompt.save_as_template);
+        assert_eq!(prompt.file_name, "Untitled.pgt");
+    }
+
+    #[test]
+    fn open_dialog_lists_documents_templates_and_legacy_recent_files() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.recent = vec![
+            "/tmp/form.pgd".to_string(),
+            "/tmp/form.pgt".to_string(),
+            "/tmp/old.pageform".to_string(),
+        ];
+        app.open_builtin_prompt(PromptKind::OpenProject);
+        let output = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&output);
+        for path in ["form.pgd", "form.pgt (template)", "old.pageform"] {
+            assert!(
+                texts.iter().any(|text| text == path),
+                "{path} missing from {texts:?}"
+            );
+        }
+        let at = text_center(&output, "form.pgt (template)").expect("template recent");
+        let mut hover = screen_input();
+        hover.events.push(egui::Event::PointerMoved(at));
+        let _ = run_ui(&ctx, &mut app, hover, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let hovered = run_ui(&ctx, &mut app, screen_input(), |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&hovered);
+        assert!(
+            texts.iter().any(|text| text == "/tmp/form.pgt"),
+            "full path tooltip missing from {texts:?}"
+        );
+        app.open_builtin_prompt(PromptKind::OpenTemplate);
+        let output = show_settled(&ctx, &mut app, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+            app.export_dialog(ctx);
+        });
+        let texts = galley_texts(&output);
+        assert!(
+            texts.iter().any(|text| text == "form.pgt (template)"),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().all(|text| text != "/tmp/form.pgd"),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_move_places_the_default_size_and_a_drag_does_not() {
+        let view = ViewTransform::new(792.0);
+        let start = PdfPoint { x: 100.0, y: 400.0 };
+        assert!(is_click(&view, start, PdfPoint { x: 104.0, y: 400.0 }));
+        assert!(!is_click(&view, start, PdfPoint { x: 120.0, y: 400.0 }));
+
+        let mut app = PageFormApp::new(false, None);
+        app.view.zoom = 1.0;
+        app.tool = Tool::Text;
+        let clicked = app.place_rect(start, PdfPoint { x: 104.0, y: 402.0 }, FieldKind::Text);
+        let (w, h) = default_size(FieldKind::Text, GridSize::Medium);
+        assert!((clicked.w - w).abs() < 0.1);
+        assert!((clicked.h - h).abs() < 0.1);
+
+        app.tool = Tool::Checkbox;
+        let check = app.place_rect(start, PdfPoint { x: 104.0, y: 402.0 }, FieldKind::Checkbox);
+        let (check_w, check_h) = default_size(FieldKind::Checkbox, GridSize::Medium);
+        assert!((check.w - check_w).abs() < 0.1);
+        assert!((check.h - check_h).abs() < 0.1);
+
+        let dragged = app.place_rect(start, PdfPoint { x: 180.0, y: 340.0 }, FieldKind::Text);
+        assert!((dragged.w - w).abs() > 1.0 || (dragged.h - h).abs() > 1.0);
+    }
+
+    #[test]
     fn square_drag_keeps_equal_sides_and_rectangle_drag_does_not() {
         let page = Page::letter();
         let start = PdfPoint { x: 72.0, y: 200.0 };
@@ -2093,10 +5259,6 @@ mod tests {
             "Save",
             "Save As",
             "Print",
-            "Select All",
-            "Copy",
-            "Cut",
-            "Paste",
             "New Blank Document",
             "New from Template",
             "Insert Page",
@@ -2107,13 +5269,109 @@ mod tests {
     }
 
     #[test]
+    fn properties_panel_starts_hidden_and_unpinned_closes_with_the_selection() {
+        let mut app = PageFormApp::new(false, None);
+        assert!(!app.properties_open);
+        assert!(!app.properties_pinned);
+        let mut storage = MemStorage::default();
+        write_preferences(&app, &mut storage);
+        let restored = PageFormApp::new(false, Some(&storage));
+        assert!(!restored.properties_open);
+        assert!(!restored.properties_pinned);
+        storage.set_string(crate::prefs::OPEN_KEY, "open".to_string());
+        storage.set_string(crate::prefs::PIN_KEY, "pinned".to_string());
+        let remembered = PageFormApp::new(false, Some(&storage));
+        assert!(remembered.properties_open);
+        assert!(remembered.properties_pinned);
+        app.open_properties();
+        assert!(app.properties_open);
+        assert!(app.persist_panel);
+        app.insert_at_view(FieldKind::Text);
+        app.dismiss_unpinned();
+        assert!(!app.properties_open);
+        app.open_properties();
+        app.set_properties_pinned(true);
+        app.persist_panel = false;
+        app.delete_selection();
+        assert!(app.properties_open);
+        assert!(app.selection.is_empty());
+        let first = FieldId(1);
+        let second = FieldId(2);
+        assert_eq!(
+            selection_after_click(&[first], second, true),
+            vec![first, second]
+        );
+        assert_eq!(
+            selection_after_click(&[first, second], first, true),
+            vec![second]
+        );
+        assert_eq!(
+            selection_after_click(&[first, second], first, false),
+            vec![first, second]
+        );
+        assert_eq!(selection_after_click(&[first], second, false), vec![second]);
+    }
+
+    #[test]
+    fn canvas_text_edit_updates_the_field_and_escape_restores_it() {
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::StaticText);
+        let id = app.primary().unwrap();
+        assert!(app.begin_inline(id));
+        assert!(app.status.starts_with("Editing text."));
+        assert!(!app.properties_open);
+        assert_eq!(app.inline.as_ref().map(|edit| edit.multiline), Some(false));
+        app.inline.as_mut().unwrap().buffer = "Full name".to_string();
+        app.apply_inline();
+        assert_eq!(app.doc.field(id).unwrap().caption(), "Full name");
+        assert_eq!(app.caption_buf, "Full name");
+        app.cancel_inline();
+        assert!(app.inline.is_none());
+        assert_eq!(app.status, "Placed Text");
+        assert!(!app.status.starts_with("Editing text."));
+        assert_eq!(app.doc.field(id).unwrap().caption(), "Label");
+        assert_eq!(app.caption_buf, "Label");
+
+        app.insert_at_view(FieldKind::TextBox);
+        let text_box = app.primary().unwrap();
+        assert!(app.begin_inline(text_box));
+        assert!(app.inline.as_ref().unwrap().multiline);
+        app.inline.as_mut().unwrap().buffer = "Line one\nLine two".to_string();
+        app.apply_inline();
+        assert_eq!(
+            app.doc.field(text_box).unwrap().caption(),
+            "Line one\nLine two"
+        );
+
+        app.insert_at_view(FieldKind::Text);
+        let text = app.primary().unwrap();
+        assert!(app.begin_inline(text));
+        app.inline.as_mut().unwrap().buffer = "Ada".to_string();
+        app.apply_inline();
+        assert_eq!(app.doc.field(text).unwrap().style().default_value, "Ada");
+        assert_eq!(app.value_buf, "Ada");
+
+        app.insert_at_view(FieldKind::Rectangle);
+        let shape = app.primary().unwrap();
+        assert!(!app.begin_inline(shape));
+        assert_eq!(app.inline.as_ref().map(|edit| edit.id), Some(text));
+        app.finish_inline();
+        assert!(app.inline.is_none());
+        assert!(
+            !app.status.starts_with("Editing text."),
+            "status was {}",
+            app.status
+        );
+    }
+
+    #[test]
     fn delete_removes_the_selected_field() {
         let mut app = PageFormApp::new(true, None);
         let id = app.doc.fields()[0].id();
-        app.selection = Some(id);
+        app.selection = vec![id];
         app.delete_selection();
         assert!(app.doc.field(id).is_none());
-        assert!(app.selection.is_none());
+        assert!(app.selection.is_empty());
         assert!(app.drag.is_none());
         assert_eq!(app.status, "Deleted field");
         assert_eq!(app.doc.fields().len(), 1);
@@ -2136,7 +5394,7 @@ mod tests {
         assert_eq!(app.doc.fields().len(), 1);
         let field = &app.doc.fields()[0];
         assert_eq!(field.kind(), FieldKind::Text);
-        assert_eq!(app.selection, Some(field.id()));
+        assert_eq!(app.selection, vec![field.id()]);
         let rect = field.rect();
         let (w, h) = default_size(FieldKind::Text, GridSize::Medium);
         assert!((rect.w - w).abs() < 0.1);
@@ -2274,6 +5532,10 @@ mod tests {
             ordered_hits(&galley_texts(&file), &menu_entries(FILE_MENU)),
             menu_entries(FILE_MENU)
         );
+        assert!(
+            galley_texts(&file).iter().any(|text| text == "Open Recent"),
+            "Open Recent stays visible when the list is empty"
+        );
         let edit = panel(&ctx, &mut app, |app, ui| app.edit_menu(ui));
         assert_eq!(
             ordered_hits(&galley_texts(&edit), &menu_entries(EDIT_MENU)),
@@ -2305,6 +5567,8 @@ mod tests {
         assert!(texts.iter().any(|text| text == "Dark"));
         assert!(texts.iter().any(|text| text == "Light"));
         assert!(texts.iter().any(|text| text == "Radio labels"));
+        assert!(texts.iter().any(|text| text == "Open by default"));
+        assert!(texts.iter().any(|text| text == "Pinned by default"));
         assert!(texts.iter().any(|text| text == "PageForm"));
         assert!(texts.iter().any(|text| text == ABOUT_TAGLINE));
         assert!(texts
@@ -2322,16 +5586,10 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = PageFormApp::new(false, None);
 
-        click_menu(&ctx, &mut app, "Open", |app, ui| app.file_menu(ui));
-        assert_eq!(app.status, "Open is not implemented yet");
-        click_menu(&ctx, &mut app, "Save As", |app, ui| app.file_menu(ui));
-        assert_eq!(app.status, "Save As is not implemented yet");
-        click_menu(&ctx, &mut app, "Print", |app, ui| app.file_menu(ui));
-        assert_eq!(app.status, "Print is not implemented yet");
         click_menu(&ctx, &mut app, "Select All", |app, ui| app.edit_menu(ui));
-        assert_eq!(app.status, "Select All is not implemented yet");
+        assert_eq!(app.status, "Selected 0 items");
         click_menu(&ctx, &mut app, "Paste", |app, ui| app.edit_menu(ui));
-        assert_eq!(app.status, "Paste is not implemented yet");
+        assert_eq!(app.status, "Selected 0 items");
 
         click_menu(&ctx, &mut app, "Preferences", |app, ui| app.edit_menu(ui));
         assert!(app.show_preferences);

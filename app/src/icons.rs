@@ -78,10 +78,11 @@ pub enum Icon {
     Snap,
     Moon,
     Sun,
+    Properties,
 }
 
 impl Icon {
-    const ALL: [Icon; 26] = [
+    const ALL: [Icon; 27] = [
         Icon::New,
         Icon::Open,
         Icon::Save,
@@ -108,6 +109,7 @@ impl Icon {
         Icon::Snap,
         Icon::Moon,
         Icon::Sun,
+        Icon::Properties,
     ];
 
     fn index(self) -> usize {
@@ -413,6 +415,7 @@ mod tests {
                 "my-location-outline",
                 "dark-mode-outline",
                 "light-mode-outline",
+                "tune",
             ]
         );
         for icon in Icon::ALL {
