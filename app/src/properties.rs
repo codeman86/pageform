@@ -16,16 +16,6 @@ impl PageFormApp {
         bump_sidebar_fonts(ui);
         self.properties_header(ui);
         ui.separator();
-        let pinned = self.properties_pinned;
-        ui.label(
-            egui::RichText::new(if pinned {
-                "Pinned. Stays open until you close it."
-            } else {
-                "Unpinned. Closes when you click empty canvas."
-            })
-            .small()
-            .weak(),
-        );
         ui.add_space(4.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -42,8 +32,16 @@ impl PageFormApp {
     }
 
     fn properties_header(&mut self, ui: &mut egui::Ui) {
+        let title = self.sidebar_title();
         ui.horizontal(|ui| {
-            ui.strong("Properties");
+            ui.strong(title);
+            if self.selection.len() == 1 {
+                if let Some(id) = self.primary() {
+                    if let Some(field) = self.doc.field(id) {
+                        info_icon(ui, kind_note(field.kind()));
+                    }
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .button("X")
@@ -52,9 +50,7 @@ impl PageFormApp {
                 {
                     self.set_properties_open(false);
                 }
-                let pin_label = if self.properties_pinned { "Pinned" } else { "Pin" };
-                if ui
-                    .selectable_label(self.properties_pinned, pin_label)
+                if pin_button(ui, self.properties_pinned)
                     .on_hover_text(
                         "Pinned panels stay open. Unpinned panels close when you click empty canvas.",
                     )
@@ -64,6 +60,17 @@ impl PageFormApp {
                 }
             });
         });
+    }
+
+    fn sidebar_title(&self) -> String {
+        if self.selection.len() == 1 {
+            if let Some(id) = self.primary() {
+                if let Some(field) = self.doc.field(id) {
+                    return sidebar_kind_title(field.kind()).to_string();
+                }
+            }
+        }
+        "Properties".to_string()
     }
 
     fn page_properties(&mut self, ui: &mut egui::Ui) {
@@ -168,110 +175,120 @@ impl PageFormApp {
         let rect = field.rect();
         let style = field.style().clone();
         let line = field.line_ends();
-        ui.label(kind.label());
-        ui.label(kind_note(kind));
 
-        section(ui, "Position and size");
-        ui.label("Points. Y is up from the bottom of the page.");
+        collapsing(ui, "Position", true, |ui| {
+            self.position_grid(ui, id, rect);
+            if let Some((start, end)) = line {
+                self.line_end_grid(ui, id, start, end);
+            }
+        });
+
+        collapsing(ui, "Text", true, |ui| {
+            if kind.is_form_field() {
+                self.identity_section(ui, id, kind);
+            } else if matches!(
+                kind,
+                FieldKind::StaticText | FieldKind::TextBox | FieldKind::Image
+            ) {
+                self.caption_edit(ui, id, "Text");
+            }
+            self.type_section(ui, id, kind, &style);
+        });
+
+        if draws_text(kind) {
+            collapsing(ui, "Font", true, |ui| {
+                self.font_section(ui, id, &style);
+            });
+        }
+        collapsing(ui, "Border", false, |ui| {
+            if matches!(
+                kind,
+                FieldKind::Line | FieldKind::Rectangle | FieldKind::Image | FieldKind::Table
+            ) {
+                self.stroke_section(ui, id, &style);
+            } else {
+                self.border_section(ui, id, &style);
+            }
+        });
+        if kind.is_form_field() {
+            collapsing(ui, "Calculations", false, |ui| {
+                self.calculations_section(ui);
+            });
+        }
+    }
+
+    fn position_grid(&mut self, ui: &mut egui::Ui, id: FieldId, rect: pageform_core::RectPt) {
         let mut next = rect;
         let mut moved = false;
-        if let Some(value) = drag_pt_wheel(ui, "X", rect.x, 0.0..=2000.0) {
-            next.x = value;
-            moved = true;
-        }
-        if let Some(value) = drag_pt_wheel(ui, "Y", rect.y, 0.0..=2000.0) {
-            next.y = value;
-            moved = true;
-        }
-        if let Some(value) = drag_pt_wheel(ui, "W", rect.w, 1.0..=2000.0) {
-            next.w = value;
-            moved = true;
-        }
-        if let Some(value) = drag_pt_wheel(ui, "H", rect.h, 1.0..=2000.0) {
-            next.h = value;
-            moved = true;
-        }
+        egui::Grid::new("position")
+            .num_columns(4)
+            .spacing(Vec2::new(8.0, 6.0))
+            .show(ui, |ui| {
+                moved |= labeled_drag(ui, "X", &mut next.x, 0.0..=2000.0, Some(POSITION_TIP));
+                moved |= labeled_drag(ui, "Y", &mut next.y, 0.0..=2000.0, Some(POSITION_TIP));
+                ui.end_row();
+                moved |= labeled_drag(ui, "W", &mut next.w, 1.0..=2000.0, Some(POSITION_TIP));
+                moved |= labeled_drag(ui, "H", &mut next.h, 1.0..=2000.0, Some(POSITION_TIP));
+                ui.end_row();
+            });
         if moved {
             self.doc.set_bounds(id, next);
         }
-        if let Some((start, end)) = line {
-            section(ui, "Line ends");
-            if let Some(value) = drag_pt(ui, "Start X", start.x, 0.0..=2000.0) {
-                self.doc.set_line_end(
-                    id,
-                    0,
-                    PdfPoint {
-                        x: value,
-                        y: start.y,
-                    },
-                );
-            }
-            if let Some(value) = drag_pt(ui, "Start Y", start.y, 0.0..=2000.0) {
-                self.doc.set_line_end(
-                    id,
-                    0,
-                    PdfPoint {
-                        x: start.x,
-                        y: value,
-                    },
-                );
-            }
-            if let Some(value) = drag_pt(ui, "End X", end.x, 0.0..=2000.0) {
-                self.doc
-                    .set_line_end(id, 1, PdfPoint { x: value, y: end.y });
-            }
-            if let Some(value) = drag_pt(ui, "End Y", end.y, 0.0..=2000.0) {
-                self.doc
-                    .set_line_end(id, 1, PdfPoint { x: end.x, y: value });
-            }
-        }
+    }
 
-        if kind.is_form_field() {
-            self.identity_section(ui, id, kind);
-        } else if matches!(kind, FieldKind::StaticText | FieldKind::Image) {
-            section(ui, "Text");
-            self.caption_edit(ui, id, "Text");
-        }
-
-        self.type_section(ui, id, kind, &style);
-        if draws_text(kind) {
-            self.font_section(ui, id, &style);
-        }
-        if matches!(
-            kind,
-            FieldKind::Line | FieldKind::Rectangle | FieldKind::Image | FieldKind::Table
-        ) {
-            self.stroke_section(ui, id, &style);
-        } else {
-            self.border_section(ui, id, &style);
-        }
-        self.calculations_section(ui);
+    fn line_end_grid(&mut self, ui: &mut egui::Ui, id: FieldId, start: PdfPoint, end: PdfPoint) {
+        egui::Grid::new("line-ends")
+            .num_columns(4)
+            .spacing(Vec2::new(8.0, 6.0))
+            .show(ui, |ui| {
+                if let Some(value) = labeled_drag_value(ui, "X1", start.x, 0.0..=2000.0, None) {
+                    self.doc.set_line_end(
+                        id,
+                        0,
+                        PdfPoint {
+                            x: value,
+                            y: start.y,
+                        },
+                    );
+                }
+                if let Some(value) = labeled_drag_value(ui, "Y1", start.y, 0.0..=2000.0, None) {
+                    self.doc.set_line_end(
+                        id,
+                        0,
+                        PdfPoint {
+                            x: start.x,
+                            y: value,
+                        },
+                    );
+                }
+                ui.end_row();
+                if let Some(value) = labeled_drag_value(ui, "X2", end.x, 0.0..=2000.0, None) {
+                    self.doc
+                        .set_line_end(id, 1, PdfPoint { x: value, y: end.y });
+                }
+                if let Some(value) = labeled_drag_value(ui, "Y2", end.y, 0.0..=2000.0, None) {
+                    self.doc
+                        .set_line_end(id, 1, PdfPoint { x: end.x, y: value });
+                }
+                ui.end_row();
+            });
     }
 
     fn identity_section(&mut self, ui: &mut egui::Ui, id: FieldId, kind: FieldKind) {
-        section(ui, "Field");
         let name_label = if kind == FieldKind::Radio {
             "Group name"
         } else {
             "Name"
         };
-        ui.label(name_label);
-        let edit =
-            ui.add(egui::TextEdit::singleline(&mut self.name_buf).desired_width(f32::INFINITY));
-        if edit.changed() {
+        let name_changed = labeled_edit(ui, name_label, &mut self.name_buf, "");
+        if name_changed {
             self.name_error = self
                 .doc
                 .set_name(id, &self.name_buf)
                 .err()
                 .map(|err| err.to_string());
         }
-        ui.label("Tooltip");
-        let tooltip_edit = ui.add(
-            egui::TextEdit::singleline(&mut self.tooltip_buf)
-                .desired_width(f32::INFINITY)
-                .hint_text("Exported as /TU"),
-        );
-        if tooltip_edit.changed() {
+        if labeled_edit(ui, "Tooltip", &mut self.tooltip_buf, "Exported as /TU") {
             self.doc.set_tooltip(id, &self.tooltip_buf);
         }
         let mut required = self
@@ -291,15 +308,11 @@ impl PageFormApp {
         if matches!(
             kind,
             FieldKind::Text | FieldKind::Date | FieldKind::Dropdown
-        ) {
-            ui.label("Default value");
-            let value = ui
-                .add(egui::TextEdit::singleline(&mut self.value_buf).desired_width(f32::INFINITY));
-            if value.changed() {
-                self.doc.set_default_value(id, &self.value_buf);
-                let text = self.value_buf.clone();
-                self.note_sidebar_text(id, super::InlineTarget::DefaultValue, &text);
-            }
+        ) && labeled_edit(ui, "Default", &mut self.value_buf, "Default value")
+        {
+            self.doc.set_default_value(id, &self.value_buf);
+            let text = self.value_buf.clone();
+            self.note_sidebar_text(id, super::InlineTarget::DefaultValue, &text);
         }
         if let Some(error) = &self.name_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
@@ -315,8 +328,7 @@ impl PageFormApp {
     ) {
         match kind {
             FieldKind::Dropdown => {
-                section(ui, "Drop-down items");
-                ui.label("One item per line.");
+                ui.label("Items").on_hover_text("One item per line.");
                 let edit = ui.add(
                     egui::TextEdit::multiline(&mut self.options_buf)
                         .desired_width(f32::INFINITY)
@@ -337,7 +349,6 @@ impl PageFormApp {
                 }
             }
             FieldKind::Radio => {
-                section(ui, "Radio");
                 self.caption_edit(ui, id, "Label");
                 if !self.doc.radio_labels() {
                     ui.label("Hidden until Radio labels is on in Edit > Preferences.");
@@ -368,7 +379,6 @@ impl PageFormApp {
                 }
             }
             FieldKind::Checkbox => {
-                section(ui, "Checkbox");
                 let mut chosen = style.checkbox_style;
                 egui::ComboBox::from_id_salt(("check", id.0))
                     .selected_text(chosen.label())
@@ -387,8 +397,9 @@ impl PageFormApp {
                 }
             }
             FieldKind::Date => {
-                section(ui, "Date");
-                ui.label("Format");
+                ui.label("Format").on_hover_text(
+                    "Not a calendar popup. The format is the empty-field hint and /TU when tooltip is blank.",
+                );
                 let mut format = style.date_format.clone();
                 if ui
                     .add(egui::TextEdit::singleline(&mut format).desired_width(f32::INFINITY))
@@ -397,16 +408,13 @@ impl PageFormApp {
                     self.doc
                         .update_style(id, |style| style.date_format = format);
                 }
-                ui.label("Not a calendar popup. The format is the empty-field hint and /TU when tooltip is blank.");
                 self.max_chars_row(ui, id, style.max_chars);
             }
             FieldKind::Text => {
-                section(ui, "Text field");
                 self.max_chars_row(ui, id, style.max_chars);
                 self.multiline_and_align(ui, id, style);
             }
             FieldKind::TextBox => {
-                section(ui, "Text box");
                 self.caption_edit(ui, id, "Text");
                 self.multiline_and_align(ui, id, style);
             }
@@ -414,40 +422,40 @@ impl PageFormApp {
                 self.align_row(ui, id, style.align);
             }
             FieldKind::Signature => {
-                section(ui, "Signature");
                 self.caption_edit(ui, id, "Label");
-                ui.label("Unsigned field. The app does not capture ink.");
             }
-            FieldKind::Image => {
-                ui.label("Choosing a file is not available yet.");
-            }
-            FieldKind::Table => {
-                ui.label("Placeholder grid. Cells are not editable yet.");
-            }
+            FieldKind::Image => {}
+            FieldKind::Table => {}
             FieldKind::Line | FieldKind::Rectangle => {}
         }
     }
 
     fn font_section(&mut self, ui: &mut egui::Ui, id: FieldId, style: &pageform_core::FieldStyle) {
-        section(ui, "Font");
-        let mut font = style.font;
-        egui::ComboBox::from_id_salt(("font", id.0))
-            .selected_text(font.label())
-            .show_ui(ui, |ui| {
-                for family in FontFamily::ALL {
-                    ui.selectable_value(&mut font, family, family.label());
-                }
-            });
-        if font != style.font {
-            self.doc.update_style(id, |style| style.font = font);
-        }
-        if let Some(size) = drag_pt_wheel(ui, "Size", style.font_size, 4.0..=96.0) {
-            self.doc.update_style(id, |style| style.font_size = size);
-        }
-        if let Some(color) = color_row(ui, "Text color", style.text_color) {
-            self.doc.update_style(id, |style| style.text_color = color);
-        }
-        ui.label("Helvetica, Times, and Courier are standard PDF fonts. On the canvas, Times uses the same proportional face as Helvetica.");
+        ui.horizontal(|ui| {
+            let mut font = style.font;
+            egui::ComboBox::from_id_salt(("font", id.0))
+                .width(108.0)
+                .selected_text(font.label())
+                .show_ui(ui, |ui| {
+                    for family in FontFamily::ALL {
+                        ui.selectable_value(&mut font, family, family.label());
+                    }
+                });
+            if font != style.font {
+                self.doc.update_style(id, |style| style.font = font);
+            }
+            if let Some(size) = drag_num(ui, style.font_size, 4.0..=96.0) {
+                self.doc.update_style(id, |style| style.font_size = size);
+            }
+            if let Some(color) = color_swatch(ui, style.text_color) {
+                self.doc
+                    .update_style(id, |style| style.text_color = color);
+            }
+            info_icon(
+                ui,
+                "Helvetica, Times, and Courier are standard PDF fonts. On the canvas, Times uses the same proportional face as Helvetica.",
+            );
+        });
     }
 
     fn border_section(
@@ -456,16 +464,17 @@ impl PageFormApp {
         id: FieldId,
         style: &pageform_core::FieldStyle,
     ) {
-        section(ui, "Border");
-        if let Some(width) = drag_pt_wheel(ui, "Width", style.border_width, 0.0..=24.0) {
-            self.doc
-                .update_style(id, |style| style.border_width = width);
-        }
-        if let Some(color) = color_row(ui, "Color", style.border_color) {
-            self.doc
-                .update_style(id, |style| style.border_color = color);
-        }
-        self.border_style_row(ui, id, style.border_style);
+        ui.horizontal(|ui| {
+            if let Some(width) = drag_num(ui, style.border_width, 0.0..=24.0) {
+                self.doc
+                    .update_style(id, |style| style.border_width = width);
+            }
+            self.border_style_row(ui, id, style.border_style);
+            if let Some(color) = color_swatch(ui, style.border_color) {
+                self.doc
+                    .update_style(id, |style| style.border_color = color);
+            }
+        });
         self.fill_row(ui, id, style.fill);
     }
 
@@ -475,16 +484,17 @@ impl PageFormApp {
         id: FieldId,
         style: &pageform_core::FieldStyle,
     ) {
-        section(ui, "Stroke");
-        if let Some(width) = drag_pt(ui, "Width", style.stroke_width, 0.0..=24.0) {
-            self.doc
-                .update_style(id, |style| style.stroke_width = width);
-        }
-        if let Some(color) = color_row(ui, "Color", style.stroke_color) {
-            self.doc
-                .update_style(id, |style| style.stroke_color = color);
-        }
-        self.border_style_row(ui, id, style.border_style);
+        ui.horizontal(|ui| {
+            if let Some(width) = drag_num(ui, style.stroke_width, 0.0..=24.0) {
+                self.doc
+                    .update_style(id, |style| style.stroke_width = width);
+            }
+            self.border_style_row(ui, id, style.border_style);
+            if let Some(color) = color_swatch(ui, style.stroke_color) {
+                self.doc
+                    .update_style(id, |style| style.stroke_color = color);
+            }
+        });
         if self
             .doc
             .field(id)
@@ -497,6 +507,7 @@ impl PageFormApp {
     fn border_style_row(&mut self, ui: &mut egui::Ui, id: FieldId, current: BorderStyleKind) {
         let mut chosen = current;
         egui::ComboBox::from_id_salt(("border", id.0))
+            .width(96.0)
             .selected_text(chosen.label())
             .show_ui(ui, |ui| {
                 for style in BorderStyleKind::ALL {
@@ -510,25 +521,25 @@ impl PageFormApp {
     }
 
     fn fill_row(&mut self, ui: &mut egui::Ui, id: FieldId, fill: Option<Rgb>) {
-        let mut enabled = fill.is_some();
-        if ui.checkbox(&mut enabled, "Fill").changed() {
-            self.doc.update_style(id, |style| {
-                style.fill = if enabled { Some(Rgb::WHITE) } else { None };
-            });
-        }
-        if let Some(color) = fill {
-            if let Some(color) = color_row(ui, "Fill color", color) {
-                self.doc.update_style(id, |style| style.fill = Some(color));
+        ui.horizontal(|ui| {
+            ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new("Fill"));
+            let mut enabled = fill.is_some();
+            if ui.checkbox(&mut enabled, "").changed() {
+                self.doc.update_style(id, |style| {
+                    style.fill = if enabled { Some(Rgb::WHITE) } else { None };
+                });
             }
-        }
+            if let Some(color) = fill {
+                if let Some(color) = color_swatch(ui, color) {
+                    self.doc.update_style(id, |style| style.fill = Some(color));
+                }
+            }
+        });
     }
 
     fn calculations_section(&self, ui: &mut egui::Ui) {
-        section(ui, "Calculations");
-        ui.label("Calculated fields are not available yet.");
         ui.add_enabled(false, egui::Button::new("Edit calculation"))
-            .on_hover_text("Coming in a later milestone.");
-        ui.label(egui::RichText::new("Placeholder only. Nothing here is exported.").small());
+            .on_hover_text("Calculated fields are not available yet. Nothing here is exported.");
     }
 
     fn multi_properties(&mut self, ui: &mut egui::Ui) {
@@ -590,18 +601,21 @@ impl PageFormApp {
     }
 
     fn caption_edit(&mut self, ui: &mut egui::Ui, id: FieldId, label: &str) {
-        ui.label(label);
-        let edit =
-            ui.add(egui::TextEdit::singleline(&mut self.caption_buf).desired_width(f32::INFINITY));
-        if edit.changed() {
-            self.name_error = self
-                .doc
-                .set_caption(id, &self.caption_buf)
-                .err()
-                .map(|err| err.to_string());
-            let text = self.caption_buf.clone();
-            self.note_sidebar_text(id, super::InlineTarget::Caption, &text);
-        }
+        ui.horizontal(|ui| {
+            ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new(label));
+            let width = ui.available_width();
+            let edit =
+                ui.add(egui::TextEdit::singleline(&mut self.caption_buf).desired_width(width));
+            if edit.changed() {
+                self.name_error = self
+                    .doc
+                    .set_caption(id, &self.caption_buf)
+                    .err()
+                    .map(|err| err.to_string());
+                let text = self.caption_buf.clone();
+                self.note_sidebar_text(id, super::InlineTarget::Caption, &text);
+            }
+        });
     }
 
     fn max_chars_row(&mut self, ui: &mut egui::Ui, id: FieldId, current: Option<i32>) {
@@ -635,14 +649,10 @@ impl PageFormApp {
     }
 
     fn align_row(&mut self, ui: &mut egui::Ui, id: FieldId, current: TextAlign) {
-        ui.label("Alignment");
         ui.horizontal(|ui| {
+            ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new("Align"));
             for align in TextAlign::ALL {
-                if ui
-                    .selectable_label(current == align, align.label())
-                    .clicked()
-                    && current != align
-                {
+                if align_icon(ui, align, current == align).clicked() && current != align {
                     self.doc.update_style(id, |style| style.align = align);
                 }
             }
@@ -698,6 +708,9 @@ fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(egui::RichText::new(title).strong());
 }
 
+const LABEL_W: f32 = 72.0;
+const POSITION_TIP: &str = "Points. Y is up from the bottom of the page.";
+
 fn drag_pt(
     ui: &mut egui::Ui,
     label: &str,
@@ -714,36 +727,25 @@ fn drag_pt_wheel(
     value: f32,
     range: std::ops::RangeInclusive<f32>,
 ) -> Option<f32> {
-    drag_pt_impl(ui, label, value, range, true)
+    ui.horizontal(|ui| {
+        ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new(label));
+        drag_num(ui, value, range)
+    })
+    .inner
 }
 
-fn drag_pt_impl(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: f32,
-    range: std::ops::RangeInclusive<f32>,
-    wheel: bool,
-) -> Option<f32> {
+fn drag_num(ui: &mut egui::Ui, value: f32, range: std::ops::RangeInclusive<f32>) -> Option<f32> {
     let mut value = value;
     let response = ui
-        .horizontal(|ui| {
-            ui.add_sized(Vec2::new(88.0, 18.0), egui::Label::new(label));
-            let mut drag = ui.add(
-                egui::DragValue::new(&mut value)
-                    .range(range.clone())
-                    .speed(0.5)
-                    .max_decimals(1),
-            );
-            if wheel {
-                drag =
-                    drag.on_hover_text("Scroll to adjust by 1 pt. Shift+scroll adjusts by 0.5 pt.");
-            }
-            drag
-        })
-        .inner;
+        .add(
+            egui::DragValue::new(&mut value)
+                .range(range.clone())
+                .speed(0.5)
+                .max_decimals(1),
+        )
+        .on_hover_text("Scroll to adjust by 1 pt. Shift+scroll adjusts by 0.5 pt.");
     let mut changed = response.changed();
-    if wheel && response.hovered() {
-        // One step per frame. A notch often arrives as both a line event and a pixel event.
+    if response.hovered() {
         let delta = take_wheel_delta(ui);
         if delta != 0.0 {
             let next = (value + delta).clamp(*range.start(), *range.end());
@@ -754,6 +756,155 @@ fn drag_pt_impl(
         }
     }
     changed.then_some(value)
+}
+
+fn labeled_edit(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) -> bool {
+    ui.horizontal(|ui| {
+        ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new(label));
+        let width = ui.available_width();
+        ui.add(
+            egui::TextEdit::singleline(text)
+                .desired_width(width)
+                .hint_text(hint),
+        )
+        .changed()
+    })
+    .inner
+}
+
+fn labeled_drag(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    tip: Option<&str>,
+) -> bool {
+    if let Some(next) = labeled_drag_value(ui, label, *value, range, tip) {
+        *value = next;
+        true
+    } else {
+        false
+    }
+}
+
+fn labeled_drag_value(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    tip: Option<&str>,
+) -> Option<f32> {
+    let mut changed = None;
+    ui.horizontal(|ui| {
+        let label = ui.add_sized(Vec2::new(22.0, 18.0), egui::Label::new(label));
+        if let Some(tip) = tip {
+            label.on_hover_text(tip);
+        }
+        if let Some(next) = drag_num(ui, value, range) {
+            changed = Some(next);
+        }
+    });
+    changed
+}
+
+fn collapsing(ui: &mut egui::Ui, title: &str, open: bool, body: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new(title)
+        .default_open(open)
+        .id_salt(title)
+        .show(ui, body);
+}
+
+fn sidebar_kind_title(kind: FieldKind) -> &'static str {
+    match kind {
+        FieldKind::StaticText => "Static Text",
+        other => other.label(),
+    }
+}
+
+fn pin_button(ui: &mut egui::Ui, pinned: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), egui::Sense::click());
+    let color = if pinned {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    if response.hovered() || pinned {
+        ui.painter().rect_filled(
+            rect,
+            3.0,
+            ui.style().interact_selectable(&response, pinned).bg_fill,
+        );
+    }
+    let center = rect.center() + Vec2::new(0.0, 1.0);
+    ui.painter().circle_stroke(
+        center + Vec2::new(0.0, -3.5),
+        2.6,
+        egui::Stroke::new(1.3_f32, color),
+    );
+    ui.painter().line_segment(
+        [center + Vec2::new(0.0, -1.0), center + Vec2::new(0.0, 5.0)],
+        egui::Stroke::new(1.3_f32, color),
+    );
+    response
+}
+
+fn info_icon(ui: &mut egui::Ui, tip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), egui::Sense::hover());
+    let color = ui.visuals().weak_text_color();
+    ui.painter()
+        .circle_stroke(rect.center(), 6.0, egui::Stroke::new(1.0_f32, color));
+    ui.painter().text(
+        rect.center() + Vec2::new(0.0, 1.0),
+        egui::Align2::CENTER_CENTER,
+        "i",
+        egui::FontId::proportional(11.0),
+        color,
+    );
+    response.on_hover_text(tip)
+}
+
+fn align_icon(ui: &mut egui::Ui, align: TextAlign, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(22.0), egui::Sense::click());
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if selected || response.hovered() {
+        ui.painter().rect_filled(rect, 3.0, visuals.bg_fill);
+    }
+    let color = visuals.text_color();
+    let left = rect.left() + 4.0;
+    let right = rect.right() - 4.0;
+    let widths = [14.0, 9.0, 12.0];
+    for (index, width) in widths.into_iter().enumerate() {
+        let y = rect.top() + 5.0 + index as f32 * 5.0;
+        let x = match align {
+            TextAlign::Left => left,
+            TextAlign::Center => rect.center().x - width * 0.5,
+            TextAlign::Right => right - width,
+        };
+        ui.painter().line_segment(
+            [egui::pos2(x, y), egui::pos2(x + width, y)],
+            egui::Stroke::new(1.4_f32, color),
+        );
+    }
+    response.on_hover_text(match align {
+        TextAlign::Left => "Align left",
+        TextAlign::Center => "Align center",
+        TextAlign::Right => "Align right",
+    })
+}
+
+fn color_swatch(ui: &mut egui::Ui, color: Rgb) -> Option<Rgb> {
+    let mut bytes = [
+        (color.r * 255.0).round().clamp(0.0, 255.0) as u8,
+        (color.g * 255.0).round().clamp(0.0, 255.0) as u8,
+        (color.b * 255.0).round().clamp(0.0, 255.0) as u8,
+    ];
+    ui.color_edit_button_srgb(&mut bytes).changed().then(|| {
+        Rgb::new(
+            bytes[0] as f32 / 255.0,
+            bytes[1] as f32 / 255.0,
+            bytes[2] as f32 / 255.0,
+        )
+    })
 }
 
 /// How long a press/release pair (or a line event and its pixel twin) counts
@@ -888,27 +1039,6 @@ fn bump_sidebar_fonts(ui: &mut egui::Ui) {
             font.size = size;
         }
     }
-}
-
-fn color_row(ui: &mut egui::Ui, label: &str, color: Rgb) -> Option<Rgb> {
-    let mut bytes = [
-        (color.r * 255.0).round().clamp(0.0, 255.0) as u8,
-        (color.g * 255.0).round().clamp(0.0, 255.0) as u8,
-        (color.b * 255.0).round().clamp(0.0, 255.0) as u8,
-    ];
-    let response = ui
-        .horizontal(|ui| {
-            ui.label(label);
-            ui.color_edit_button_srgb(&mut bytes)
-        })
-        .inner;
-    response.changed().then(|| {
-        Rgb::new(
-            bytes[0] as f32 / 255.0,
-            bytes[1] as f32 / 255.0,
-            bytes[2] as f32 / 255.0,
-        )
-    })
 }
 
 #[cfg(test)]

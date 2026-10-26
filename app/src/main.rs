@@ -39,6 +39,11 @@ fn dispatch() -> Result<(), String> {
                 index += 1;
                 preview_path = Some(required_value(&args, index, "--preview")?);
             }
+            "--sidebar-shots" => {
+                index += 1;
+                let dir = required_value(&args, index, "--sidebar-shots")?;
+                std::env::set_var("PAGEFORM_SIDEBAR_SHOTS", &dir);
+            }
             other => {
                 return Err(format!(
                     "unknown argument \"{other}\". Run pageform --help."
@@ -152,7 +157,9 @@ Usage:
   pageform --export sample.pdf [--preview sample.png]
       Write the sample form without opening a window.
 
-Scroll to zoom. Middle-drag or Space-drag to pan.
+Scroll to zoom. The Hand tool, or H, drags the page. Middle-drag or
+Space-drag pans from any tool and leaves that tool selected. Space does
+not pan while you are typing.
 The window opens in the dark theme. Edit → Preferences, View → Dark / Light,
 or the toolbar moon/sun icon switches it, and the choice is restored next launch.
 The properties panel starts hidden. View → Properties, the toolbar icon,

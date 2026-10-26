@@ -37,7 +37,7 @@ cargo test --workspace
 cargo run -p pageform -- --export sample-form.pdf
 ```
 
-Scroll to zoom. Middle-drag, or hold Space and drag, to pan. `cargo run -p pageform -- --demo` opens the sample fields used by the export test.
+Scroll to zoom. The Hand tool (H), next to Select, drags the page. Middle-drag, or hold Space and drag, pans from any tool and then returns to it. Space does not pan while a text field is focused. `cargo run -p pageform -- --demo` opens the sample fields used by the export test.
 
 ## Download
 

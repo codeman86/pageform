@@ -37,6 +37,7 @@ pub fn run_gui(demo: bool) -> eframe::Result<()> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
     Select,
+    Hand,
     Text,
     StaticText,
     Checkbox,
@@ -55,7 +56,7 @@ enum Tool {
 impl Tool {
     fn place_kind(self) -> Option<FieldKind> {
         match self {
-            Tool::Select => None,
+            Tool::Select | Tool::Hand => None,
             Tool::Text => Some(FieldKind::Text),
             Tool::StaticText => Some(FieldKind::StaticText),
             Tool::Checkbox => Some(FieldKind::Checkbox),
@@ -229,6 +230,9 @@ struct PageFormApp {
     context_field: Option<FieldId>,
     /// PDF point under the last right-click, for Paste on the canvas.
     context_at: Option<PdfPoint>,
+    /// Directory for `--sidebar-shots`. Empty in normal use.
+    shot_dir: Option<String>,
+    shot_frame: u32,
     inline: Option<InlineEdit>,
     status_before_inline: Option<String>,
     /// False until the user pans or zooms, so the page stays centered as the canvas resizes.
@@ -309,6 +313,8 @@ impl PageFormApp {
             persist_panel: false,
             context_field: None,
             context_at: None,
+            shot_dir: std::env::var("PAGEFORM_SIDEBAR_SHOTS").ok(),
+            shot_frame: 0,
             inline: None,
             status_before_inline: None,
             navigated: false,
@@ -1543,6 +1549,7 @@ impl PageFormApp {
         self.selection = vec![id];
         self.drag = None;
         self.suppress_place_click = true;
+        self.open_properties();
         self.status = format!("Placed {}", kind.label());
     }
 
@@ -1635,6 +1642,10 @@ impl PageFormApp {
 
     fn view_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(200.0);
+        if menu_command(ui, "Hand", Some("H"), self.tool == Tool::Hand) {
+            self.tool = Tool::Hand;
+        }
+        ui.separator();
         let mut open = self.properties_open;
         if ui
             .checkbox(&mut open, "Properties")
@@ -1864,6 +1875,15 @@ impl PageFormApp {
             icons::icon_button(ui, icons::Icon::Select, self.tool == Tool::Select, "Select");
         if select.clicked() {
             self.tool = Tool::Select;
+        }
+        let hand = icons::icon_button(
+            ui,
+            icons::Icon::Hand,
+            self.tool == Tool::Hand,
+            "Hand. Drag to pan. H selects this tool.",
+        );
+        if hand.clicked() {
+            self.tool = Tool::Hand;
         }
         if icons::icon_button(ui, icons::Icon::InsertPage, false, "Insert Page").clicked() {
             self.mark_not_implemented("Insert Page");
@@ -2147,6 +2167,8 @@ impl PageFormApp {
             self.ask_or_run(PendingFileAction::Exit);
         } else if ctx.input_mut(|input| input.consume_shortcut(&select_all)) {
             self.select_all();
+        } else if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
+            self.tool = Tool::Hand;
         }
     }
 
@@ -2178,7 +2200,7 @@ impl PageFormApp {
         let primary_down = ctx.input(|input| input.pointer.primary_down());
         let primary_released = ctx.input(|input| input.pointer.primary_released());
         let middle_pressed = ctx.input(|input| input.pointer.button_pressed(PointerButton::Middle));
-        let space = ctx.input(|input| input.key_down(Key::Space));
+        let space = space_pans(ctx);
 
         if response.double_clicked() && self.tool == Tool::Select {
             if let Some(pdf) = self.pointer_pdf(ctx) {
@@ -2212,17 +2234,15 @@ impl PageFormApp {
         if middle_pressed && response.hovered() {
             self.drag = Some(Drag::Pan);
         } else if primary_pressed && response.hovered() && !ignore_primary {
-            if space {
-                self.drag = Some(Drag::Pan);
-            } else {
-                self.begin_primary(ctx);
-            }
+            self.begin_canvas_press(ctx, space);
         }
 
         if matches!(self.drag, Some(Drag::Pan)) {
+            let hand = self.tool == Tool::Hand;
             let panning = ctx.input(|input| {
                 input.pointer.button_down(PointerButton::Middle)
-                    || (input.key_down(Key::Space) && input.pointer.primary_down())
+                    || (hand && input.pointer.primary_down())
+                    || (space && input.pointer.primary_down())
             });
             if panning {
                 let delta = ctx.input(|input| input.pointer.delta());
@@ -2246,6 +2266,7 @@ impl PageFormApp {
                     let id = self.finish_place(start, current, kind);
                     self.selection = vec![id];
                     self.tool = Tool::Select;
+                    self.open_properties();
                     self.status = format!("Placed {}", kind.label());
                 }
             }
@@ -2260,11 +2281,22 @@ impl PageFormApp {
         }
     }
 
+    fn begin_canvas_press(&mut self, ctx: &egui::Context, space: bool) {
+        if space || self.tool == Tool::Hand {
+            self.drag = Some(Drag::Pan);
+        } else {
+            self.begin_primary(ctx);
+        }
+    }
+
     fn begin_primary(&mut self, ctx: &egui::Context) {
         let Some(pdf) = self.pointer_pdf(ctx) else {
             return;
         };
         match self.tool {
+            Tool::Hand => {
+                self.drag = Some(Drag::Pan);
+            }
             Tool::Select => {
                 let radius = 8.0 / self.view.zoom;
                 if let Some(id) = self.primary() {
@@ -3066,8 +3098,12 @@ impl PageFormApp {
         if !response.hovered() {
             return;
         }
-        let cursor = if ctx.input(|input| input.key_down(Key::Space)) {
-            CursorIcon::Grab
+        let cursor = if let Some(cursor) = hand_cursor(
+            self.tool,
+            matches!(self.drag, Some(Drag::Pan)),
+            space_pans(ctx),
+        ) {
+            cursor
         } else if self.tool.place_kind().is_some() {
             CursorIcon::Crosshair
         } else if let Some(pos) = response.hover_pos() {
@@ -3102,6 +3138,34 @@ impl PageFormApp {
             return;
         };
         response.ctx.set_cursor_icon(cursor);
+    }
+
+    fn capture_sidebar_shot(&mut self, ctx: &egui::Context) {
+        let Some(dir) = self.shot_dir.clone() else {
+            return;
+        };
+        ctx.request_repaint();
+        self.properties_open = true;
+        self.shot_frame += 1;
+        let grab = |name: &str| grab_root(&dir, name);
+        match self.shot_frame {
+            12 => grab("blank-canvas.png"),
+            13 => {
+                self.insert_at_view(FieldKind::StaticText);
+            }
+            24 => grab("static-text.png"),
+            25 => {
+                self.doc = Document::letter();
+                self.selection.clear();
+                self.name_for = None;
+                self.insert_at_view(FieldKind::Text);
+            }
+            36 => {
+                grab("text-field.png");
+                std::process::exit(0);
+            }
+            _ => {}
+        }
     }
 
     fn field_at(&self, pdf: PdfPoint) -> bool {
@@ -3182,6 +3246,23 @@ impl eframe::App for PageFormApp {
         if self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        self.capture_sidebar_shot(ctx);
+    }
+}
+
+fn grab_root(dir: &str, name: &str) {
+    let path = std::path::Path::new(dir).join(name);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let target = path.display().to_string();
+    let status = std::process::Command::new("import")
+        .args(["-window", "root", &target])
+        .status();
+    if status.as_ref().ok().is_some_and(|status| status.success()) {
+        println!("wrote {target}");
+    } else {
+        eprintln!("pageform: could not capture {target} ({status:?})");
     }
 }
 
@@ -3326,7 +3407,7 @@ const HELP_FAQ: &[(&str, &str)] = &[
     ),
     (
         "How do I select, move, and delete?",
-        "Edit > Select, or the Select tool. Drag on empty canvas to draw a box around the items you want. Drag a selected item to move it, and drag a handle to resize it. Edit > Delete, or the Delete key, removes the selection. Right-click an item for Cut, Copy, Paste, Duplicate, and Delete. Ctrl or Cmd+C, X, V, and D do the same when no text field is focused. Paste on empty canvas drops the copy at the click. Edit > Align, or a right-click, lines up two or more selected items.",
+        "Edit > Select, or the Select tool. Drag on empty canvas to draw a box around the items you want. Drag a selected item to move it, and drag a handle to resize it. Edit > Delete, or the Delete key, removes the selection. View > Hand, or H, drags the page. Middle-drag or Space-drag pans from any tool and leaves that tool selected. Space does not pan while you are typing. Right-click an item for Cut, Copy, Paste, Duplicate, and Delete. Ctrl or Cmd+C, X, V, and D do the same when no text field is focused. Paste on empty canvas drops the copy at the click. Edit > Align, or a right-click, lines up two or more selected items.",
     ),
     (
         "Where are theme and radio labels?",
@@ -3646,6 +3727,21 @@ fn items_clipboard_text(fields: &[Field]) -> String {
         .map(copied_item_text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Space pans from any tool. A focused text field keeps the space bar for typing.
+fn space_pans(ctx: &egui::Context) -> bool {
+    !ctx.wants_keyboard_input() && ctx.input(|input| input.key_down(egui::Key::Space))
+}
+
+fn hand_cursor(tool: Tool, dragging_pan: bool, space: bool) -> Option<CursorIcon> {
+    if dragging_pan {
+        Some(CursorIcon::Grabbing)
+    } else if tool == Tool::Hand || space {
+        Some(CursorIcon::Grab)
+    } else {
+        None
+    }
 }
 
 fn command_shortcut(ui: &egui::Ui, key: egui::Key) -> String {
@@ -4521,6 +4617,86 @@ mod tests {
     }
 
     #[test]
+    fn hand_tool_pans_and_space_stays_temporary() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.tool = Tool::Text;
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::H,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input, |ctx| app.handle_shortcuts(ctx));
+        assert_eq!(app.tool, Tool::Hand);
+        app.begin_canvas_press(&ctx, false);
+        assert!(matches!(app.drag, Some(Drag::Pan)));
+        assert_eq!(app.tool, Tool::Hand);
+        assert_eq!(
+            hand_cursor(Tool::Hand, false, false),
+            Some(CursorIcon::Grab)
+        );
+        assert_eq!(
+            hand_cursor(Tool::Hand, true, false),
+            Some(CursorIcon::Grabbing)
+        );
+        assert_eq!(
+            hand_cursor(Tool::Text, true, true),
+            Some(CursorIcon::Grabbing)
+        );
+        assert_eq!(hand_cursor(Tool::Text, false, false), None);
+
+        app.tool = Tool::Checkbox;
+        app.drag = None;
+        app.begin_canvas_press(&ctx, true);
+        assert!(matches!(app.drag, Some(Drag::Pan)));
+        assert_eq!(app.tool, Tool::Checkbox);
+        let before = app.view.origin_x;
+        app.view.origin_x += 15.0;
+        app.view.origin_y += -6.0;
+        assert!((app.view.origin_x - before - 15.0).abs() < 0.01);
+        app.drag = None;
+        assert_eq!(app.tool, Tool::Checkbox);
+
+        let mut typing = "Hello".to_string();
+        let _ = ctx.run(screen_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.text_edit_singleline(&mut typing).request_focus();
+            });
+        });
+        let mut input = screen_input();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::H,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.text_edit_singleline(&mut typing);
+            });
+            assert!(ctx.wants_keyboard_input());
+            assert!(!space_pans(ctx));
+            app.handle_shortcuts(ctx);
+        });
+        assert_eq!(app.tool, Tool::Checkbox);
+        let view = panel(&ctx, &mut app, |app, ui| app.view_menu(ui));
+        let texts = galley_texts(&view);
+        assert!(texts.iter().any(|text| text == "Hand"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "H"), "{texts:?}");
+    }
+
+    #[test]
     fn a_selected_checkbox_copies_and_pastes_from_the_keys() {
         let ctx = egui::Context::default();
         let mut app = PageFormApp::new(false, None);
@@ -5269,6 +5445,35 @@ mod tests {
     }
 
     #[test]
+    fn properties_sidebar_uses_the_item_title_and_hides_calculations_for_static_text() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let blank = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        let texts = galley_texts(&blank);
+        assert!(texts.iter().any(|text| text == "Properties"), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .all(|text| !text.contains("Pinned. Stays") && !text.contains("Unpinned. Closes")),
+            "{texts:?}"
+        );
+        app.insert_at_view(FieldKind::StaticText);
+        let output = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        let texts = galley_texts(&output);
+        assert!(texts.iter().any(|text| text == "Static Text"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Position"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "X"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Y"), "{texts:?}");
+        assert!(texts.iter().all(|text| text != "Calculations"), "{texts:?}");
+        app.insert_at_view(FieldKind::Text);
+        let output = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        let texts = galley_texts(&output);
+        assert!(texts.iter().any(|text| text == "Text Field"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Calculations"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Font"), "{texts:?}");
+    }
+
+    #[test]
     fn properties_panel_starts_hidden_and_unpinned_closes_with_the_selection() {
         let mut app = PageFormApp::new(false, None);
         assert!(!app.properties_open);
@@ -5286,7 +5491,9 @@ mod tests {
         app.open_properties();
         assert!(app.properties_open);
         assert!(app.persist_panel);
+        app.set_properties_open(false);
         app.insert_at_view(FieldKind::Text);
+        assert!(app.properties_open, "adding an item opens properties");
         app.dismiss_unpinned();
         assert!(!app.properties_open);
         app.open_properties();
@@ -5317,6 +5524,8 @@ mod tests {
         let mut app = PageFormApp::new(false, None);
         app.insert_at_view(FieldKind::StaticText);
         let id = app.primary().unwrap();
+        assert!(app.properties_open);
+        app.set_properties_open(false);
         assert!(app.begin_inline(id));
         assert!(app.status.starts_with("Editing text."));
         assert!(!app.properties_open);
