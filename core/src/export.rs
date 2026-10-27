@@ -937,17 +937,27 @@ fn page_content(doc: &Document) -> (Vec<u8>, Vec<FontFamily>) {
     for field in doc.fields() {
         let style = field.style();
         match field.kind() {
-            FieldKind::StaticText if !field.caption().is_empty() => {
-                paint_page_text(
-                    &mut content,
-                    field.rect(),
-                    field.caption(),
-                    style,
-                    false,
-                    &mut fonts,
-                );
+            FieldKind::StaticText => {
+                let rect = field.rect();
+                if let Some(fill) = style.fill {
+                    content.save_state();
+                    set_fill(&mut content, fill);
+                    content.rect(rect.x, rect.y, rect.w, rect.h);
+                    content.fill_nonzero();
+                    content.restore_state();
+                }
+                if !field.caption().is_empty() {
+                    paint_page_text(
+                        &mut content,
+                        rect,
+                        field.caption(),
+                        style,
+                        false,
+                        &mut fonts,
+                    );
+                }
                 if style.border_width > 0.05 {
-                    stroke_page_box(&mut content, field.rect(), style, true);
+                    stroke_page_box(&mut content, rect, style, true);
                 }
             }
             FieldKind::Table => stroke_table(&mut content, field.rect(), style),

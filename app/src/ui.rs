@@ -177,6 +177,46 @@ struct FilePrompt {
     save_as_template: bool,
 }
 
+/// Open and closed properties sections for the item currently shown.
+///
+/// A different item starts from the defaults. The ids stay on that item so a
+/// click can open Position and the choice does not leak onto another item.
+#[derive(Clone, Copy)]
+struct SectionFolds {
+    item: Option<FieldId>,
+    position: bool,
+    text: bool,
+    font: bool,
+    border: bool,
+    calculations: bool,
+}
+
+impl SectionFolds {
+    fn initial() -> Self {
+        Self {
+            item: None,
+            position: true,
+            text: true,
+            font: true,
+            border: false,
+            calculations: false,
+        }
+    }
+
+    fn for_item(&mut self, id: FieldId) {
+        if self.item != Some(id) {
+            *self = Self {
+                item: Some(id),
+                position: true,
+                text: true,
+                font: true,
+                border: false,
+                calculations: false,
+            };
+        }
+    }
+}
+
 struct PageFormApp {
     doc: Document,
     tool: Tool,
@@ -226,6 +266,7 @@ struct PageFormApp {
     persist_theme: bool,
     properties_open: bool,
     properties_pinned: bool,
+    section_folds: SectionFolds,
     persist_panel: bool,
     context_field: Option<FieldId>,
     /// PDF point under the last right-click, for Paste on the canvas.
@@ -310,6 +351,7 @@ impl PageFormApp {
             persist_theme: false,
             properties_open: crate::prefs::is_open(open.as_deref()),
             properties_pinned: crate::prefs::is_pinned(pinned.as_deref()),
+            section_folds: SectionFolds::initial(),
             persist_panel: false,
             context_field: None,
             context_at: None,
@@ -480,7 +522,8 @@ impl PageFormApp {
                 w = side;
                 h = side;
             }
-            place_default(start, w, h, self.snap_grid(), &page)
+            // The drop point is the top-left. Snap happens after the rect exists.
+            place_default(current, w, h, self.snap_grid(), &page)
         } else if square {
             square_from_drag(start, current, self.snap_grid(), self.min_size(), &page)
         } else {
@@ -1642,6 +1685,8 @@ impl PageFormApp {
 
     fn view_menu(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(200.0);
+        // The first row otherwise sits on the popup's top edge.
+        ui.add_space(8.0);
         if menu_command(ui, "Hand", Some("H"), self.tool == Tool::Hand) {
             self.tool = Tool::Hand;
         }
@@ -2018,6 +2063,9 @@ impl PageFormApp {
     }
 
     fn finish_marquee(&mut self, start: PdfPoint, current: PdfPoint, extend: bool) {
+        if self.suppress_place_click {
+            return;
+        }
         if is_click(&self.view, start, current) {
             if !extend {
                 self.selection.clear();
@@ -2233,7 +2281,13 @@ impl PageFormApp {
 
         if middle_pressed && response.hovered() {
             self.drag = Some(Drag::Pan);
-        } else if primary_pressed && response.hovered() && !ignore_primary {
+        } else if primary_pressed
+            && response.hovered()
+            && response.contains_pointer()
+            && !ignore_primary
+        {
+            // A menu floating over the canvas does not hover it, so that click
+            // cannot start a marquee and clear the item just inserted.
             self.begin_canvas_press(ctx, space);
         }
 
@@ -2261,24 +2315,35 @@ impl PageFormApp {
         }
 
         if primary_released && !ignore_primary {
+            let mut placed = false;
             if let Some(Drag::Place { start, kind }) = self.drag.clone() {
                 if let Some(current) = self.pointer_pdf(ctx) {
-                    let id = self.finish_place(start, current, kind);
-                    self.selection = vec![id];
-                    self.tool = Tool::Select;
-                    self.open_properties();
-                    self.status = format!("Placed {}", kind.label());
+                    self.commit_place(start, current, kind);
+                    placed = true;
                 }
             }
-            if let Some(Drag::Marquee { start, extend }) = self.drag.clone() {
-                if let Some(current) = self.pointer_pdf(ctx) {
-                    self.finish_marquee(start, current, extend);
+            if !placed {
+                if let Some(Drag::Marquee { start, extend }) = self.drag.clone() {
+                    if let Some(current) = self.pointer_pdf(ctx) {
+                        self.finish_marquee(start, current, extend);
+                    }
                 }
             }
             if !ctx.input(|input| input.pointer.button_down(PointerButton::Middle)) {
                 self.drag = None;
             }
         }
+    }
+
+    /// Drop the gesture on the page, select that item, and open its properties.
+    fn commit_place(&mut self, start: PdfPoint, current: PdfPoint, kind: FieldKind) {
+        let id = self.finish_place(start, current, kind);
+        self.selection = vec![id];
+        self.tool = Tool::Select;
+        self.drag = None;
+        self.suppress_place_click = true;
+        self.open_properties();
+        self.status = format!("Placed {}", kind.label());
     }
 
     fn begin_canvas_press(&mut self, ctx: &egui::Context, space: bool) {
@@ -2772,9 +2837,7 @@ impl PageFormApp {
         }
 
         if let Some(fill) = style.fill {
-            if kind != FieldKind::StaticText {
-                painter.rect_filled(screen, 0.0, canvas_fill(fill, colors));
-            }
+            painter.rect_filled(screen, 0.0, canvas_fill(fill, colors));
         }
         let outline_pt = if matches!(
             kind,
@@ -2811,6 +2874,17 @@ impl PageFormApp {
                 shape_stroke_px(outline_pt, zoom, stand_in),
                 outline_color,
                 style.border_style,
+            );
+        }
+        if kind == FieldKind::StaticText
+            && static_text_needs_placeholder(outline_pt, style.border_color, style.fill)
+        {
+            paint_outline(
+                painter,
+                screen,
+                1.25_f32,
+                colors.shape_stroke,
+                BorderStyleKind::Solid,
             );
         }
 
@@ -3875,14 +3949,12 @@ fn square_from_drag(
     min: f32,
     page: &pageform_core::Page,
 ) -> pageform_core::RectPt {
-    let start = snap_point(start, grid);
-    let end = snap_point(end, grid);
     let dx = end.x - start.x;
     let dy = end.y - start.y;
     let side = dx.abs().max(dy.abs()).max(min.max(1.0));
     let ex = start.x + if dx < 0.0 { -side } else { side };
     let ey = start.y + if dy < 0.0 { -side } else { side };
-    rect_from_drag(start, PdfPoint { x: ex, y: ey }, None, min, page)
+    rect_from_drag(start, PdfPoint { x: ex, y: ey }, grid, min, page)
 }
 
 fn rects_overlap(a: RectPt, b: RectPt) -> bool {
@@ -4133,6 +4205,19 @@ fn canvas_fill(color: Rgb, colors: &crate::theme::CanvasColors) -> egui::Color32
     } else {
         rgb32(color)
     }
+}
+
+/// A filled static label with no real border, or a light border on a light
+/// fill, would vanish into the page. The canvas draws a stand-in stroke.
+fn static_text_needs_placeholder(border_width: f32, border: Rgb, fill: Option<Rgb>) -> bool {
+    let Some(fill) = fill else {
+        return false;
+    };
+    if border_width <= 0.05 {
+        return true;
+    }
+    let light = |color: Rgb| color.r + color.g + color.b > 2.4;
+    light(border) && light(fill)
 }
 
 fn canvas_text_color(
@@ -5471,6 +5556,186 @@ mod tests {
         assert!(texts.iter().any(|text| text == "Text Field"), "{texts:?}");
         assert!(texts.iter().any(|text| text == "Calculations"), "{texts:?}");
         assert!(texts.iter().any(|text| text == "Font"), "{texts:?}");
+    }
+
+    #[test]
+    fn every_inserted_and_dropped_item_stays_selected() {
+        let ctx = egui::Context::default();
+        for kind in FieldKind::INSERT {
+            let mut app = PageFormApp::new(false, None);
+            app.insert_at_view(kind);
+            let id = app.primary().expect("insert selects");
+            assert_eq!(app.doc.field(id).map(|field| field.kind()), Some(kind));
+            let output = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+            let texts = galley_texts(&output);
+            let title = if kind == FieldKind::StaticText {
+                "Static Text"
+            } else {
+                kind.label()
+            };
+            assert!(
+                texts.iter().any(|text| text == title),
+                "{kind:?} panel was {texts:?}"
+            );
+            assert!(
+                texts.iter().all(|text| text != "Nothing selected"),
+                "{kind:?} panel was {texts:?}"
+            );
+
+            app.drag = Some(Drag::Marquee {
+                start: PdfPoint { x: 10.0, y: 10.0 },
+                extend: false,
+            });
+            app.finish_marquee(
+                PdfPoint { x: 10.0, y: 10.0 },
+                PdfPoint { x: 12.0, y: 11.0 },
+                false,
+            );
+            assert_eq!(
+                app.primary(),
+                Some(id),
+                "{kind:?} insert click must not clear the selection"
+            );
+
+            app.commit_place(
+                PdfPoint { x: 90.0, y: 240.0 },
+                PdfPoint { x: 90.0, y: 240.0 },
+                kind,
+            );
+            let dropped = app.primary().expect("drop selects");
+            assert_ne!(dropped, id);
+            assert_eq!(app.doc.field(dropped).map(|field| field.kind()), Some(kind));
+            assert!(app.properties_open);
+            let output = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+            let texts = galley_texts(&output);
+            assert!(
+                texts.iter().any(|text| text == title),
+                "{kind:?} drop panel was {texts:?}"
+            );
+            assert!(texts.iter().all(|text| text != "Nothing selected"));
+        }
+    }
+
+    #[test]
+    fn a_click_uses_the_drop_point_and_then_snaps() {
+        let mut app = PageFormApp::new(false, None);
+        app.view.zoom = 1.0;
+        app.snap = false;
+        let drop = PdfPoint { x: 120.0, y: 500.0 };
+        let rect = app.place_rect(drop, drop, FieldKind::Text);
+        let (w, h) = default_size(FieldKind::Text, app.grid_size);
+        assert!((rect.x - drop.x).abs() < 0.1);
+        assert!((rect.top() - drop.y).abs() < 0.1);
+        assert!((rect.w - w).abs() < 0.1);
+        assert!((rect.h - h).abs() < 0.1);
+
+        let dragged = app.place_rect(
+            PdfPoint { x: 10.0, y: 100.0 },
+            PdfPoint { x: 50.0, y: 70.0 },
+            FieldKind::Text,
+        );
+        assert!((dragged.x - 10.0).abs() < 0.1);
+        assert!((dragged.y - 70.0).abs() < 0.1);
+        assert!((dragged.w - 40.0).abs() < 0.1);
+        assert!((dragged.h - 30.0).abs() < 0.1);
+
+        app.snap = true;
+        let step = app.grid_size.minor_pt();
+        let snapped = app.place_rect(drop, drop, FieldKind::Text);
+        assert!(on_step(snapped.x, step));
+        assert!(on_step(snapped.y, step));
+        assert!((snapped.w - w).abs() < 0.1);
+        assert!((snapped.h - h).abs() < 0.1);
+        let snapped_drag = app.place_rect(
+            PdfPoint { x: 10.0, y: 100.0 },
+            PdfPoint { x: 50.0, y: 70.0 },
+            FieldKind::Rectangle,
+        );
+        assert!((snapped_drag.x - 9.0).abs() < 0.1);
+        assert!((snapped_drag.y - 72.0).abs() < 0.1);
+        assert!((snapped_drag.w - 40.0).abs() < 0.1);
+        assert!((snapped_drag.h - 30.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn white_static_text_keeps_a_canvas_placeholder() {
+        assert!(static_text_needs_placeholder(
+            0.0,
+            Rgb::BLACK,
+            Some(Rgb::WHITE)
+        ));
+        assert!(static_text_needs_placeholder(
+            1.0,
+            Rgb::WHITE,
+            Some(Rgb::WHITE)
+        ));
+        assert!(!static_text_needs_placeholder(
+            1.0,
+            Rgb::BLACK,
+            Some(Rgb::WHITE)
+        ));
+        assert!(!static_text_needs_placeholder(0.0, Rgb::BLACK, None));
+    }
+
+    #[test]
+    fn section_state_is_per_item_and_position_toggles() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let output = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        assert!(galley_texts(&output).iter().any(|text| text == "W"));
+        click_header(&ctx, &mut app, "Position");
+        let collapsed = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        assert!(
+            galley_texts(&collapsed).iter().all(|text| text != "W"),
+            "Position click should collapse, got {:?}",
+            galley_texts(&collapsed)
+        );
+        click_header(&ctx, &mut app, "Position");
+        let expanded = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        assert!(
+            galley_texts(&expanded).iter().any(|text| text == "W"),
+            "Position click should expand, got {:?}",
+            galley_texts(&expanded)
+        );
+
+        click_header(&ctx, &mut app, "Position");
+        let _ = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        app.insert_at_view(FieldKind::Date);
+        let date = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        let texts = galley_texts(&date);
+        assert!(
+            texts.iter().any(|text| text == "W"),
+            "a different item starts with Position open: {texts:?}"
+        );
+        assert!(texts.iter().any(|text| text == "Format"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Max chars"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "YYYY-MM-DD"), "{texts:?}");
+        assert!(
+            texts.iter().all(|text| text != "No character limit"),
+            "{texts:?}"
+        );
+
+        click_header(&ctx, &mut app, "Border");
+        let border = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        let texts = galley_texts(&border);
+        assert!(
+            texts
+                .iter()
+                .filter(|text| text.as_str() == "Border")
+                .count()
+                >= 2,
+            "border row needs its own label: {texts:?}"
+        );
+        assert!(texts.iter().any(|text| text == "Fill"), "{texts:?}");
+    }
+
+    fn click_header(ctx: &egui::Context, app: &mut PageFormApp, label: &str) {
+        let output = panel(ctx, app, |app, ui| app.properties_panel(ui));
+        let at = text_center(&output, label).unwrap_or_else(|| panic!("missing {label}"));
+        click_at(ctx, app, at, |app, ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.properties_panel(ui));
+        });
     }
 
     #[test]

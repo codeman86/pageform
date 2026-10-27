@@ -764,6 +764,45 @@ fn inline_text_edits_export_as_page_content_or_field_value() {
 }
 
 #[test]
+fn static_text_fill_is_painted_under_the_caption() {
+    let mut doc = Form::letter();
+    let id = doc.add_field(
+        FieldKind::StaticText,
+        RectPt {
+            x: 72.0,
+            y: 700.0,
+            w: 180.0,
+            h: 18.0,
+        },
+    );
+    doc.set_caption(id, "WhiteLabel").unwrap();
+    doc.update_style(id, |style| {
+        style.fill = Some(Rgb::WHITE);
+        style.border_width = 1.0;
+    });
+    let bytes = export_pdf(&doc).unwrap();
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let page_dict = page(&pdf, catalog(&pdf));
+    let contents = stream_plain(&pdf, deref(&pdf, page_dict.get(b"Contents").unwrap()));
+    let page_text = String::from_utf8_lossy(&contents);
+    let fill_at = page_text
+        .find("1 g")
+        .unwrap_or_else(|| panic!("missing white fill: {page_text}"));
+    let text_at = page_text
+        .find("WhiteLabel")
+        .unwrap_or_else(|| panic!("missing caption: {page_text}"));
+    assert!(
+        fill_at < text_at,
+        "fill must be under the caption: {page_text}"
+    );
+    let after = &page_text[text_at..];
+    assert!(
+        after.contains('S'),
+        "border is stroked after the caption: {page_text}"
+    );
+}
+
+#[test]
 fn text1_exports_an_empty_value_and_a_normal_appearance() {
     let mut doc = Form::letter();
     let id = doc.add_field(

@@ -175,15 +175,28 @@ impl PageFormApp {
         let rect = field.rect();
         let style = field.style().clone();
         let line = field.line_ends();
+        self.section_folds.for_item(id);
+        let mut open_position = self.section_folds.position;
+        let mut open_text = self.section_folds.text;
+        let mut open_font = self.section_folds.font;
+        let mut open_border = self.section_folds.border;
+        let mut open_calculations = self.section_folds.calculations;
+        let salt = id.0;
 
-        collapsing(ui, "Position", true, |ui| {
-            self.position_grid(ui, id, rect);
-            if let Some((start, end)) = line {
-                self.line_end_grid(ui, id, start, end);
-            }
-        });
+        collapsing(
+            ui,
+            "Position",
+            &mut open_position,
+            ("position", salt),
+            |ui| {
+                self.position_grid(ui, id, rect);
+                if let Some((start, end)) = line {
+                    self.line_end_grid(ui, id, start, end);
+                }
+            },
+        );
 
-        collapsing(ui, "Text", true, |ui| {
+        collapsing(ui, "Text", &mut open_text, ("text", salt), |ui| {
             if kind.is_form_field() {
                 self.identity_section(ui, id, kind);
             } else if matches!(
@@ -196,11 +209,11 @@ impl PageFormApp {
         });
 
         if draws_text(kind) {
-            collapsing(ui, "Font", true, |ui| {
+            collapsing(ui, "Font", &mut open_font, ("font", salt), |ui| {
                 self.font_section(ui, id, &style);
             });
         }
-        collapsing(ui, "Border", false, |ui| {
+        collapsing(ui, "Border", &mut open_border, ("border", salt), |ui| {
             if matches!(
                 kind,
                 FieldKind::Line | FieldKind::Rectangle | FieldKind::Image | FieldKind::Table
@@ -211,10 +224,21 @@ impl PageFormApp {
             }
         });
         if kind.is_form_field() {
-            collapsing(ui, "Calculations", false, |ui| {
-                self.calculations_section(ui);
-            });
+            collapsing(
+                ui,
+                "Calculations",
+                &mut open_calculations,
+                ("calculations", salt),
+                |ui| {
+                    self.calculations_section(ui);
+                },
+            );
         }
+        self.section_folds.position = open_position;
+        self.section_folds.text = open_text;
+        self.section_folds.font = open_font;
+        self.section_folds.border = open_border;
+        self.section_folds.calculations = open_calculations;
     }
 
     fn position_grid(&mut self, ui: &mut egui::Ui, id: FieldId, rect: pageform_core::RectPt) {
@@ -397,18 +421,20 @@ impl PageFormApp {
                 }
             }
             FieldKind::Date => {
-                ui.label("Format").on_hover_text(
-                    "Not a calendar popup. The format is the empty-field hint and /TU when tooltip is blank.",
-                );
                 let mut format = style.date_format.clone();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut format).desired_width(f32::INFINITY))
-                    .changed()
-                {
+                if labeled_edit_tip(
+                    ui,
+                    "Format",
+                    &mut format,
+                    "",
+                    Some(
+                        "Not a calendar popup. The format is the empty-field hint and /TU when tooltip is blank.",
+                    ),
+                ) {
                     self.doc
                         .update_style(id, |style| style.date_format = format);
                 }
-                self.max_chars_row(ui, id, style.max_chars);
+                self.max_chars_grid(ui, id, style.max_chars);
             }
             FieldKind::Text => {
                 self.max_chars_row(ui, id, style.max_chars);
@@ -465,6 +491,7 @@ impl PageFormApp {
         style: &pageform_core::FieldStyle,
     ) {
         ui.horizontal(|ui| {
+            field_label(ui, "Border");
             if let Some(width) = drag_num(ui, style.border_width, 0.0..=24.0) {
                 self.doc
                     .update_style(id, |style| style.border_width = width);
@@ -485,6 +512,7 @@ impl PageFormApp {
         style: &pageform_core::FieldStyle,
     ) {
         ui.horizontal(|ui| {
+            field_label(ui, "Border");
             if let Some(width) = drag_num(ui, style.stroke_width, 0.0..=24.0) {
                 self.doc
                     .update_style(id, |style| style.stroke_width = width);
@@ -522,7 +550,7 @@ impl PageFormApp {
 
     fn fill_row(&mut self, ui: &mut egui::Ui, id: FieldId, fill: Option<Rgb>) {
         ui.horizontal(|ui| {
-            ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new("Fill"));
+            field_label(ui, "Fill");
             let mut enabled = fill.is_some();
             if ui.checkbox(&mut enabled, "").changed() {
                 self.doc.update_style(id, |style| {
@@ -614,6 +642,25 @@ impl PageFormApp {
                     .map(|err| err.to_string());
                 let text = self.caption_buf.clone();
                 self.note_sidebar_text(id, super::InlineTarget::Caption, &text);
+            }
+        });
+    }
+
+    fn max_chars_grid(&mut self, ui: &mut egui::Ui, id: FieldId, current: Option<i32>) {
+        ui.horizontal(|ui| {
+            field_label(ui, "Max chars");
+            let mut unlimited = current.is_none();
+            if ui.checkbox(&mut unlimited, "No limit").changed() {
+                self.doc.update_style(id, |style| {
+                    style.max_chars = if unlimited { None } else { Some(20) };
+                });
+            }
+            if let Some(max) = current {
+                if let Some(value) = drag_num(ui, max as f32, 1.0..=5000.0) {
+                    let max = value.round() as i32;
+                    self.doc
+                        .update_style(id, |style| style.max_chars = Some(max));
+                }
             }
         });
     }
@@ -759,8 +806,21 @@ fn drag_num(ui: &mut egui::Ui, value: f32, range: std::ops::RangeInclusive<f32>)
 }
 
 fn labeled_edit(ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str) -> bool {
+    labeled_edit_tip(ui, label, text, hint, None)
+}
+
+fn labeled_edit_tip(
+    ui: &mut egui::Ui,
+    label: &str,
+    text: &mut String,
+    hint: &str,
+    tip: Option<&str>,
+) -> bool {
     ui.horizontal(|ui| {
-        ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new(label));
+        let label = field_label(ui, label);
+        if let Some(tip) = tip {
+            label.on_hover_text(tip);
+        }
         let width = ui.available_width();
         ui.add(
             egui::TextEdit::singleline(text)
@@ -807,11 +867,26 @@ fn labeled_drag_value(
     changed
 }
 
-fn collapsing(ui: &mut egui::Ui, title: &str, open: bool, body: impl FnOnce(&mut egui::Ui)) {
-    egui::CollapsingHeader::new(title)
-        .default_open(open)
-        .id_salt(title)
+fn collapsing(
+    ui: &mut egui::Ui,
+    title: &str,
+    open: &mut bool,
+    salt: impl std::hash::Hash,
+    body: impl FnOnce(&mut egui::Ui),
+) {
+    // `.open(Some)` is the displayed state. egui does not toggle that itself,
+    // so the click has to flip `open` or Position stays stuck.
+    let response = egui::CollapsingHeader::new(title)
+        .open(Some(*open))
+        .id_salt(salt)
         .show(ui, body);
+    if response.header_response.clicked() {
+        *open = !*open;
+    }
+}
+
+fn field_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new(label))
 }
 
 fn sidebar_kind_title(kind: FieldKind) -> &'static str {

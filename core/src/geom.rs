@@ -298,8 +298,6 @@ pub fn rect_from_drag(
     min: f32,
     page: &Page,
 ) -> RectPt {
-    let start = snap_point(start, grid);
-    let end = snap_point(end, grid);
     let min = min.max(1.0);
     let left = start.x.min(end.x);
     let mut right = start.x.max(end.x);
@@ -311,26 +309,48 @@ pub fn rect_from_drag(
     if top - bottom < min {
         top = bottom + min;
     }
-    clamp_rect(
+    snap_rect_origin(
         RectPt {
             x: left,
             y: bottom,
             w: right - left,
             h: top - bottom,
         },
+        grid,
         page,
     )
 }
 
 /// `anchor` is the visual top-left of the new field (PDF x, PDF top edge).
+/// The rectangle is built at that point, then its origin is snapped.
 pub fn place_default(anchor: PdfPoint, w: f32, h: f32, grid: Option<f32>, page: &Page) -> RectPt {
-    let anchor = snap_point(anchor, grid);
-    clamp_rect(
+    snap_rect_origin(
         RectPt {
             x: anchor.x,
             y: anchor.y - h,
             w,
             h,
+        },
+        grid,
+        page,
+    )
+}
+
+/// Move the bottom-left onto the grid. Width and height stay as dropped.
+fn snap_rect_origin(rect: RectPt, grid: Option<f32>, page: &Page) -> RectPt {
+    let origin = snap_point(
+        PdfPoint {
+            x: rect.x,
+            y: rect.y,
+        },
+        grid,
+    );
+    clamp_rect(
+        RectPt {
+            x: origin.x,
+            y: origin.y,
+            w: rect.w,
+            h: rect.h,
         },
         page,
     )
@@ -669,5 +689,31 @@ mod tests {
         close(rect.x, 9.0);
         close(rect.top(), 702.0);
         close(rect.h, 36.0);
+    }
+
+    #[test]
+    fn placement_uses_the_drop_rect_and_then_snaps_the_origin() {
+        let page = Page::letter();
+        let grid = Some(9.0_f32);
+        let clicked = place_default(PdfPoint { x: 10.0, y: 100.0 }, 30.0, 20.0, grid, &page);
+        // Built at the drop: bottom is 80. Snapping that origin does not
+        // snap the top first and then subtract the height.
+        close(clicked.x, 9.0);
+        close(clicked.y, 81.0);
+        close(clicked.w, 30.0);
+        close(clicked.h, 20.0);
+        close(clicked.top(), 101.0);
+
+        let dragged = rect_from_drag(
+            PdfPoint { x: 10.0, y: 100.0 },
+            PdfPoint { x: 50.0, y: 70.0 },
+            grid,
+            9.0,
+            &page,
+        );
+        close(dragged.x, 9.0);
+        close(dragged.y, 72.0);
+        close(dragged.w, 40.0);
+        close(dragged.h, 30.0);
     }
 }
