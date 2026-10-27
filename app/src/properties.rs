@@ -20,7 +20,9 @@ impl PageFormApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
+                // Lock the content to the panel. A wider row must not grow it.
+                let width = ui.available_width();
+                ui.set_width(width);
                 if self.selection.len() > 1 {
                     self.multi_properties(ui);
                 } else if self.primary().is_some() {
@@ -43,11 +45,13 @@ impl PageFormApp {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
+                let close = ui
                     .button("X")
-                    .on_hover_text("Close the properties panel")
-                    .clicked()
-                {
+                    .on_hover_text("Close the properties panel");
+                if super::menu_activated(&close) {
+                    // The same click must not reach the canvas and clear the selection.
+                    self.suppress_place_click = true;
+                    self.drag = None;
                     self.set_properties_open(false);
                 }
                 if pin_button(ui, self.properties_pinned)
@@ -490,19 +494,7 @@ impl PageFormApp {
         id: FieldId,
         style: &pageform_core::FieldStyle,
     ) {
-        ui.horizontal(|ui| {
-            field_label(ui, "Border");
-            if let Some(width) = drag_num(ui, style.border_width, 0.0..=24.0) {
-                self.doc
-                    .update_style(id, |style| style.border_width = width);
-            }
-            self.border_style_row(ui, id, style.border_style);
-            if let Some(color) = color_swatch(ui, style.border_color) {
-                self.doc
-                    .update_style(id, |style| style.border_color = color);
-            }
-        });
-        self.fill_row(ui, id, style.fill);
+        self.border_rows(ui, id, style, false, true);
     }
 
     fn stroke_section(
@@ -511,31 +503,153 @@ impl PageFormApp {
         id: FieldId,
         style: &pageform_core::FieldStyle,
     ) {
-        ui.horizontal(|ui| {
-            field_label(ui, "Border");
-            if let Some(width) = drag_num(ui, style.stroke_width, 0.0..=24.0) {
-                self.doc
-                    .update_style(id, |style| style.stroke_width = width);
-            }
-            self.border_style_row(ui, id, style.border_style);
-            if let Some(color) = color_swatch(ui, style.stroke_color) {
-                self.doc
-                    .update_style(id, |style| style.stroke_color = color);
-            }
-        });
-        if self
+        let show_fill = self
             .doc
             .field(id)
-            .is_some_and(|field| field.kind() != FieldKind::Line)
-        {
-            self.fill_row(ui, id, style.fill);
-        }
+            .is_some_and(|field| field.kind() != FieldKind::Line);
+        self.border_rows(ui, id, style, true, show_fill);
     }
 
-    fn border_style_row(&mut self, ui: &mut egui::Ui, id: FieldId, current: BorderStyleKind) {
+    /// Border and Fill share one grid: a right-aligned label, controls, and a
+    /// swatch in the same right-hand slot with padding before the panel edge.
+    fn border_rows(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: FieldId,
+        style: &pageform_core::FieldStyle,
+        stroke: bool,
+        show_fill: bool,
+    ) {
+        let row_w = (ui.available_width() - ROW_RIGHT_PAD).max(0.0);
+        ui.scope(|ui| {
+            ui.set_max_width(row_w);
+            self.border_line(ui, id, style, stroke, row_w);
+            if show_fill {
+                self.fill_line(ui, id, style.fill, row_w);
+            }
+        });
+    }
+
+    fn border_line(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: FieldId,
+        style: &pageform_core::FieldStyle,
+        stroke: bool,
+        row_w: f32,
+    ) {
+        ui.horizontal(|ui| {
+            ui.set_width(row_w);
+            field_label(ui, "Border");
+            let rest = ui.available_width();
+            let controls_w = (rest - SWATCH_SLOT).max(0.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(controls_w, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    // Keep the unused width so the swatch stays in the right slot.
+                    ui.set_min_width(controls_w);
+                    ui.set_max_width(controls_w);
+                    ui.scope(|ui| {
+                        ui.set_max_width(56.0);
+                        let value = if stroke {
+                            style.stroke_width
+                        } else {
+                            style.border_width
+                        };
+                        if let Some(next) = drag_num(ui, value, 0.0..=24.0) {
+                            self.doc.update_style(id, |style| {
+                                if stroke {
+                                    style.stroke_width = next;
+                                } else {
+                                    style.border_width = next;
+                                }
+                            });
+                        }
+                    });
+                    let combo_w = ui.available_width().clamp(48.0, 88.0);
+                    self.border_style_row(ui, id, style.border_style, combo_w);
+                },
+            );
+            self.swatch_slot(ui, stroke, id, style);
+        });
+    }
+
+    fn fill_line(&mut self, ui: &mut egui::Ui, id: FieldId, fill: Option<Rgb>, row_w: f32) {
+        ui.horizontal(|ui| {
+            ui.set_width(row_w);
+            field_label(ui, "Fill");
+            let rest = ui.available_width();
+            let controls_w = (rest - SWATCH_SLOT).max(0.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(controls_w, ui.spacing().interact_size.y),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_width(controls_w);
+                    ui.set_max_width(controls_w);
+                    let mut enabled = fill.is_some();
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        self.doc.update_style(id, |style| {
+                            style.fill = if enabled { Some(Rgb::WHITE) } else { None };
+                        });
+                    }
+                },
+            );
+            ui.allocate_ui_with_layout(
+                Vec2::new(SWATCH_SLOT, ui.spacing().interact_size.y),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    ui.set_min_width(SWATCH_SLOT);
+                    if let Some(color) = fill {
+                        if let Some(color) = color_swatch(ui, color) {
+                            self.doc.update_style(id, |style| style.fill = Some(color));
+                        }
+                    }
+                },
+            );
+        });
+    }
+
+    fn swatch_slot(
+        &mut self,
+        ui: &mut egui::Ui,
+        stroke: bool,
+        id: FieldId,
+        style: &pageform_core::FieldStyle,
+    ) {
+        let color = if stroke {
+            style.stroke_color
+        } else {
+            style.border_color
+        };
+        ui.allocate_ui_with_layout(
+            Vec2::new(SWATCH_SLOT, ui.spacing().interact_size.y),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.set_min_width(SWATCH_SLOT);
+                if let Some(color) = color_swatch(ui, color) {
+                    self.doc.update_style(id, |style| {
+                        if stroke {
+                            style.stroke_color = color;
+                        } else {
+                            style.border_color = color;
+                        }
+                    });
+                }
+            },
+        );
+    }
+
+    fn border_style_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: FieldId,
+        current: BorderStyleKind,
+        width: f32,
+    ) {
         let mut chosen = current;
         egui::ComboBox::from_id_salt(("border", id.0))
-            .width(96.0)
+            .width(width)
             .selected_text(chosen.label())
             .show_ui(ui, |ui| {
                 for style in BorderStyleKind::ALL {
@@ -546,23 +660,6 @@ impl PageFormApp {
             self.doc
                 .update_style(id, |style| style.border_style = chosen);
         }
-    }
-
-    fn fill_row(&mut self, ui: &mut egui::Ui, id: FieldId, fill: Option<Rgb>) {
-        ui.horizontal(|ui| {
-            field_label(ui, "Fill");
-            let mut enabled = fill.is_some();
-            if ui.checkbox(&mut enabled, "").changed() {
-                self.doc.update_style(id, |style| {
-                    style.fill = if enabled { Some(Rgb::WHITE) } else { None };
-                });
-            }
-            if let Some(color) = fill {
-                if let Some(color) = color_swatch(ui, color) {
-                    self.doc.update_style(id, |style| style.fill = Some(color));
-                }
-            }
-        });
     }
 
     fn calculations_section(&self, ui: &mut egui::Ui) {
@@ -630,7 +727,7 @@ impl PageFormApp {
 
     fn caption_edit(&mut self, ui: &mut egui::Ui, id: FieldId, label: &str) {
         ui.horizontal(|ui| {
-            ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new(label));
+            field_label(ui, label);
             let width = ui.available_width();
             let edit =
                 ui.add(egui::TextEdit::singleline(&mut self.caption_buf).desired_width(width));
@@ -697,7 +794,7 @@ impl PageFormApp {
 
     fn align_row(&mut self, ui: &mut egui::Ui, id: FieldId, current: TextAlign) {
         ui.horizontal(|ui| {
-            ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new("Align"));
+            field_label(ui, "Align");
             for align in TextAlign::ALL {
                 if align_icon(ui, align, current == align).clicked() && current != align {
                     self.doc.update_style(id, |style| style.align = align);
@@ -756,6 +853,10 @@ fn section(ui: &mut egui::Ui, title: &str) {
 }
 
 const LABEL_W: f32 = 72.0;
+/// Gap between the swatch and the panel's right edge.
+const ROW_RIGHT_PAD: f32 = 8.0;
+/// Shared right-hand slot so Border and Fill swatches share one x.
+const SWATCH_SLOT: f32 = 28.0;
 const POSITION_TIP: &str = "Points. Y is up from the bottom of the page.";
 
 fn drag_pt(
@@ -775,7 +876,7 @@ fn drag_pt_wheel(
     range: std::ops::RangeInclusive<f32>,
 ) -> Option<f32> {
     ui.horizontal(|ui| {
-        ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new(label));
+        field_label(ui, label);
         drag_num(ui, value, range)
     })
     .inner
@@ -856,7 +957,7 @@ fn labeled_drag_value(
 ) -> Option<f32> {
     let mut changed = None;
     ui.horizontal(|ui| {
-        let label = ui.add_sized(Vec2::new(22.0, 18.0), egui::Label::new(label));
+        let label = column_label(ui, label, 22.0);
         if let Some(tip) = tip {
             label.on_hover_text(tip);
         }
@@ -886,7 +987,21 @@ fn collapsing(
 }
 
 fn field_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add_sized(Vec2::new(LABEL_W, 18.0), egui::Label::new(label))
+    column_label(ui, label, LABEL_W)
+}
+
+/// Right-align the words in a fixed label column. `add_sized` centers them.
+fn column_label(ui: &mut egui::Ui, label: &str, width: f32) -> egui::Response {
+    let height = ui.spacing().interact_size.y.max(18.0);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().text_color();
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, color);
+    let pos = egui::Align2::RIGHT_CENTER
+        .align_size_within_rect(galley.size(), rect.shrink2(egui::vec2(1.0, 0.0)))
+        .min;
+    ui.painter().galley(pos, galley, color);
+    response
 }
 
 fn sidebar_kind_title(kind: FieldKind) -> &'static str {

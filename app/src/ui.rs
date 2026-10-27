@@ -266,6 +266,8 @@ struct PageFormApp {
     persist_theme: bool,
     properties_open: bool,
     properties_pinned: bool,
+    /// Screen rect of the properties panel this frame, when it is open.
+    properties_rect: Option<Rect>,
     section_folds: SectionFolds,
     persist_panel: bool,
     context_field: Option<FieldId>,
@@ -351,6 +353,7 @@ impl PageFormApp {
             persist_theme: false,
             properties_open: crate::prefs::is_open(open.as_deref()),
             properties_pinned: crate::prefs::is_pinned(pinned.as_deref()),
+            properties_rect: None,
             section_folds: SectionFolds::initial(),
             persist_panel: false,
             context_field: None,
@@ -1151,6 +1154,13 @@ impl PageFormApp {
         self.set_properties_open(true);
     }
 
+    fn pointer_over_properties(&self, ctx: &egui::Context) -> bool {
+        self.properties_rect.is_some_and(|rect| {
+            ctx.input(|input| input.pointer.latest_pos())
+                .is_some_and(|pos| rect.contains(pos))
+        })
+    }
+
     /// Start canvas editing for an item that shows text. Returns false for shapes and other items.
     fn begin_inline(&mut self, id: FieldId) -> bool {
         if self.inline.as_ref().is_some_and(|edit| edit.id == id) {
@@ -1321,7 +1331,7 @@ impl PageFormApp {
                         ui.menu_button("Open Recent", |ui| {
                             ui.set_min_width(280.0);
                             for path in self.recent.clone() {
-                                if recent_entry(ui, &path).clicked() {
+                                if menu_activated(&recent_entry(ui, &path)) {
                                     self.ask_or_run(PendingFileAction::OpenPath(path));
                                     ui.close();
                                 }
@@ -1356,7 +1366,7 @@ impl PageFormApp {
                         self.export_path
                     );
                     let export = ui.button(*label).on_hover_text(tip);
-                    if export.clicked() {
+                    if menu_activated(&export) {
                         self.export_current();
                         ui.close();
                     }
@@ -1435,7 +1445,7 @@ impl PageFormApp {
                         !self.selection.is_empty(),
                         egui::Button::new(*label).shortcut_text("Del"),
                     );
-                    if delete.clicked() {
+                    if menu_activated(&delete) {
                         self.delete_selection();
                         ui.close();
                     }
@@ -1444,7 +1454,7 @@ impl PageFormApp {
                     ui.menu_button("Align", |ui| self.align_menu(ui));
                 }
                 "Preferences" => {
-                    if ui.button(*label).clicked() {
+                    if menu_activated(&ui.button(*label)) {
                         self.show_preferences = true;
                         ui.close();
                     }
@@ -1459,13 +1469,13 @@ impl PageFormApp {
         for label in HELP_MENU {
             match *label {
                 "Help" => {
-                    if ui.button(*label).clicked() {
+                    if menu_activated(&ui.button(*label)) {
                         self.show_help = true;
                         ui.close();
                     }
                 }
                 "About" => {
-                    if ui.button(*label).clicked() {
+                    if menu_activated(&ui.button(*label)) {
                         self.show_about = true;
                         ui.close();
                     }
@@ -1495,7 +1505,7 @@ impl PageFormApp {
                 .add_enabled(align_ok, egui::Button::new(*label))
                 .on_hover_text(need)
                 .on_disabled_hover_text("Select two or more items.");
-            if response.clicked() {
+            if menu_activated(&response) {
                 let ids = self.selection.clone();
                 self.doc.align_fields(&ids, *edge);
                 self.status = format!("Aligned {label}");
@@ -1512,7 +1522,7 @@ impl PageFormApp {
             let response = ui
                 .add_enabled(distribute_ok, egui::Button::new(label))
                 .on_disabled_hover_text("Select three or more items.");
-            if response.clicked() {
+            if menu_activated(&response) {
                 let ids = self.selection.clone();
                 self.doc.distribute_fields(&ids, horizontal);
                 self.status = label.to_string();
@@ -1526,7 +1536,7 @@ impl PageFormApp {
             let response = ui
                 .add_enabled(align_ok, egui::Button::new(label))
                 .on_disabled_hover_text("Select two or more items.");
-            if response.clicked() {
+            if menu_activated(&response) {
                 let ids = self.selection.clone();
                 let reference = ids.len() - 1;
                 self.doc.match_field_size(&ids, reference, width, height);
@@ -1546,7 +1556,7 @@ impl PageFormApp {
                 if menu_command(ui, item, Some(&shortcut), false) {
                     self.request_new_blank();
                 }
-            } else if ui.button(*item).clicked() {
+            } else if menu_activated(&ui.button(*item)) {
                 if *item == "New from Template" {
                     self.ask_or_run(PendingFileAction::NewFromTemplate);
                 } else {
@@ -1564,7 +1574,7 @@ impl PageFormApp {
 
     fn stub_item(&mut self, ui: &mut egui::Ui, label: &str) {
         let button = ui.button(label).on_hover_text("Not implemented yet");
-        if button.clicked() {
+        if menu_activated(&button) {
             self.mark_not_implemented(label);
             ui.close();
         }
@@ -1578,7 +1588,7 @@ impl PageFormApp {
         ui.set_min_width(240.0);
         for kind in sorted_insert_kinds() {
             let button = ui.button(kind.label()).on_hover_text(insert_tip(kind));
-            if button.clicked() {
+            if menu_activated(&button) {
                 self.insert_at_view(kind);
                 ui.close();
             }
@@ -1692,36 +1702,33 @@ impl PageFormApp {
         }
         ui.separator();
         let mut open = self.properties_open;
-        if ui
-            .checkbox(&mut open, "Properties")
-            .on_hover_text("Show or hide the properties panel.")
-            .changed()
-        {
+        let properties = menu_checkbox(ui, &mut open, "Properties")
+            .on_hover_text("Show or hide the properties panel.");
+        if properties.changed() || open != self.properties_open {
             self.set_properties_open(open);
         }
         ui.separator();
-        ui.checkbox(&mut self.dots_visible, "Grid dots");
-        ui.checkbox(&mut self.guides_visible, "Guide lines");
-        ui.checkbox(&mut self.margins_visible, "Print-safe margin");
-        ui.checkbox(&mut self.header_visible, "Header")
+        menu_checkbox(ui, &mut self.dots_visible, "Grid dots");
+        menu_checkbox(ui, &mut self.guides_visible, "Guide lines");
+        menu_checkbox(ui, &mut self.margins_visible, "Print-safe margin");
+        menu_checkbox(ui, &mut self.header_visible, "Header")
             .on_hover_text("Header band on the canvas. Not written into the PDF.");
-        ui.checkbox(&mut self.footer_visible, "Footer")
+        menu_checkbox(ui, &mut self.footer_visible, "Footer")
             .on_hover_text("Footer band on the canvas. Not written into the PDF.");
-        ui.checkbox(&mut self.page_numbers_visible, "Page numbers")
-            .on_hover_text(
-                "Page number on the canvas. This page reads 1. Not written into the PDF.",
-            );
-        ui.checkbox(&mut self.snap, "Snap");
+        menu_checkbox(ui, &mut self.page_numbers_visible, "Page numbers").on_hover_text(
+            "Page number on the canvas. This page reads 1. Not written into the PDF.",
+        );
+        menu_checkbox(ui, &mut self.snap, "Snap");
         ui.separator();
         ui.label("Grid size");
         for size in GridSize::ALL {
-            ui.radio_value(&mut self.grid_size, size, size.label());
+            menu_radio_value(ui, &mut self.grid_size, size, size.label());
         }
         ui.separator();
         ui.label("Theme");
         let before = self.dark;
-        ui.radio_value(&mut self.dark, true, "Dark");
-        ui.radio_value(&mut self.dark, false, "Light");
+        menu_radio_value(ui, &mut self.dark, true, "Dark");
+        menu_radio_value(ui, &mut self.dark, false, "Light");
         if self.dark != before {
             self.persist_theme = true;
         }
@@ -1957,21 +1964,21 @@ impl PageFormApp {
         );
         egui::Popup::menu(&response).show(|ui| {
             ui.set_min_width(160.0);
-            if ui
+            let square = ui
                 .selectable_label(self.tool == Tool::Square, "Square")
-                .on_hover_text("Click to place a default square, or drag to size it. The sides stay equal.")
-                .clicked()
-            {
+                .on_hover_text(
+                    "Click to place a default square, or drag to size it. The sides stay equal.",
+                );
+            if menu_activated(&square) {
                 self.tool = Tool::Square;
                 ui.close();
             }
-            if ui
+            let rectangle = ui
                 .selectable_label(self.tool == Tool::Rectangle, "Rectangle")
                 .on_hover_text(
                     "Click to place a default rectangle, or drag to size it. Width and height are independent.",
-                )
-                .clicked()
-            {
+                );
+            if menu_activated(&rectangle) {
                 self.tool = Tool::Rectangle;
                 ui.close();
             }
@@ -1984,11 +1991,10 @@ impl PageFormApp {
         egui::Popup::menu(&response).show(|ui| {
             ui.set_min_width(140.0);
             for size in GridSize::ALL {
-                if ui
+                let choice = ui
                     .selectable_label(current == size, size.label())
-                    .on_hover_text(size.minor_label())
-                    .clicked()
-                {
+                    .on_hover_text(size.minor_label());
+                if menu_activated(&choice) {
                     self.grid_size = size;
                     ui.close();
                 }
@@ -2285,6 +2291,7 @@ impl PageFormApp {
             && response.hovered()
             && response.contains_pointer()
             && !ignore_primary
+            && !self.pointer_over_properties(ctx)
         {
             // A menu floating over the canvas does not hover it, so that click
             // cannot start a marquee and clear the item just inserted.
@@ -2613,7 +2620,7 @@ impl PageFormApp {
             self.clipboard_commands(ui, on_item);
             if on_item {
                 ui.separator();
-                if ui.button("Properties").clicked() {
+                if menu_activated(&ui.button("Properties")) {
                     self.open_properties();
                     ui.close();
                 }
@@ -2658,7 +2665,7 @@ impl PageFormApp {
                 !self.selection.is_empty(),
                 egui::Button::new("Delete").shortcut_text("Del"),
             );
-            if delete.clicked() {
+            if menu_activated(&delete) {
                 self.delete_selection();
                 ui.close();
             }
@@ -3236,6 +3243,13 @@ impl PageFormApp {
             }
             36 => {
                 grab("text-field.png");
+                if let Some(id) = self.primary() {
+                    self.section_folds.for_item(id);
+                    self.section_folds.border = true;
+                }
+            }
+            48 => {
+                grab("text-field-border.png");
                 std::process::exit(0);
             }
             _ => {}
@@ -3292,16 +3306,17 @@ impl eframe::App for PageFormApp {
                 ui.label("Scroll to zoom · middle-drag or Space-drag to pan");
             });
         });
+        self.properties_rect = None;
         if self.properties_open {
-            egui::SidePanel::right("properties")
-                .resizable(true)
-                .default_width(300.0)
-                .width_range(260.0..=460.0)
+            let panel = egui::SidePanel::right("properties")
+                .resizable(false)
+                .exact_width(PROPERTIES_WIDTH)
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
                     self.properties_panel(ui);
                     ui.add_space(8.0);
                 });
+            self.properties_rect = Some(panel.response.rect);
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             self.canvas(ui);
@@ -3424,6 +3439,8 @@ fn grid_lines(span: f32, step: f32) -> impl Iterator<Item = f32> {
 fn on_step(value: f32, step: f32) -> bool {
     ((value / step).round() * step - value).abs() < 0.05
 }
+
+const PROPERTIES_WIDTH: f32 = 300.0;
 
 const MENU_BAR: &[&str] = &["File", "Edit", "Insert", "View", "Help"];
 
@@ -3966,7 +3983,7 @@ fn menu_command(ui: &mut egui::Ui, label: &str, shortcut: Option<&str>, selected
     if let Some(shortcut) = shortcut {
         button = button.shortcut_text(shortcut);
     }
-    let clicked = ui.add(button).clicked();
+    let clicked = menu_activated(&ui.add(button));
     if clicked {
         ui.close();
     }
@@ -3983,11 +4000,55 @@ fn menu_command_enabled(
     if let Some(shortcut) = shortcut {
         button = button.shortcut_text(shortcut);
     }
-    let clicked = ui.add_enabled(enabled, button).clicked();
+    let clicked = menu_activated(&ui.add_enabled(enabled, button));
     if clicked {
         ui.close();
     }
     clicked
+}
+
+/// Menu rows are hit-tested against last frame's widgets, so a click on a row
+/// that has not been hovered yet is ignored. Accept that click when the press
+/// and the release are both on the row.
+fn menu_activated(response: &egui::Response) -> bool {
+    if response.clicked() {
+        return true;
+    }
+    if !response.enabled() {
+        return false;
+    }
+    response.ctx.input(|input| {
+        let pointer = &input.pointer;
+        // `press_origin` is cleared once the button is up, so a click is the
+        // release position. The menu-bar click that opens the menu is not on a row.
+        pointer.primary_clicked()
+            && pointer
+                .interact_pos()
+                .is_some_and(|pos| response.rect.contains(pos))
+    })
+}
+
+fn menu_checkbox(ui: &mut egui::Ui, value: &mut bool, label: &str) -> egui::Response {
+    let before = *value;
+    let response = ui.checkbox(value, label);
+    if menu_activated(&response) && *value == before {
+        *value = !before;
+    }
+    response
+}
+
+fn menu_radio_value<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    current: &mut T,
+    value: T,
+    label: &str,
+) -> egui::Response {
+    let before = *current;
+    let response = ui.radio_value(current, value, label);
+    if menu_activated(&response) && *current == before && before != value {
+        *current = value;
+    }
+    response
 }
 
 fn insert_tip(kind: FieldKind) -> &'static str {
@@ -5728,6 +5789,191 @@ mod tests {
             "border row needs its own label: {texts:?}"
         );
         assert!(texts.iter().any(|text| text == "Fill"), "{texts:?}");
+    }
+
+    #[test]
+    fn border_and_fill_labels_share_the_label_column() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.section_folds.for_item(id);
+        app.section_folds.border = true;
+        let output = panel(&ctx, &mut app, |app, ui| app.properties_panel(ui));
+        let boxes = text_boxes(&output);
+        let right = |label: &str| {
+            boxes
+                .iter()
+                .filter(|(text, _)| text == label)
+                .map(|(_, rect)| rect.right())
+                .fold(f32::MIN, f32::max)
+        };
+        let name = right("Name");
+        let fill = right("Fill");
+        assert!(
+            (name - fill).abs() < 2.0,
+            "label right edges name {name} fill {fill}"
+        );
+        assert!(
+            boxes
+                .iter()
+                .any(|(text, rect)| { text == "Border" && (rect.right() - name).abs() < 2.0 }),
+            "Border row label should share Name's right edge {name}: {boxes:?}"
+        );
+    }
+
+    #[test]
+    fn opening_border_does_not_change_the_canvas_width() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        app.properties_open = true;
+        let _ = show_properties_chrome(&ctx, &mut app);
+        let collapsed = show_properties_chrome(&ctx, &mut app);
+        let collapsed_width = app.canvas_rect.unwrap().width();
+        app.section_folds.border = true;
+        let _ = show_properties_chrome(&ctx, &mut app);
+        let open_width = app.canvas_rect.unwrap().width();
+        assert!(
+            (collapsed_width - open_width).abs() < 0.5,
+            "canvas {collapsed_width} vs {open_width}"
+        );
+        let _ = collapsed;
+    }
+
+    #[test]
+    fn the_panel_close_button_does_not_deselect() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        app.insert_at_view(FieldKind::Text);
+        let id = app.primary().unwrap();
+        app.properties_open = true;
+        let _ = show_properties_chrome(&ctx, &mut app);
+        let output = show_properties_chrome(&ctx, &mut app);
+        let at = text_center(&output, "X").expect("close button");
+        click_chrome(&ctx, &mut app, at);
+        assert!(!app.properties_open, "X closes the panel");
+        assert_eq!(app.primary(), Some(id), "X must not clear the selection");
+    }
+
+    #[test]
+    fn a_new_menu_row_accepts_the_first_click() {
+        let ctx = egui::Context::default();
+        let mut app = PageFormApp::new(false, None);
+        let _ = run_ui(&ctx, &mut app, screen_input(), |_, ctx| {
+            egui::CentralPanel::default().show(ctx, |_| {});
+        });
+        let rect = Rect::from_min_size(Pos2::new(40.0, 80.0), Vec2::new(180.0, 28.0));
+        let mut raw = screen_input();
+        let pos = rect.center();
+        raw.events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let mut activated = false;
+        let mut egui_clicked = false;
+        let _ = run_ui(&ctx, &mut app, raw, |_, ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let response = ui.put(rect, egui::Button::new("Text Field"));
+                egui_clicked = response.clicked();
+                activated = menu_activated(&response);
+            });
+        });
+        assert!(
+            activated,
+            "first click on a new row should count (egui clicked={egui_clicked})"
+        );
+    }
+
+    fn show_properties_chrome(ctx: &egui::Context, app: &mut PageFormApp) -> egui::FullOutput {
+        run_ui(ctx, app, screen_input(), |app, ctx| {
+            app.properties_rect = None;
+            if app.properties_open {
+                let panel = egui::SidePanel::right("properties")
+                    .resizable(false)
+                    .exact_width(PROPERTIES_WIDTH)
+                    .show(ctx, |ui| {
+                        app.properties_panel(ui);
+                    });
+                app.properties_rect = Some(panel.response.rect);
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.canvas(ui);
+            });
+        })
+    }
+
+    fn click_chrome(ctx: &egui::Context, app: &mut PageFormApp, pos: Pos2) {
+        let mut raw = screen_input();
+        raw.events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ];
+        let _ = run_ui(ctx, app, raw, |app, ctx| {
+            app.properties_rect = None;
+            if app.properties_open {
+                let panel = egui::SidePanel::right("properties")
+                    .resizable(false)
+                    .exact_width(PROPERTIES_WIDTH)
+                    .show(ctx, |ui| {
+                        app.properties_panel(ui);
+                    });
+                app.properties_rect = Some(panel.response.rect);
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.canvas(ui);
+            });
+        });
+    }
+
+    fn text_boxes(output: &egui::FullOutput) -> Vec<(String, Rect)> {
+        let mut boxes = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_boxes(&clipped.shape, &mut boxes);
+        }
+        boxes
+    }
+
+    fn collect_text_boxes(shape: &egui::epaint::Shape, boxes: &mut Vec<(String, Rect)>) {
+        match shape {
+            egui::epaint::Shape::Text(text) => {
+                let value = text.galley.text().trim();
+                if !value.is_empty() {
+                    boxes.push((
+                        value.to_string(),
+                        Rect::from_min_size(text.pos, text.galley.size()),
+                    ));
+                }
+            }
+            egui::epaint::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text_boxes(shape, boxes);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn click_header(ctx: &egui::Context, app: &mut PageFormApp, label: &str) {
