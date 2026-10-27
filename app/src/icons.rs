@@ -57,6 +57,7 @@ pub enum Icon {
     Save,
     Print,
     Select,
+    Hand,
     InsertPage,
     Checkbox,
     Date,
@@ -78,15 +79,17 @@ pub enum Icon {
     Snap,
     Moon,
     Sun,
+    Properties,
 }
 
 impl Icon {
-    const ALL: [Icon; 26] = [
+    const ALL: [Icon; 28] = [
         Icon::New,
         Icon::Open,
         Icon::Save,
         Icon::Print,
         Icon::Select,
+        Icon::Hand,
         Icon::InsertPage,
         Icon::Checkbox,
         Icon::Date,
@@ -108,6 +111,7 @@ impl Icon {
         Icon::Snap,
         Icon::Moon,
         Icon::Sun,
+        Icon::Properties,
     ];
 
     fn index(self) -> usize {
@@ -392,6 +396,7 @@ mod tests {
                 "save-outline",
                 "print-outline",
                 "arrow-selector-tool-outline",
+                "pan-tool-outline",
                 "note-stack-add-outline",
                 "check-box-outline",
                 "calendar-today-outline",
@@ -413,6 +418,7 @@ mod tests {
                 "my-location-outline",
                 "dark-mode-outline",
                 "light-mode-outline",
+                "tune",
             ]
         );
         for icon in Icon::ALL {

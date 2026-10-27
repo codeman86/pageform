@@ -2,7 +2,8 @@
 
 use lopdf::{Document, Object};
 use pageform_core::{
-    export_pdf, Document as Form, FieldKind, RectPt, SAMPLE_CHECK_NAME, SAMPLE_CHECK_RECT,
+    export_pdf, BorderStyleKind, CheckboxStyle, Document as Form, FieldKind, FontFamily,
+    Orientation, PageSize, RectPt, Rgb, TextAlign, SAMPLE_CHECK_NAME, SAMPLE_CHECK_RECT,
     SAMPLE_TEXT_NAME, SAMPLE_TEXT_RECT,
 };
 
@@ -452,6 +453,409 @@ fn new_insert_items_export_as_fields_or_page_content() {
     let hidden_text = String::from_utf8_lossy(&hidden_contents);
     assert!(!hidden_text.contains("(Yes)"));
     assert!(!hidden_text.contains("(No)"));
+}
+
+#[test]
+fn styled_properties_round_trip_into_the_acroform() {
+    let mut doc = Form::letter();
+    let text = doc.add_field(
+        FieldKind::Text,
+        RectPt {
+            x: 72.0,
+            y: 700.0,
+            w: 180.0,
+            h: 36.0,
+        },
+    );
+    doc.set_name(text, "person").unwrap();
+    doc.set_tooltip(text, "Full name");
+    doc.set_required(text, true);
+    doc.set_read_only(text, true);
+    doc.set_default_value(text, "Ada");
+    doc.update_style(text, |style| {
+        style.max_chars = Some(20);
+        style.multiline = true;
+        style.align = TextAlign::Center;
+        style.font = FontFamily::Times;
+        style.font_size = 14.0;
+        style.text_color = Rgb::new(1.0, 0.0, 0.0);
+        style.border_width = 2.0;
+        style.border_color = Rgb::new(0.0, 0.0, 1.0);
+        style.border_style = BorderStyleKind::Dashed;
+        style.fill = Some(Rgb::new(1.0, 1.0, 0.0));
+    });
+
+    let check = doc.add_field(
+        FieldKind::Checkbox,
+        RectPt {
+            x: 72.0,
+            y: 650.0,
+            w: 18.0,
+            h: 18.0,
+        },
+    );
+    doc.set_checked(check, true);
+    doc.update_style(check, |style| {
+        style.checkbox_style = CheckboxStyle::Cross;
+    });
+
+    let choice = doc.add_field(
+        FieldKind::Dropdown,
+        RectPt {
+            x: 72.0,
+            y: 610.0,
+            w: 144.0,
+            h: 18.0,
+        },
+    );
+    doc.set_options(choice, vec!["Red".into(), "Blue".into()])
+        .unwrap();
+    doc.set_default_value(choice, "Blue");
+
+    let radio = doc.add_field(
+        FieldKind::Radio,
+        RectPt {
+            x: 72.0,
+            y: 560.0,
+            w: 18.0,
+            h: 18.0,
+        },
+    );
+    doc.set_name(radio, "Color").unwrap();
+    let other = doc.add_radio(
+        RectPt {
+            x: 110.0,
+            y: 560.0,
+            w: 18.0,
+            h: 18.0,
+        },
+        Some("Color"),
+    );
+    doc.set_checked(other, true);
+    doc.set_required(radio, true);
+
+    let date = doc.add_field(
+        FieldKind::Date,
+        RectPt {
+            x: 200.0,
+            y: 560.0,
+            w: 120.0,
+            h: 18.0,
+        },
+    );
+    doc.update_style(date, |style| style.date_format = "MM/DD/YYYY".to_string());
+
+    let line = doc.add_field(
+        FieldKind::Line,
+        RectPt {
+            x: 72.0,
+            y: 500.0,
+            w: 144.0,
+            h: 9.0,
+        },
+    );
+    doc.update_style(line, |style| {
+        style.stroke_width = 3.0;
+        style.stroke_color = Rgb::new(1.0, 0.0, 0.0);
+    });
+    doc.set_header_text("CANVAS-HEADER");
+    doc.set_footer_text("CANVAS-FOOTER");
+    doc.set_page_size(PageSize::Letter);
+    doc.set_orientation(Orientation::Landscape);
+
+    let bytes = export_pdf(&doc).unwrap();
+    assert!(!bytes
+        .windows(b"NeedAppearances".len())
+        .any(|window| window == b"NeedAppearances"));
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let root = catalog(&pdf);
+    let page_dict = page(&pdf, root);
+    let media = numbers(deref(&pdf, page_dict.get(b"MediaBox").unwrap()));
+    assert_close(media[2], 792.0);
+    assert_close(media[3], 612.0);
+
+    let acro = deref(&pdf, root.get(b"AcroForm").unwrap())
+        .as_dict()
+        .unwrap();
+    assert!(acro.get(b"NeedAppearances").is_err());
+    let fields = deref(&pdf, acro.get(b"Fields").unwrap());
+    let fields = fields.as_array().unwrap();
+
+    let person = find_field(&pdf, fields, "person");
+    assert_eq!(
+        string_bytes(deref(&pdf, person.get(b"TU").unwrap())),
+        b"Full name"
+    );
+    let flags = flag_bits(&pdf, person);
+    assert_ne!(flags & 1, 0, "read-only");
+    assert_ne!(flags & 2, 0, "required");
+    assert_ne!(flags & (1 << 12), 0, "multiline");
+    match deref(&pdf, person.get(b"MaxLen").unwrap()) {
+        Object::Integer(len) => assert_eq!(*len, 20),
+        other => panic!("MaxLen {other:?}"),
+    }
+    match deref(&pdf, person.get(b"Q").unwrap()) {
+        Object::Integer(value) => assert_eq!(*value, 1, "center"),
+        other => panic!("Q {other:?}"),
+    }
+    let da = string_bytes(deref(&pdf, person.get(b"DA").unwrap()));
+    let da_text = String::from_utf8_lossy(da);
+    assert!(da_text.contains("/TiRo"), "{da_text}");
+    assert!(da_text.contains("14"), "{da_text}");
+    assert!(da_text.contains("rg"), "{da_text}");
+    assert_eq!(string_bytes(deref(&pdf, person.get(b"V").unwrap())), b"Ada");
+    assert_eq!(
+        string_bytes(deref(&pdf, person.get(b"DV").unwrap())),
+        b"Ada"
+    );
+    let bs = deref(&pdf, person.get(b"BS").unwrap()).as_dict().unwrap();
+    match deref(&pdf, bs.get(b"W").unwrap()) {
+        Object::Integer(width) => assert_eq!(*width, 2),
+        Object::Real(width) => assert!((width - 2.0).abs() < 0.01),
+        other => panic!("border width {other:?}"),
+    }
+    assert_name(deref(&pdf, bs.get(b"S").unwrap()), b"D");
+    let mk = deref(&pdf, person.get(b"MK").unwrap()).as_dict().unwrap();
+    let border = numbers(deref(&pdf, mk.get(b"BC").unwrap()));
+    assert_close(border[2], 1.0);
+    let fill = numbers(deref(&pdf, mk.get(b"BG").unwrap()));
+    assert_close(fill[0], 1.0);
+    assert_close(fill[1], 1.0);
+    assert_close(fill[2], 0.0);
+    let appearance = stream_plain(&pdf, appearance_n(&pdf, person));
+    let appearance_text = String::from_utf8_lossy(&appearance);
+    assert!(
+        appearance_text.contains("Ada"),
+        "explicit appearance shows the default value"
+    );
+
+    let check_field = find_field(&pdf, fields, "Check1");
+    assert_name(deref(&pdf, check_field.get(b"V").unwrap()), b"On");
+    assert_name(deref(&pdf, check_field.get(b"DV").unwrap()), b"On");
+    assert_name(deref(&pdf, check_field.get(b"AS").unwrap()), b"On");
+    let check_mk = deref(&pdf, check_field.get(b"MK").unwrap())
+        .as_dict()
+        .unwrap();
+    assert_eq!(
+        string_bytes(deref(&pdf, check_mk.get(b"CA").unwrap())),
+        b"8"
+    );
+    let states = appearance_n(&pdf, check_field)
+        .as_dict()
+        .expect("checkbox appearances");
+    assert!(stream_len(&pdf, deref(&pdf, states.get(b"On").unwrap())) > 8);
+    assert!(stream_len(&pdf, deref(&pdf, states.get(b"Off").unwrap())) > 8);
+
+    let choice_field = find_field(&pdf, fields, "Choice1");
+    let options = deref(&pdf, choice_field.get(b"Opt").unwrap());
+    assert_eq!(options.as_array().unwrap().len(), 2);
+    assert_eq!(
+        string_bytes(deref(&pdf, choice_field.get(b"V").unwrap())),
+        b"Blue"
+    );
+    assert_eq!(
+        string_bytes(deref(&pdf, choice_field.get(b"DV").unwrap())),
+        b"Blue"
+    );
+
+    let group = find_field(&pdf, fields, "Color");
+    assert_name(deref(&pdf, group.get(b"FT").unwrap()), b"Btn");
+    let radio_flags = flag_bits(&pdf, group);
+    assert_ne!(radio_flags & (1 << 15), 0, "radio");
+    assert_ne!(radio_flags & 2, 0, "required on the group");
+    assert_eq!(
+        deref(&pdf, group.get(b"Kids").unwrap())
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_name(deref(&pdf, group.get(b"V").unwrap()), b"No");
+    assert_name(deref(&pdf, group.get(b"DV").unwrap()), b"No");
+
+    let date_field = find_field(&pdf, fields, "Date1");
+    assert_eq!(
+        string_bytes(deref(&pdf, date_field.get(b"TU").unwrap())),
+        b"MM/DD/YYYY"
+    );
+    match deref(&pdf, date_field.get(b"MaxLen").unwrap()) {
+        Object::Integer(len) => assert_eq!(*len, 10),
+        other => panic!("date MaxLen {other:?}"),
+    }
+
+    let contents = stream_plain(&pdf, deref(&pdf, page_dict.get(b"Contents").unwrap()));
+    let page_text = String::from_utf8_lossy(&contents);
+    assert!(
+        page_text.contains("1 0 0 RG"),
+        "line stroke color is in the page content: {page_text}"
+    );
+    assert!(
+        page_text.contains("3 w"),
+        "line stroke width is in the page content: {page_text}"
+    );
+    assert!(!page_text.contains("CANVAS-HEADER"));
+    assert!(!page_text.contains("CANVAS-FOOTER"));
+}
+
+#[test]
+fn inline_text_edits_export_as_page_content_or_field_value() {
+    let mut doc = Form::letter();
+    let label = doc.add_field(
+        FieldKind::StaticText,
+        RectPt {
+            x: 72.0,
+            y: 700.0,
+            w: 180.0,
+            h: 18.0,
+        },
+    );
+    doc.set_caption(label, "Full name").unwrap();
+    let text_box = doc.add_field(
+        FieldKind::TextBox,
+        RectPt {
+            x: 72.0,
+            y: 640.0,
+            w: 180.0,
+            h: 48.0,
+        },
+    );
+    doc.set_caption(text_box, "Line one\nLine two").unwrap();
+    let check = doc.add_field(
+        FieldKind::Checkbox,
+        RectPt {
+            x: 72.0,
+            y: 600.0,
+            w: 18.0,
+            h: 18.0,
+        },
+    );
+    doc.set_caption(check, "Agree").unwrap();
+    let text = doc.add_field(
+        FieldKind::Text,
+        RectPt {
+            x: 72.0,
+            y: 560.0,
+            w: 144.0,
+            h: 18.0,
+        },
+    );
+    doc.set_name(text, "person").unwrap();
+    doc.set_default_value(text, "Ada");
+
+    let bytes = export_pdf(&doc).unwrap();
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let root = catalog(&pdf);
+    let page_dict = page(&pdf, root);
+    let contents = stream_plain(&pdf, deref(&pdf, page_dict.get(b"Contents").unwrap()));
+    let page_text = String::from_utf8_lossy(&contents);
+    assert!(page_text.contains("Full name"), "{page_text}");
+    assert!(page_text.contains("Line one"), "{page_text}");
+    assert!(page_text.contains("Line two"), "{page_text}");
+    assert!(page_text.contains("Agree"), "{page_text}");
+
+    let acro = deref(&pdf, root.get(b"AcroForm").unwrap())
+        .as_dict()
+        .unwrap();
+    let fields = deref(&pdf, acro.get(b"Fields").unwrap());
+    let person = find_field(&pdf, fields.as_array().unwrap(), "person");
+    assert_eq!(string_bytes(deref(&pdf, person.get(b"V").unwrap())), b"Ada");
+    let appearance = stream_plain(&pdf, appearance_n(&pdf, person));
+    assert!(String::from_utf8_lossy(&appearance).contains("Ada"));
+}
+
+#[test]
+fn static_text_fill_is_painted_under_the_caption() {
+    let mut doc = Form::letter();
+    let id = doc.add_field(
+        FieldKind::StaticText,
+        RectPt {
+            x: 72.0,
+            y: 700.0,
+            w: 180.0,
+            h: 18.0,
+        },
+    );
+    doc.set_caption(id, "WhiteLabel").unwrap();
+    doc.update_style(id, |style| {
+        style.fill = Some(Rgb::WHITE);
+        style.border_width = 1.0;
+    });
+    let bytes = export_pdf(&doc).unwrap();
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let page_dict = page(&pdf, catalog(&pdf));
+    let contents = stream_plain(&pdf, deref(&pdf, page_dict.get(b"Contents").unwrap()));
+    let page_text = String::from_utf8_lossy(&contents);
+    let fill_at = page_text
+        .find("1 g")
+        .unwrap_or_else(|| panic!("missing white fill: {page_text}"));
+    let text_at = page_text
+        .find("WhiteLabel")
+        .unwrap_or_else(|| panic!("missing caption: {page_text}"));
+    assert!(
+        fill_at < text_at,
+        "fill must be under the caption: {page_text}"
+    );
+    let after = &page_text[text_at..];
+    assert!(
+        after.contains('S'),
+        "border is stroked after the caption: {page_text}"
+    );
+}
+
+#[test]
+fn text1_exports_an_empty_value_and_a_normal_appearance() {
+    let mut doc = Form::letter();
+    let id = doc.add_field(
+        FieldKind::Text,
+        RectPt {
+            x: 72.0,
+            y: 700.0,
+            w: 144.0,
+            h: 18.0,
+        },
+    );
+    assert_eq!(doc.field(id).unwrap().name(), "Text1");
+
+    let bytes = export_pdf(&doc).unwrap();
+    assert!(!bytes
+        .windows(b"NeedAppearances".len())
+        .any(|window| window == b"NeedAppearances"));
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let root = catalog(&pdf);
+    let acro = deref(&pdf, root.get(b"AcroForm").unwrap())
+        .as_dict()
+        .unwrap();
+    assert!(acro.get(b"NeedAppearances").is_err());
+    let fields = deref(&pdf, acro.get(b"Fields").unwrap())
+        .as_array()
+        .unwrap();
+    let text = find_field(&pdf, fields, "Text1");
+    assert_name(deref(&pdf, text.get(b"FT").unwrap()), b"Tx");
+    assert_eq!(string_bytes(deref(&pdf, text.get(b"V").unwrap())), b"");
+    let appearance = stream_plain(&pdf, appearance_n(&pdf, text));
+    assert!(
+        appearance.len() > 16,
+        "empty Text1 still needs a normal appearance, got {} bytes",
+        appearance.len()
+    );
+
+    doc.set_default_value(id, "Hello");
+    let bytes = export_pdf(&doc).unwrap();
+    let pdf = Document::load_mem(&bytes).unwrap();
+    let root = catalog(&pdf);
+    let acro = deref(&pdf, root.get(b"AcroForm").unwrap())
+        .as_dict()
+        .unwrap();
+    let fields = deref(&pdf, acro.get(b"Fields").unwrap())
+        .as_array()
+        .unwrap();
+    let text = find_field(&pdf, fields, "Text1");
+    assert_eq!(string_bytes(deref(&pdf, text.get(b"V").unwrap())), b"Hello");
+    let appearance = stream_plain(&pdf, appearance_n(&pdf, text));
+    assert!(
+        String::from_utf8_lossy(&appearance).contains("Hello"),
+        "appearance missing the value"
+    );
 }
 
 fn field_names(doc: &Document, fields: &[Object]) -> Vec<String> {

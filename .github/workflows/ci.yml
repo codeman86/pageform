@@ -83,15 +83,34 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-      - name: Build Linux AppImage
-        if: runner.os == 'Linux'
+  # Built on Ubuntu 22.04 so the AppImage needs glibc 2.35, not the
+  # glibc of ubuntu-latest. Newer symbols fail on Debian 12/13 and Ubuntu 24.04.
+  appimage:
+    name: linux-appimage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build packages
         run: |
-          sudo apt-get install -y file curl ca-certificates \
-            libxkbcommon0 libwayland-client0 libwayland-cursor0 libwayland-egl1
-          packaging/make-appimage.sh
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libvulkan-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-render0-dev libssl-dev \
+            file curl ca-certificates binutils \
+            libxkbcommon0 libxkbcommon-x11-0 libxcb-xkb1 \
+            libwayland-client0 libwayland-cursor0 libwayland-egl1
+
+      - name: Build Linux AppImage
+        run: packaging/make-appimage.sh
+
+      - name: Require glibc 2.35 or older
+        run: packaging/check-glibc.sh 2.35
 
       - name: Upload Linux AppImage
-        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: pageform-linux-appimage
