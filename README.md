@@ -45,7 +45,7 @@ GitHub Actions uploads two desktop builds from this repository.
 
 Windows: download the `pageform-windows-exe` artifact and unzip it. `PageForm.exe` is at the zip root.
 
-Linux: download the `pageform-linux-appimage` artifact and unzip it. `PageForm-x86_64.AppImage` is at the zip root. It is built on Ubuntu's glibc and runs on newer glibc desktops, including Arch, without installing PageForm's own libraries. It bundles `libxkbcommon-x11.so.0` and `libxcb-xkb.so.1`, which the window needs for keyboard input. A desktop session (Wayland or X11) and the host OpenGL libraries (`libGL` / `libEGL` from the GPU driver) still have to be present. The GPU driver is not inside the AppImage.
+Linux: download the `pageform-linux-appimage` artifact and unzip it. `PageForm-x86_64.AppImage` is at the zip root. It is built on Ubuntu 22.04 (glibc 2.35) and runs on newer glibc desktops, including Debian 12/13, Ubuntu 24.04, and Arch, without installing PageForm's own libraries. It bundles `libxkbcommon-x11.so.0` and `libxcb-xkb.so.1`, which the window needs for keyboard input. A desktop session (Wayland or X11) and the host OpenGL libraries (`libGL` / `libEGL` from the GPU driver) still have to be present. The GPU driver is not inside the AppImage.
 
 ```bash
 chmod +x PageForm-x86_64.AppImage
